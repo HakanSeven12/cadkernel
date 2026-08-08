@@ -119,6 +119,52 @@ impl EllipseArc {
     }
 }
 
+/// A ray: everything from `origin` onward along `direction`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ray {
+    /// Where it starts.
+    pub origin: [f64; 2],
+    /// Which way it goes. Its length sets the parameter's scale, exactly as a
+    /// line's start-to-end vector does.
+    pub direction: [f64; 2],
+}
+
+/// An infinite construction line, unbounded in both directions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XLine {
+    /// A point it passes through, and where its parameter reads zero.
+    pub base: [f64; 2],
+    /// Which way it runs.
+    pub direction: [f64; 2],
+}
+
+/// How far a curve's parameter is allowed to run.
+///
+/// A single "is it bounded" flag would not do: a ray is bounded at one end and
+/// not the other, and treating it as unbounded would accept crossings behind
+/// its origin, where the ray does not go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extent {
+    /// `0..=1`, the whole curve.
+    Bounded,
+    /// `0..=∞`. A ray.
+    Forward,
+    /// Everything. An infinite line.
+    Infinite,
+}
+
+impl Extent {
+    /// Whether `t` is on the curve rather than on its extension.
+    pub fn holds(&self, t: f64) -> bool {
+        const SLACK: f64 = 1e-9;
+        match self {
+            Self::Bounded => (-SLACK..=1.0 + SLACK).contains(&t),
+            Self::Forward => t >= -SLACK,
+            Self::Infinite => true,
+        }
+    }
+}
+
 /// Any plane curve this kernel understands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Curve {
@@ -134,9 +180,76 @@ pub enum Curve {
     Polyline(Polyline),
     /// A NURBS curve — a drawing's SPLINE.
     Nurbs(NurbsCurve),
+    /// A ray, bounded at its origin only.
+    Ray(Ray),
+    /// An infinite construction line.
+    XLine(XLine),
 }
 
 impl Curve {
+    /// How far this curve's parameter runs.
+    pub fn extent(&self) -> Extent {
+        match self {
+            Self::Ray(_) => Extent::Forward,
+            Self::XLine(_) => Extent::Infinite,
+            _ => Extent::Bounded,
+        }
+    }
+
+    /// Whether the curve is straight, and so answered in closed form against
+    /// anything else this module knows.
+    pub fn is_straight(&self) -> bool {
+        matches!(self, Self::Line(_) | Self::Ray(_) | Self::XLine(_))
+    }
+
+    /// A point on the curve and the vector its parameter advances by, for the
+    /// straight kinds.
+    pub fn as_ray(&self) -> Option<([f64; 2], [f64; 2])> {
+        match self {
+            Self::Line(line) => Some((line.start, line.direction())),
+            Self::Ray(ray) => Some((ray.origin, ray.direction)),
+            Self::XLine(line) => Some((line.base, line.direction)),
+            _ => None,
+        }
+    }
+
+    /// A polyline taken apart into the lines and arcs it is made of.
+    ///
+    /// Empty for everything else, which is what lets a caller ask without
+    /// checking first.
+    pub fn segments(&self) -> Vec<Curve> {
+        let Self::Polyline(polyline) = self else {
+            return Vec::new();
+        };
+        let count = polyline_segment_count(polyline);
+        let vertices = polyline.vertices.len();
+        (0..count)
+            .map(|index| {
+                let start = polyline.vertices[index].position;
+                let end = polyline.vertices[(index + 1) % vertices].position;
+                match polyline.segment_arc(index) {
+                    Some(arc) => {
+                        // Arcs here run counter-clockwise, so a clockwise bulge
+                        // is stored with its ends the other way round. Only the
+                        // shape matters to the caller, not the direction.
+                        let (from, to) = if arc.sweep >= 0.0 {
+                            (arc.start_angle, arc.start_angle + arc.sweep)
+                        } else {
+                            (arc.end_angle, arc.end_angle - arc.sweep)
+                        };
+                        Curve::Arc(Arc {
+                            centre: arc.center,
+                            radius: arc.radius,
+                            start_angle: from,
+                            end_angle: to,
+                        })
+                    }
+                    None => Curve::Line(Line { start, end }),
+                }
+            })
+            .collect()
+    }
+
     /// Whether the curve returns to where it started.
     pub fn is_closed(&self) -> bool {
         match self {
@@ -146,6 +259,7 @@ impl Curve {
             Self::Ellipse(arc) => (arc.sweep() - TAU).abs() < 1e-9,
             Self::Polyline(polyline) => polyline.closed,
             Self::Nurbs(curve) => curve.is_closed(),
+            Self::Ray(_) | Self::XLine(_) => false,
         }
     }
 
@@ -179,6 +293,14 @@ impl Curve {
                 .point_at(arc.start_parameter + t * arc.sweep()),
             Self::Polyline(polyline) => point_on_polyline(polyline, t),
             Self::Nurbs(curve) => curve.point_at(t),
+            Self::Ray(ray) => [
+                ray.origin[0] + t * ray.direction[0],
+                ray.origin[1] + t * ray.direction[1],
+            ],
+            Self::XLine(line) => [
+                line.base[0] + t * line.direction[0],
+                line.base[1] + t * line.direction[1],
+            ],
         }
     }
 
@@ -220,6 +342,14 @@ impl Curve {
             }
             Self::Polyline(polyline) => parameter_on_polyline(polyline, point),
             Self::Nurbs(curve) => curve.parameter_at(point),
+            Self::Ray(_) | Self::XLine(_) => {
+                let (origin, d) = self.as_ray().expect("straight");
+                let squared = d[0] * d[0] + d[1] * d[1];
+                if squared < 1e-24 {
+                    return 0.0;
+                }
+                ((point[0] - origin[0]) * d[0] + (point[1] - origin[1]) * d[1]) / squared
+            }
         }
     }
 
@@ -261,6 +391,10 @@ impl Curve {
                 let per_span = ((segments_per_radian / 4.0).ceil() as usize).max(2);
                 curve.tessellate(per_span)
             }
+            // Only the stretch the parameter calls `0..=1`. An unbounded curve
+            // has no finite polyline, so clipping it to something visible is
+            // the caller's decision, not this one's.
+            Self::Ray(_) | Self::XLine(_) => vec![self.point_at(0.0), self.point_at(1.0)],
         }
     }
 }
@@ -322,7 +456,16 @@ fn parameter_on_polyline(polyline: &Polyline, point: [f64; 2]) -> f64 {
         let local = match polyline.segment_arc(index) {
             Some(arc) => {
                 let angle = (point[1] - arc.center[1]).atan2(point[0] - arc.center[0]);
-                ((angle - arc.start_angle) / arc.sweep).clamp(0.0, 1.0)
+                // `atan2` lands in -π..=π, so the difference has to be wrapped
+                // into the direction the arc actually travels before it means
+                // anything. Without this a point past the wrap reads as
+                // negative and clamps to the arc's start.
+                let travelled = if arc.sweep >= 0.0 {
+                    (angle - arc.start_angle).rem_euclid(TAU)
+                } else {
+                    -((arc.start_angle - angle).rem_euclid(TAU))
+                };
+                (travelled / arc.sweep).clamp(0.0, 1.0)
             }
             None => {
                 let dx = end[0] - start[0];

@@ -74,6 +74,12 @@ See `brep::Provenance`.
 
 ## Scope
 
+Curves: line, ray, infinite line, circle, arc, elliptical arc, polyline with
+bulges, and NURBS. Intersection is closed-form wherever one exists, a polyline
+is taken apart into pieces that have one, and what remains is subdivided and
+refined until it converges to the tolerance asked for. Nothing is sampled at a
+fixed density and no result is left approximate.
+
 In: 2D curve intersection, offset, containment, chaining, area and length;
 B-rep topology, surface–surface intersection, booleans; exact ACIS lift and
 lower.
