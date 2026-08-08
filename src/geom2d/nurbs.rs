@@ -365,8 +365,10 @@ impl NurbsCurve {
 /// values, then `degree + 1` ones.
 ///
 /// Clamped so the curve starts at its first control point and ends at its
-/// last, which is what a drawing expects to see.
-fn clamped_uniform_knots(degree: usize, control_point_count: usize) -> Vec<f64> {
+/// last, which is what a drawing expects to see. Public because rebuilding a
+/// spline after its control polygon changed needs the same vector, and it is
+/// better shared than guessed at twice.
+pub fn clamped_uniform_knots(degree: usize, control_point_count: usize) -> Vec<f64> {
     let interior = control_point_count.saturating_sub(degree + 1);
     let mut knots = vec![0.0; degree + 1];
     for i in 1..=interior {
