@@ -27,7 +27,7 @@
 //! caller that wants a magnitude takes the absolute value; a caller deciding
 //! whether a loop is a hole wants the sign.
 
-use super::curve::{Arc, Circle, Curve, EllipseArc};
+use super::curve::Curve;
 use super::vec::Vec2;
 use std::f64::consts::TAU;
 
@@ -126,7 +126,7 @@ fn circular_area(centre: [f64; 2], radius: f64, start: f64, end: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::geom2d::polyline::{Polyline, PolylineVertex};
-    use crate::geom2d::{Ellipse, Line, NurbsCurve};
+    use crate::geom2d::{Arc, Circle, Ellipse, EllipseArc, Line, NurbsCurve};
     use std::f64::consts::{FRAC_PI_2, PI};
 
     fn circle(centre: [f64; 2], radius: f64) -> Curve {
