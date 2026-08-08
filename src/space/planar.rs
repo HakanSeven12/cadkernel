@@ -81,6 +81,37 @@ impl PlanarCurve {
             .collect()
     }
 
+    /// The curve's length in world units.
+    ///
+    /// Measured in the plane's coordinates, which is the same thing provided
+    /// the frame preserves length — true of every frame a drawing produces,
+    /// since an extrusion normal yields unit perpendicular axes. A plane
+    /// carrying a scaled parameterisation would report the length in *its*
+    /// units, which is what such a plane means.
+    pub fn length(&self) -> f64 {
+        self.curve.length()
+    }
+
+    /// The world point at arc length `distance` from the start.
+    ///
+    /// The question DIVIDE, MEASURE and a path array all ask. See
+    /// [`Curve::point_at_distance`](crate::geom2d::Curve::point_at_distance)
+    /// for why it is not the same as evaluating at a fraction of the
+    /// parameter.
+    pub fn point_at_distance(&self, distance: f64) -> [f64; 3] {
+        self.lower(self.curve.point_at_distance(distance))
+    }
+
+    /// The parameter at arc length `distance` from the start.
+    pub fn parameter_at_distance(&self, distance: f64) -> f64 {
+        self.curve.parameter_at_distance(distance)
+    }
+
+    /// The direction of travel at `t`, in world coordinates.
+    pub fn tangent_at(&self, t: f64) -> [f64; 3] {
+        self.plane.vector_at(self.curve.tangent_at(t))
+    }
+
     /// The plane's unit normal, or `None` if its axes do not span one.
     pub fn normal(&self) -> Option<[f64; 3]> {
         self.plane.normal()
@@ -258,6 +289,34 @@ mod tests {
             PlanarCurve::new(upright(), unit_arc()).normal(),
             Some([0.0, -1.0, 0.0])
         );
+    }
+
+    #[test]
+    fn distance_along_a_tilted_curve_is_measured_in_world_units() {
+        // A quarter of a unit circle, standing upright. Its length is π/2
+        // whichever way the plane faces, and half of that lands at 45°.
+        let flat = PlanarCurve::flat(unit_arc());
+        let raised = PlanarCurve::new(upright(), unit_arc());
+        assert!((flat.length() - FRAC_PI_2).abs() < 1e-12);
+        assert!((raised.length() - FRAC_PI_2).abs() < 1e-12);
+
+        let half = raised.point_at_distance(FRAC_PI_2 * 0.5);
+        let root_half = std::f64::consts::FRAC_1_SQRT_2;
+        assert!((half[0] - root_half).abs() < 1e-9, "{half:?}");
+        assert!((half[2] - root_half).abs() < 1e-9, "{half:?}");
+    }
+
+    #[test]
+    fn the_tangent_comes_out_in_world_coordinates() {
+        // At the start of the upright arc the curve heads along its plane's
+        // own +v, which world-side is +Z.
+        let raised = PlanarCurve::new(upright(), unit_arc());
+        let tangent = raised.tangent_at(0.0);
+        let length = (tangent[0] * tangent[0]
+            + tangent[1] * tangent[1]
+            + tangent[2] * tangent[2])
+            .sqrt();
+        assert!((tangent[2] / length - 1.0).abs() < 1e-9, "{tangent:?}");
     }
 
     #[test]
