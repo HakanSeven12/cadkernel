@@ -335,6 +335,166 @@ impl NurbsCurve {
     ///
     /// `None` when the cut falls at or outside an end, where there is nothing
     /// to divide.
+    /// The same curve traced the other way.
+    ///
+    /// Control points and weights reverse, and the knots are mirrored within
+    /// the domain — `U'ᵢ = (first + last) − U_{m−i}` — so the shape is
+    /// untouched and only the direction of travel changes.
+    ///
+    /// The mirroring is the part that is easy to skip. Reversing the control
+    /// points and then regenerating a *clamped uniform* knot vector looks
+    /// right and is not: a curve whose knots are unevenly spaced is a
+    /// different curve afterwards, bulging where it used to be taut.
+    pub fn reversed(&self) -> Self {
+        let (start, end) = (self.knots[0], self.knots[self.knots.len() - 1]);
+        let total = start + end;
+        let knots: Vec<f64> = self.knots.iter().rev().map(|u| total - u).collect();
+        Self {
+            degree: self.degree,
+            knots,
+            control_points: self.control_points.iter().rev().copied().collect(),
+            weights: self.weights.iter().rev().copied().collect(),
+        }
+    }
+
+    /// The same curve written at a higher degree.
+    ///
+    /// Exact — degree elevation changes how a curve is described, never where
+    /// it goes. Needed whenever two curves have to share a description: JOIN
+    /// on a pair of splines of different degrees, and a B-rep edge shared by
+    /// faces that disagree about it.
+    ///
+    /// Done by taking the curve apart into Bézier segments, elevating each —
+    /// where the rule is one line — and putting them back. The result keeps
+    /// each interior break at full multiplicity rather than reducing it back
+    /// to the smoothness the curve actually has: legal, exact, and a few more
+    /// control points than the minimal form.
+    ///
+    /// `None` if `by` is zero, since there is nothing to do.
+    pub fn elevated(&self, by: usize) -> Option<Self> {
+        if by == 0 {
+            return None;
+        }
+        let mut curve = self.elevated_once()?;
+        for _ in 1..by {
+            curve = curve.elevated_once()?;
+        }
+        Some(curve)
+    }
+
+    fn elevated_once(&self) -> Option<Self> {
+        let degree = self.degree;
+        let raised = degree + 1;
+        let (segments, breaks) = self.bezier_segments();
+        if segments.is_empty() {
+            return None;
+        }
+
+        let mut control: Vec<[f64; 2]> = Vec::new();
+        let mut weights: Vec<f64> = Vec::new();
+        for segment in &segments {
+            // Qᵢ = (i/(p+1))·Pᵢ₋₁ + (1 − i/(p+1))·Pᵢ, in homogeneous
+            // coordinates so a rational curve elevates exactly too.
+            let mut elevated: Vec<[f64; 3]> = Vec::with_capacity(raised + 1);
+            for i in 0..=raised {
+                let alpha = i as f64 / raised as f64;
+                let before = if i == 0 {
+                    [0.0; 3]
+                } else {
+                    segment[i - 1]
+                };
+                let after = if i > degree { [0.0; 3] } else { segment[i] };
+                elevated.push([
+                    before[0] * alpha + after[0] * (1.0 - alpha),
+                    before[1] * alpha + after[1] * (1.0 - alpha),
+                    before[2] * alpha + after[2] * (1.0 - alpha),
+                ]);
+            }
+            // Neighbouring segments share an endpoint.
+            let skip = usize::from(!control.is_empty());
+            for point in &elevated[skip..] {
+                let w = if point[2].abs() < 1e-15 { 1.0 } else { point[2] };
+                control.push([point[0] / w, point[1] / w]);
+                weights.push(w);
+            }
+        }
+
+        // The breaks keep the curve's own knot values. Spacing them evenly
+        // instead leaves the same point set but reparameterised, so the
+        // elevated curve would no longer agree with the original about which
+        // point `t` names.
+        let (start, end) = self.domain();
+        let mut knots: Vec<f64> = vec![start; raised + 1];
+        for at in &breaks {
+            knots.extend(std::iter::repeat_n(*at, raised));
+        }
+        knots.extend(std::iter::repeat_n(end, raised + 1));
+
+        Some(Self {
+            degree: raised,
+            knots,
+            control_points: control,
+            weights,
+        })
+    }
+
+    /// The curve taken apart into Bézier segments, each as `degree + 1`
+    /// homogeneous control points.
+    ///
+    /// Raising every interior knot to full multiplicity makes the segments
+    /// independent, which is what lets a per-Bézier rule be applied one
+    /// segment at a time.
+    fn bezier_segments(&self) -> (Vec<Vec<[f64; 3]>>, Vec<f64>) {
+        let (start, end) = self.domain();
+        let mut work = self.clone();
+        loop {
+            let breaks: Vec<f64> = {
+                let mut seen: Vec<(f64, usize)> = Vec::new();
+                for knot in &work.knots {
+                    if *knot <= start + 1e-12 || *knot >= end - 1e-12 {
+                        continue;
+                    }
+                    match seen.iter_mut().find(|(at, _)| (at - knot).abs() < 1e-12) {
+                        Some((_, count)) => *count += 1,
+                        None => seen.push((*knot, 1)),
+                    }
+                }
+                seen.into_iter()
+                    .filter(|(_, count)| *count < work.degree)
+                    .map(|(at, _)| at)
+                    .collect()
+            };
+            if breaks.is_empty() {
+                break;
+            }
+            for at in breaks {
+                work.insert_knot(at);
+            }
+        }
+        // Every interior knot now sits at full multiplicity, so the distinct
+        // interior values in order are the segment boundaries.
+        let mut breaks: Vec<f64> = Vec::new();
+        for knot in &work.knots {
+            if *knot <= start + 1e-12 || *knot >= end - 1e-12 {
+                continue;
+            }
+            if breaks.last().is_none_or(|last| (last - knot).abs() > 1e-12) {
+                breaks.push(*knot);
+            }
+        }
+        let homogeneous = work.homogeneous();
+        let segments = (0..)
+            .map(|index| index * work.degree)
+            .take_while(|from| from + work.degree < homogeneous.len() + work.degree)
+            .filter_map(|from| {
+                homogeneous
+                    .get(from..=from + work.degree)
+                    .map(<[[f64; 3]]>::to_vec)
+            })
+            .collect::<Vec<_>>();
+        (segments, breaks)
+    }
+
     pub fn split_at(&self, t: f64) -> Option<(Self, Self)> {
         let (start, end) = self.domain();
         let u = start + t.clamp(0.0, 1.0) * (end - start);
@@ -738,6 +898,119 @@ mod tests {
         let second = curve.derivative_at_knot(0.4);
         assert!(close(first, second, 1e-9), "{first:?} vs {second:?}");
         assert!(first[1].abs() < 1e-9, "the first span runs along X");
+    }
+
+    /// A cubic with an uneven knot vector, which is where the difference
+    /// between mirroring the knots and regenerating them shows.
+    fn uneven() -> NurbsCurve {
+        NurbsCurve::new(
+            3,
+            vec![
+                [0.0, 0.0],
+                [1.0, 6.0],
+                [4.0, 6.0],
+                [6.0, 0.0],
+                [9.0, 4.0],
+                [12.0, 0.0],
+            ],
+            vec![0.0, 0.0, 0.0, 0.0, 0.2, 0.9, 1.0, 1.0, 1.0, 1.0],
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reversing_traces_the_same_curve_backwards() {
+        for curve in [linear(), uneven(), rational_quarter()] {
+            let back = curve.reversed();
+            for i in 0..=20 {
+                let t = i as f64 / 20.0;
+                assert!(
+                    close(curve.point_at(t), back.point_at(1.0 - t), 1e-9),
+                    "t={t}: {:?} vs {:?}",
+                    curve.point_at(t),
+                    back.point_at(1.0 - t)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn regenerating_the_knots_instead_would_move_the_curve() {
+        // The failure this guards: reversing the control points and then
+        // rebuilding a clamped *uniform* knot vector looks right and changes
+        // the shape of any curve whose knots are not evenly spaced.
+        let curve = uneven();
+        let naive = NurbsCurve::new(
+            curve.degree(),
+            curve.control_points().iter().rev().copied().collect(),
+            clamped_uniform_knots(curve.degree(), curve.control_points().len()),
+            None,
+        )
+        .unwrap();
+        let worst = (0..=20)
+            .map(|i| {
+                let t = i as f64 / 20.0;
+                Vec2::from(curve.point_at(t)).distance(Vec2::from(naive.point_at(1.0 - t)))
+            })
+            .fold(0.0, f64::max);
+        assert!(worst > 0.1, "the two agreed to within {worst}");
+    }
+
+    #[test]
+    fn reversing_twice_is_the_original() {
+        let curve = uneven();
+        let there_and_back = curve.reversed().reversed();
+        for i in 0..=10 {
+            let t = i as f64 / 10.0;
+            assert!(close(curve.point_at(t), there_and_back.point_at(t), 1e-12));
+        }
+    }
+
+    #[test]
+    fn elevating_the_degree_does_not_move_the_curve() {
+        for curve in [linear(), uneven(), rational_quarter()] {
+            let raised = curve.elevated(1).unwrap();
+            assert_eq!(raised.degree(), curve.degree() + 1);
+            for i in 0..=20 {
+                let t = i as f64 / 20.0;
+                assert!(
+                    close(curve.point_at(t), raised.point_at(t), 1e-9),
+                    "degree {} at t={t}: {:?} vs {:?}",
+                    curve.degree(),
+                    curve.point_at(t),
+                    raised.point_at(t)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn elevating_a_rational_curve_keeps_it_rational() {
+        let curve = rational_quarter();
+        let raised = curve.elevated(1).unwrap();
+        assert!(raised.is_rational());
+        // Still tracing the circle of radius 100 it started as.
+        for i in 0..=10 {
+            let point = Vec2::from(raised.point_at(i as f64 / 10.0));
+            assert!((point.length() - 100.0).abs() < 1e-9, "{point:?}");
+        }
+    }
+
+    #[test]
+    fn elevating_by_more_than_one_step_compounds() {
+        let curve = uneven();
+        let raised = curve.elevated(3).unwrap();
+        assert_eq!(raised.degree(), curve.degree() + 3);
+        for i in 0..=10 {
+            let t = i as f64 / 10.0;
+            assert!(close(curve.point_at(t), raised.point_at(t), 1e-8));
+        }
+    }
+
+    #[test]
+    fn elevating_by_nothing_has_nothing_to_do() {
+        assert!(uneven().elevated(0).is_none());
     }
 
     #[test]
