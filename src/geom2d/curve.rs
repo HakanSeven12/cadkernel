@@ -30,6 +30,7 @@ use std::f64::consts::TAU;
 use super::angle::{arc_parameter, arc_span, normalize_angle};
 use super::nurbs::NurbsCurve;
 use super::polyline::Polyline;
+use super::vec::Vec2;
 use super::Ellipse;
 
 /// A straight segment.
@@ -44,13 +45,12 @@ pub struct Line {
 impl Line {
     /// Start-to-end vector. Not normalised — its length is the line's.
     pub fn direction(&self) -> [f64; 2] {
-        [self.end[0] - self.start[0], self.end[1] - self.start[1]]
+        (Vec2::from(self.end) - Vec2::from(self.start)).to_array()
     }
 
     /// Length.
     pub fn length(&self) -> f64 {
-        let d = self.direction();
-        (d[0] * d[0] + d[1] * d[1]).sqrt()
+        Vec2::from(self.start).distance(Vec2::from(self.end))
     }
 }
 
@@ -312,12 +312,12 @@ impl Curve {
     pub fn parameter_at(&self, point: [f64; 2]) -> f64 {
         match self {
             Self::Line(line) => {
-                let d = line.direction();
-                let squared = d[0] * d[0] + d[1] * d[1];
+                let along = Vec2::from(line.direction());
+                let squared = along.length_squared();
                 if squared < 1e-24 {
                     return 0.0;
                 }
-                ((point[0] - line.start[0]) * d[0] + (point[1] - line.start[1]) * d[1]) / squared
+                (Vec2::from(point) - Vec2::from(line.start)).dot(along) / squared
             }
             Self::Circle(circle) => {
                 let angle = (point[1] - circle.centre[1]).atan2(point[0] - circle.centre[0]);
@@ -343,12 +343,13 @@ impl Curve {
             Self::Polyline(polyline) => parameter_on_polyline(polyline, point),
             Self::Nurbs(curve) => curve.parameter_at(point),
             Self::Ray(_) | Self::XLine(_) => {
-                let (origin, d) = self.as_ray().expect("straight");
-                let squared = d[0] * d[0] + d[1] * d[1];
+                let (origin, direction) = self.as_ray().expect("straight");
+                let along = Vec2::from(direction);
+                let squared = along.length_squared();
                 if squared < 1e-24 {
                     return 0.0;
                 }
-                ((point[0] - origin[0]) * d[0] + (point[1] - origin[1]) * d[1]) / squared
+                (Vec2::from(point) - Vec2::from(origin)).dot(along) / squared
             }
         }
     }
@@ -435,10 +436,7 @@ fn point_on_polyline(polyline: &Polyline, t: f64) -> [f64; 2] {
     let end = polyline.vertices[(index + 1) % count].position;
     match polyline.segment_arc(index) {
         Some(arc) => arc.sample(local),
-        None => [
-            start[0] + local * (end[0] - start[0]),
-            start[1] + local * (end[1] - start[1]),
-        ],
+        None => Vec2::from(start).lerp(Vec2::from(end), local).to_array(),
     }
 }
 
@@ -468,22 +466,19 @@ fn parameter_on_polyline(polyline: &Polyline, point: [f64; 2]) -> f64 {
                 (travelled / arc.sweep).clamp(0.0, 1.0)
             }
             None => {
-                let dx = end[0] - start[0];
-                let dy = end[1] - start[1];
-                let squared = dx * dx + dy * dy;
+                let along = Vec2::from(end) - Vec2::from(start);
+                let squared = along.length_squared();
                 if squared < 1e-24 {
                     0.0
                 } else {
-                    (((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / squared)
+                    ((Vec2::from(point) - Vec2::from(start)).dot(along) / squared)
                         .clamp(0.0, 1.0)
                 }
             }
         };
         let candidate = (index as f64 + local) / count as f64;
-        let on_curve = point_on_polyline(polyline, candidate);
-        let dx = on_curve[0] - point[0];
-        let dy = on_curve[1] - point[1];
-        let distance = dx * dx + dy * dy;
+        let distance =
+            Vec2::from(point_on_polyline(polyline, candidate)).distance_squared(Vec2::from(point));
         if distance < best.0 {
             best = (distance, candidate);
         }

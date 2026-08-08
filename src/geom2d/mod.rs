@@ -19,6 +19,7 @@ pub mod nurbs;
 pub mod offset;
 pub mod polyline;
 pub mod tessellate;
+pub mod vec;
 
 pub use angle::{angle_within_arc, arc_parameter, arc_span, normalize_angle};
 pub use cross::{intersect, Crossing};
@@ -33,6 +34,7 @@ pub use intersect::{
 pub use offset::offset_polyline;
 pub use polyline::{BulgeArc, Polyline, PolylineVertex};
 pub use tessellate::{arc, ellipse_arc, lerp, DEFAULT_SEGMENTS_PER_RADIAN};
+pub use vec::Vec2;
 
 /// An ellipse in the plane.
 ///

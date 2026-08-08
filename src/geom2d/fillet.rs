@@ -11,6 +11,7 @@
 //! from whatever it has: a pick point, a segment's own extent, a rule.
 
 use super::angle::normalize_angle;
+use super::vec::Vec2;
 
 /// The arc that rounds a corner, and where it meets the two sides.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,8 +46,12 @@ pub fn fillet_between_rays(
     direction2: [f64; 2],
     radius: f64,
 ) -> Option<Fillet> {
-    let cosine = (direction1[0] * direction2[0] + direction1[1] * direction2[1]).clamp(-1.0, 1.0);
-    let corner = cosine.acos();
+    let (apex, direction1, direction2) = (
+        Vec2::from(apex),
+        Vec2::from(direction1),
+        Vec2::from(direction2),
+    );
+    let corner = direction1.dot(direction2).clamp(-1.0, 1.0).acos();
     if corner < 1e-6 || (corner - std::f64::consts::PI).abs() < 1e-6 {
         return None;
     }
@@ -58,37 +63,22 @@ pub fn fillet_between_rays(
     // Along each ray, the tangent point sits r / tan(half) from the apex, and
     // the centre sits r / sin(half) along the bisector.
     let along = radius / half.tan();
-    let tangent1 = [
-        apex[0] + along * direction1[0],
-        apex[1] + along * direction1[1],
-    ];
-    let tangent2 = [
-        apex[0] + along * direction2[0],
-        apex[1] + along * direction2[1],
-    ];
+    let tangent1 = apex + direction1 * along;
+    let tangent2 = apex + direction2 * along;
 
-    let bisector = [
-        direction1[0] + direction2[0],
-        direction1[1] + direction2[1],
-    ];
-    let length = (bisector[0] * bisector[0] + bisector[1] * bisector[1]).sqrt();
-    if length < 1e-10 {
-        return None;
-    }
-    let to_centre = radius / half.sin();
-    let centre = [
-        apex[0] + to_centre * bisector[0] / length,
-        apex[1] + to_centre * bisector[1] / length,
-    ];
+    // Opposed directions have no bisector to place the centre on, which the
+    // parallel check above already refused; this is the belt to its braces.
+    let bisector = (direction1 + direction2).normalize()?;
+    let centre = apex + bisector * (radius / half.sin());
 
-    let angle1 = (tangent1[1] - centre[1]).atan2(tangent1[0] - centre[0]);
-    let angle2 = (tangent2[1] - centre[1]).atan2(tangent2[0] - centre[0]);
+    let angle1 = (tangent1 - centre).angle();
+    let angle2 = (tangent2 - centre).angle();
 
     // Arcs are stored sweeping counter-clockwise, so the endpoints go in the
     // order that fills the corner rather than the one that goes the long way
     // round the outside. Which order that is follows the turn from the first
     // direction to the second.
-    let turn = direction1[0] * direction2[1] - direction1[1] * direction2[0];
+    let turn = direction1.cross(direction2);
     let (start_angle, end_angle) = if turn <= 0.0 {
         (angle1, angle2)
     } else {
@@ -96,9 +86,9 @@ pub fn fillet_between_rays(
     };
 
     Some(Fillet {
-        tangent1,
-        tangent2,
-        centre,
+        tangent1: tangent1.to_array(),
+        tangent2: tangent2.to_array(),
+        centre: centre.to_array(),
         start_angle: normalize_angle(start_angle),
         end_angle: normalize_angle(end_angle),
     })

@@ -117,10 +117,16 @@ it:
 | `iTriangle` | triangulation for fills |
 | `curvo` | NURBS evaluation, derivatives, knot insertion |
 
-Two decisions are still open: the vector math dependency, since the codec
-uses `nalgebra` and the renderer consuming this uses `glam`, so one boundary
-will need conversions either way; and whether the ACIS bridge depends on the
-codec crate directly or inverts so the codec stays unaware of the kernel.
+Vector maths is this crate's own — `geom2d::Vec2`, with `Vec3` and a transform
+to follow when the B-rep layer starts. Not `glam` or `nalgebra`: what is needed
+is add, subtract, scale, dot, cross and normalise, and taking a dependency for
+that would pin every consumer to a version on this crate's account. Public
+signatures stay `[f64; 2]`, which converts for free and imports nothing. If a
+decomposition is ever genuinely needed — fitting a surface through a mesh, say
+— that module can take one behind its own feature.
+
+One decision is still open: whether the ACIS bridge depends on the codec crate
+directly, or inverts so the codec stays unaware of the kernel.
 
 ## Licence
 

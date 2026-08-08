@@ -14,6 +14,8 @@
 //! ellipses arrive once they have been through a modeller — come out visibly
 //! off. Weights are carried here and applied in homogeneous coordinates.
 
+use super::vec::Vec2;
+
 /// A non-uniform rational B-spline curve in the plane.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NurbsCurve {
@@ -157,12 +159,8 @@ impl NurbsCurve {
     /// point that is not on it is projected rather than rejected.
     pub fn parameter_at(&self, point: [f64; 2]) -> f64 {
         let coarse = (self.control_points.len() * 8).max(64);
-        let distance_at = |t: f64| {
-            let on_curve = self.point_at(t);
-            let dx = on_curve[0] - point[0];
-            let dy = on_curve[1] - point[1];
-            dx * dx + dy * dy
-        };
+        let point = Vec2::from(point);
+        let distance_at = |t: f64| Vec2::from(self.point_at(t)).distance_squared(point);
 
         let mut best = 0.0;
         let mut best_distance = f64::INFINITY;
@@ -228,11 +226,7 @@ impl NurbsCurve {
 
     /// Whether the curve comes back to where it started.
     pub fn is_closed(&self) -> bool {
-        let start = self.point_at(0.0);
-        let end = self.point_at(1.0);
-        let dx = end[0] - start[0];
-        let dy = end[1] - start[1];
-        (dx * dx + dy * dy).sqrt() < 1e-9
+        Vec2::from(self.point_at(0.0)).distance(Vec2::from(self.point_at(1.0))) < 1e-9
     }
 
     /// Inserts the knot value `u` once, leaving the curve's shape unchanged.
@@ -369,9 +363,9 @@ impl NurbsCurve {
         // how tangents are stored — stays a consistent dP/dt.
         let mut knots_at = vec![0.0f64; count];
         for i in 1..count {
-            let dx = points[i][0] - points[i - 1][0];
-            let dy = points[i][1] - points[i - 1][1];
-            let chord = (dx * dx + dy * dy).sqrt().max(1e-9);
+            let chord = Vec2::from(points[i - 1])
+                .distance(Vec2::from(points[i]))
+                .max(1e-9);
             let step = match parameterization {
                 Parameterization::Uniform => 1.0,
                 Parameterization::Centripetal => chord.sqrt(),

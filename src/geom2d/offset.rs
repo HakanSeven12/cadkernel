@@ -19,6 +19,7 @@ use cavalier_contours::polyline::{
 
 use super::intersect::line_line;
 use super::polyline::{BulgeArc, Polyline, PolylineVertex};
+use super::vec::Vec2;
 
 /// Positions closer than this are the same point.
 ///
@@ -235,10 +236,10 @@ fn sharpen_joins(raw: &mut CavPolyline<f64>, source: &CavPolyline<f64>) {
             if (connection.radius - 1.0).abs() > JOIN_EPSILON {
                 continue;
             }
+            let centre = Vec2::from(connection.center);
             let sits_on_a_source_vertex = source.iter_vertexes().any(|vertex| {
-                let dx = vertex.x - connection.center[0];
-                let dy = vertex.y - connection.center[1];
-                dx * dx + dy * dy <= JOIN_EPSILON * JOIN_EPSILON
+                Vec2::new(vertex.x, vertex.y).distance_squared(centre)
+                    <= JOIN_EPSILON * JOIN_EPSILON
             });
             if !sits_on_a_source_vertex {
                 continue;

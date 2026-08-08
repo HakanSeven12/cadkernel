@@ -36,6 +36,7 @@
 
 use super::curve::{Curve, Extent};
 use super::intersect::{circle_circle_points, line_circle, line_ellipse, line_line};
+use super::vec::Vec2;
 use super::Tolerance;
 
 /// How deep the subdivision may go before giving up on a branch.
@@ -74,9 +75,7 @@ pub fn intersect(a: &Curve, b: &Curve, tolerance: Tolerance) -> Vec<Crossing> {
 }
 
 fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
-    let dx = a[0] - b[0];
-    let dy = a[1] - b[1];
-    (dx * dx + dy * dy).sqrt()
+    Vec2::from(a).distance(Vec2::from(b))
 }
 
 /// The parameter at `point` if it really lies on `curve`, else `None`.
@@ -223,14 +222,14 @@ impl Piece {
 }
 
 fn distance_to_segment(point: [f64; 2], start: [f64; 2], end: [f64; 2]) -> f64 {
-    let dx = end[0] - start[0];
-    let dy = end[1] - start[1];
-    let squared = dx * dx + dy * dy;
+    let (point, start) = (Vec2::from(point), Vec2::from(start));
+    let along = Vec2::from(end) - start;
+    let squared = along.length_squared();
     if squared < 1e-24 {
-        return distance(point, start);
+        return point.distance(start);
     }
-    let t = (((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / squared).clamp(0.0, 1.0);
-    distance(point, [start[0] + t * dx, start[1] + t * dy])
+    let t = ((point - start).dot(along) / squared).clamp(0.0, 1.0);
+    point.distance(start + along * t)
 }
 
 /// Halves the parameter ranges until both pieces are straight within
@@ -244,8 +243,8 @@ fn subdivided(a: &Curve, b: &Curve, tolerance: Tolerance) -> Vec<[f64; 2]> {
     let mut out = Vec::new();
     if let Some((origin, direction)) = a.as_ray() {
         against_straight(
-            origin,
-            direction,
+            Vec2::from(origin),
+            Vec2::from(direction),
             b,
             &Piece::of(b, 0.0, 1.0),
             a,
@@ -255,8 +254,8 @@ fn subdivided(a: &Curve, b: &Curve, tolerance: Tolerance) -> Vec<[f64; 2]> {
         );
     } else if let Some((origin, direction)) = b.as_ray() {
         against_straight(
-            origin,
-            direction,
+            Vec2::from(origin),
+            Vec2::from(direction),
             a,
             &Piece::of(a, 0.0, 1.0),
             b,
@@ -281,8 +280,8 @@ fn subdivided(a: &Curve, b: &Curve, tolerance: Tolerance) -> Vec<[f64; 2]> {
 /// Subdivides only the curved side, keeping the straight one whole.
 #[allow(clippy::too_many_arguments)]
 fn against_straight(
-    origin: [f64; 2],
-    direction: [f64; 2],
+    origin: Vec2,
+    direction: Vec2,
     curve: &Curve,
     piece: &Piece,
     straight: &Curve,
@@ -292,9 +291,7 @@ fn against_straight(
 ) {
     // Which side of the line each corner of the piece's box falls on. All on
     // one side means the line misses it.
-    let side = |p: [f64; 2]| {
-        direction[0] * (p[1] - origin[1]) - direction[1] * (p[0] - origin[0])
-    };
+    let side = |p: [f64; 2]| direction.cross(Vec2::from(p) - origin);
     let corners = [
         side([piece.low[0], piece.low[1]]),
         side([piece.high[0], piece.low[1]]),
@@ -306,11 +303,12 @@ fn against_straight(
     }
 
     if depth >= MAX_DEPTH || piece.bow <= tolerance.linear() {
-        let chord = [piece.end[0] - piece.start[0], piece.end[1] - piece.start[1]];
+        let chord = (Vec2::from(piece.end) - Vec2::from(piece.start)).to_array();
         // The straight side's parameter is left unbounded — a ray or infinite
         // line reaches as far as it reaches, and `on_curve` decides afterwards
         // whether that is on it.
-        let Some((_, u)) = line_line(origin, direction, piece.start, chord) else {
+        let Some((_, u)) = line_line(origin.to_array(), direction.to_array(), piece.start, chord)
+        else {
             return;
         };
         let slack = 1e-9;
@@ -360,14 +358,8 @@ fn descend(
         // Both pieces are chords now, so the exact segment crossing is the
         // answer — up to how far each piece bows, which the refinement below
         // takes out.
-        let d = [
-            piece_a.end[0] - piece_a.start[0],
-            piece_a.end[1] - piece_a.start[1],
-        ];
-        let e = [
-            piece_b.end[0] - piece_b.start[0],
-            piece_b.end[1] - piece_b.start[1],
-        ];
+        let d = (Vec2::from(piece_a.end) - Vec2::from(piece_a.start)).to_array();
+        let e = (Vec2::from(piece_b.end) - Vec2::from(piece_b.start)).to_array();
         let Some((t, u)) = line_line(piece_a.start, d, piece_b.start, e) else {
             return;
         };
