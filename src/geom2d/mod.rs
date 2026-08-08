@@ -8,9 +8,60 @@
 //!
 //! Everything here obeys the coordinate policy in [`frame`].
 
+pub mod angle;
 pub mod frame;
+pub mod intersect;
+pub mod tessellate;
 
+pub use angle::{angle_within_arc, arc_parameter, arc_span, normalize_angle};
 pub use frame::Frame;
+pub use intersect::{circle_circle_angles, line_circle, line_ellipse, line_line};
+pub use tessellate::{arc, ellipse_arc, lerp, DEFAULT_SEGMENTS_PER_RADIAN};
+
+/// An ellipse in the plane.
+///
+/// Grouped rather than passed as loose scalars because the four fields are
+/// only meaningful together, and because a parameter is not interpretable
+/// without the axis it is measured from — see [`Ellipse::point_at`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ellipse {
+    /// Centre in world coordinates.
+    pub centre: [f64; 2],
+    /// Half-length along [`major_axis`](Self::major_axis).
+    pub major_radius: f64,
+    /// Half-length across it.
+    pub minor_radius: f64,
+    /// Unit vector along the major axis. The minor direction is this turned a
+    /// quarter turn counter-clockwise.
+    pub major_axis: [f64; 2],
+}
+
+impl Ellipse {
+    /// The unit minor direction: [`major_axis`](Self::major_axis) rotated a
+    /// quarter turn counter-clockwise.
+    pub fn minor_axis(&self) -> [f64; 2] {
+        [-self.major_axis[1], self.major_axis[0]]
+    }
+
+    /// The point at parameter `t`.
+    ///
+    /// `t` is the ellipse's own parameter, not an angle measured at the
+    /// centre: the two agree only when the radii are equal.
+    pub fn point_at(&self, t: f64) -> [f64; 2] {
+        let along = self.major_radius * t.cos();
+        let across = self.minor_radius * t.sin();
+        let minor = self.minor_axis();
+        [
+            self.centre[0] + along * self.major_axis[0] + across * minor[0],
+            self.centre[1] + along * self.major_axis[1] + across * minor[1],
+        ]
+    }
+
+    /// Whether the radii are large enough to describe a curve at all.
+    pub(crate) fn is_degenerate(&self) -> bool {
+        self.major_radius.abs() < 1e-20 || self.minor_radius.abs() < 1e-20
+    }
+}
 
 /// Distance below which two positions are treated as one.
 ///
