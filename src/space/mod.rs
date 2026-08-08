@@ -11,6 +11,7 @@
 //! circles, ellipses and polylines are stored exactly this way, and so is a
 //! planar B-rep face.
 
+pub mod curve;
 pub mod plane;
 pub mod polygon;
 pub mod vec;
