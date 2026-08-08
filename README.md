@@ -80,6 +80,11 @@ is taken apart into pieces that have one, and what remains is subdivided and
 refined until it converges to the tolerance asked for. Nothing is sampled at a
 fixed density and no result is left approximate.
 
+Nearest points and containment come off the same dispatch: the point on a
+curve nearest a cursor, and whether a point lies inside a boundary — the
+latter by casting a ray and counting crossings, retried from another angle
+when the ray grazes a corner rather than passing through it.
+
 In: 2D curve intersection, offset, containment, chaining, area and length;
 B-rep topology, surface–surface intersection, booleans; exact ACIS lift and
 lower.
