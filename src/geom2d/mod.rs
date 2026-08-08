@@ -12,6 +12,7 @@ pub mod angle;
 pub mod containment;
 pub mod cross;
 pub mod curve;
+pub mod deviation;
 pub mod fillet;
 pub mod frame;
 pub mod intersect;
