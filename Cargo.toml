@@ -11,10 +11,15 @@ categories = ["mathematics", "graphics"]
 [features]
 default = ["geom2d"]
 
-# 2D curve algebra: curve types, intersection, offset, containment, chaining.
+# 2D curve algebra: curve types, intersection, containment, chaining.
 # Depends on nothing outside this crate. The 3D layer is built on top of it,
 # because splitting a face during a boolean is a 2D problem in (u, v) space.
 geom2d = []
+
+# Parallel offset of a polyline. Separate because it is the one part of the
+# 2D layer that needs an outside implementation, and a caller that only wants
+# intersection or tessellation should not pay for it.
+offset = ["geom2d", "dep:cavalier_contours"]
 
 # Owned, mutable B-rep topology plus the operations that act on it.
 brep = ["geom2d"]
@@ -25,5 +30,8 @@ brep = ["geom2d"]
 acis = ["brep"]
 
 [dependencies]
+# Offsetting only. Pinned to match the version already resolved elsewhere in
+# this stack, since the offset path reaches into the crate's internals.
+cavalier_contours = { version = "=0.7.0", optional = true }
 
 [dev-dependencies]

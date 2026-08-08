@@ -11,11 +11,17 @@
 pub mod angle;
 pub mod frame;
 pub mod intersect;
+#[cfg(feature = "offset")]
+pub mod offset;
+pub mod polyline;
 pub mod tessellate;
 
 pub use angle::{angle_within_arc, arc_parameter, arc_span, normalize_angle};
 pub use frame::Frame;
 pub use intersect::{circle_circle_angles, line_circle, line_ellipse, line_line};
+#[cfg(feature = "offset")]
+pub use offset::offset_polyline;
+pub use polyline::{BulgeArc, Polyline, PolylineVertex};
 pub use tessellate::{arc, ellipse_arc, lerp, DEFAULT_SEGMENTS_PER_RADIAN};
 
 /// An ellipse in the plane.

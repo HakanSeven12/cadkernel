@@ -13,10 +13,11 @@ acis    lift a SatDocument into brep, lower it back        [feature = "acis"]
   │
 brep    owned mutable topology, SSI, boolean, blends       [feature = "brep"]
   │
-geom2d  curves, intersection, offset, containment          [feature = "geom2d"]
+geom2d  curves, intersection, containment, tessellation    [feature = "geom2d"]
+  └ offset  parallel offset of a polyline                  [feature = "offset"]
 ```
 
-`geom2d` is the default feature and compiles alone.
+`geom2d` is the default feature, compiles alone, and pulls in nothing.
 
 The direction is the point. Splitting a face during a boolean means
 projecting the intersection curve into that face's `(u, v)` space and running
@@ -90,15 +91,23 @@ rather than approximate quietly.
 
 ## Dependencies
 
-None yet, deliberately. The intent is to take algorithms that are already
-solved rather than rewrite them, but each one gets added when the code that
-needs it lands:
+One so far, and only under `offset`:
+
+| Crate | For |
+| --- | --- |
+| `cavalier_contours` | polyline offset — the surviving-pieces problem, not the moving-segments one |
+
+Offsetting is behind its own feature because of it: the default build stays
+dependency-free. The version is pinned, because the offset path reaches into
+the crate's internals rather than only its public API.
+
+The rest are intended but not yet added; each arrives with the code that needs
+it:
 
 | Crate | For |
 | --- | --- |
 | `robust` | exact orientation predicates — classification is where naive kernels break |
 | `rstar` | spatial index for intersection candidate pruning and snapping |
-| `cavalier_contours` | bulge-aware polyline offset and boolean |
 | `iTriangle` | triangulation for fills |
 | `curvo` | NURBS evaluation, derivatives, knot insertion |
 
