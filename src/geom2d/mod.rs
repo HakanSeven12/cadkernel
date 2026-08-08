@@ -10,6 +10,7 @@
 
 pub mod angle;
 pub mod arclength;
+pub mod area;
 pub mod arrangement;
 pub mod containment;
 pub mod cross;
