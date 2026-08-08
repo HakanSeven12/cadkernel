@@ -70,6 +70,11 @@ impl NurbsCurve {
         &self.control_points
     }
 
+    /// The knot vector.
+    pub fn knots(&self) -> &[f64] {
+        &self.knots
+    }
+
     /// The weights, one per control point. All ones for a polynomial curve.
     pub fn weights(&self) -> &[f64] {
         &self.weights
