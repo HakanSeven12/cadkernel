@@ -9,6 +9,8 @@
 //! brep    owned mutable topology, SSI, boolean, blends       [feature = "brep"]
 //!   │
 //! geom2d  curves, intersection, offset, containment          [feature = "geom2d"]
+//!   │
+//! space   the plane a 2D curve lives on, and the map to it
 //! ```
 //!
 //! The direction matters. Splitting a face during a boolean means projecting
@@ -23,6 +25,10 @@
 //! [`geom2d::frame`] for why this is an invariant rather than a convenience.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+
+/// Unconditional: a plane and a vector depend on nothing, and a caller that
+/// wants only the ACIS layer still has to say where a face's frame points.
+pub mod space;
 
 #[cfg(feature = "geom2d")]
 pub mod geom2d;
