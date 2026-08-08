@@ -9,6 +9,8 @@
 //! Everything here obeys the coordinate policy in [`frame`].
 
 pub mod angle;
+pub mod cross;
+pub mod curve;
 pub mod fillet;
 pub mod frame;
 pub mod intersect;
@@ -18,6 +20,8 @@ pub mod polyline;
 pub mod tessellate;
 
 pub use angle::{angle_within_arc, arc_parameter, arc_span, normalize_angle};
+pub use cross::{intersect, intersect_with_density, Crossing};
+pub use curve::{Arc, Circle, Curve, EllipseArc, Line};
 pub use frame::Frame;
 pub use fillet::{fillet_between_rays, Fillet};
 pub use intersect::{
