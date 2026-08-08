@@ -28,6 +28,7 @@
 use std::f64::consts::TAU;
 
 use super::angle::{arc_parameter, arc_span, normalize_angle};
+use super::nurbs::NurbsCurve;
 use super::polyline::Polyline;
 use super::Ellipse;
 
@@ -131,6 +132,8 @@ pub enum Curve {
     Ellipse(EllipseArc),
     /// A chain of straight and arc segments.
     Polyline(Polyline),
+    /// A NURBS curve — a drawing's SPLINE.
+    Nurbs(NurbsCurve),
 }
 
 impl Curve {
@@ -142,6 +145,7 @@ impl Curve {
             Self::Arc(arc) => (arc.sweep() - TAU).abs() < 1e-9,
             Self::Ellipse(arc) => (arc.sweep() - TAU).abs() < 1e-9,
             Self::Polyline(polyline) => polyline.closed,
+            Self::Nurbs(curve) => curve.is_closed(),
         }
     }
 
@@ -174,6 +178,7 @@ impl Curve {
                 .ellipse
                 .point_at(arc.start_parameter + t * arc.sweep()),
             Self::Polyline(polyline) => point_on_polyline(polyline, t),
+            Self::Nurbs(curve) => curve.point_at(t),
         }
     }
 
@@ -214,6 +219,7 @@ impl Curve {
                 travelled / arc.sweep()
             }
             Self::Polyline(polyline) => parameter_on_polyline(polyline, point),
+            Self::Nurbs(curve) => curve.parameter_at(point),
         }
     }
 
@@ -249,6 +255,12 @@ impl Curve {
                     .collect()
             }
             Self::Polyline(polyline) => tessellate_polyline(polyline, segments_per_radian),
+            Self::Nurbs(curve) => {
+                // A spline has no sweep to measure, so the density is spent
+                // per knot span instead — which is where its shape changes.
+                let per_span = ((segments_per_radian / 4.0).ceil() as usize).max(2);
+                curve.tessellate(per_span)
+            }
         }
     }
 }
