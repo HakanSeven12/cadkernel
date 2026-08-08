@@ -341,6 +341,130 @@ impl NurbsCurve {
             .then_some((left, right))
     }
 
+    /// The C² cubic through every one of `points`.
+    ///
+    /// This is the other way a drawing describes a spline: fit points it must
+    /// pass through, with optional tangents at the ends, rather than a control
+    /// polygon it merely approaches. Both arrive as SPLINE entities and both
+    /// have to be trimmable, so a fit-point spline is turned into an exact
+    /// curve here rather than sampled into a polyline.
+    ///
+    /// A tangent that is absent — or zero, which is how "unset" is stored —
+    /// gets the natural end condition instead, leaving the second derivative
+    /// zero there.
+    ///
+    /// `None` for fewer than two points, where there is no curve.
+    pub fn interpolate(
+        points: &[[f64; 2]],
+        start_tangent: Option<[f64; 2]>,
+        end_tangent: Option<[f64; 2]>,
+        parameterization: Parameterization,
+    ) -> Option<Self> {
+        let count = points.len();
+        if count < 2 {
+            return None;
+        }
+
+        // Parameter values, left unnormalised so a unit end tangent — which is
+        // how tangents are stored — stays a consistent dP/dt.
+        let mut knots_at = vec![0.0f64; count];
+        for i in 1..count {
+            let dx = points[i][0] - points[i - 1][0];
+            let dy = points[i][1] - points[i - 1][1];
+            let chord = (dx * dx + dy * dy).sqrt().max(1e-9);
+            let step = match parameterization {
+                Parameterization::Uniform => 1.0,
+                Parameterization::Centripetal => chord.sqrt(),
+                Parameterization::Chord => chord,
+            };
+            knots_at[i] = knots_at[i - 1] + step;
+        }
+        let spans: Vec<f64> = (0..count - 1)
+            .map(|i| (knots_at[i + 1] - knots_at[i]).max(1e-9))
+            .collect();
+
+        let usable = |t: Option<[f64; 2]>| {
+            t.filter(|v| v[0] * v[0] + v[1] * v[1] > 1e-18)
+        };
+        let start_tangent = usable(start_tangent);
+        let end_tangent = usable(end_tangent);
+
+        // Solve for dP/dt at each fit point, one axis at a time. The interior
+        // rows are C² continuity; the end rows are either the clamped tangent
+        // or the natural condition.
+        let mut slopes = [vec![0.0f64; count], vec![0.0f64; count]];
+        for (axis, slope) in slopes.iter_mut().enumerate() {
+            let segment_slope =
+                |i: usize| (points[i + 1][axis] - points[i][axis]) / spans[i];
+            let mut sub = vec![0.0; count];
+            let mut main = vec![0.0; count];
+            let mut sup = vec![0.0; count];
+            let mut rhs = vec![0.0; count];
+
+            match start_tangent {
+                Some(t) => {
+                    main[0] = 1.0;
+                    rhs[0] = t[axis];
+                }
+                None => {
+                    main[0] = 2.0;
+                    sup[0] = 1.0;
+                    rhs[0] = 3.0 * segment_slope(0);
+                }
+            }
+            for i in 1..count - 1 {
+                sub[i] = spans[i];
+                main[i] = 2.0 * (spans[i - 1] + spans[i]);
+                sup[i] = spans[i - 1];
+                rhs[i] = 3.0
+                    * (spans[i] * segment_slope(i - 1) + spans[i - 1] * segment_slope(i));
+            }
+            match end_tangent {
+                Some(t) => {
+                    main[count - 1] = 1.0;
+                    rhs[count - 1] = t[axis];
+                }
+                None => {
+                    sub[count - 1] = 1.0;
+                    main[count - 1] = 2.0;
+                    rhs[count - 1] = 3.0 * segment_slope(count - 2);
+                }
+            }
+            solve_tridiagonal(&sub, &main, &sup, &mut rhs);
+            *slope = rhs;
+        }
+
+        // Each Hermite span becomes a cubic Bezier: the inner control points
+        // sit a third of the span's derivative from each end. Chaining them is
+        // a degree-3 B-spline whose interior knots carry multiplicity 3.
+        let mut control_points = Vec::with_capacity(3 * count - 2);
+        control_points.push(points[0]);
+        for i in 0..count - 1 {
+            let h = spans[i];
+            let from = points[i];
+            let to = points[i + 1];
+            let m0 = [slopes[0][i] * h, slopes[1][i] * h];
+            let m1 = [slopes[0][i + 1] * h, slopes[1][i + 1] * h];
+            control_points.push([from[0] + m0[0] / 3.0, from[1] + m0[1] / 3.0]);
+            control_points.push([to[0] - m1[0] / 3.0, to[1] - m1[1] / 3.0]);
+            control_points.push(to);
+        }
+
+        let mut knots = vec![knots_at[0]; 4];
+        for value in knots_at.iter().take(count - 1).skip(1) {
+            knots.extend([*value; 3]);
+        }
+        knots.extend([knots_at[count - 1]; 4]);
+
+        let weights = vec![1.0; control_points.len()];
+        Some(Self {
+            degree: 3,
+            knots,
+            control_points,
+            weights,
+        })
+    }
+
     /// Index of the knot span holding `u`.
     fn span_containing(&self, u: f64) -> usize {
         let last = self.control_points.len() - 1;
@@ -358,6 +482,36 @@ impl NurbsCurve {
             }
         }
         low
+    }
+}
+
+/// How fit points are spaced along the parameter when interpolating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parameterization {
+    /// Equal parameter per span, ignoring distance. Bunches the curve where
+    /// the points are far apart.
+    Uniform,
+    /// Square root of chord length. The usual compromise, and what tends to
+    /// avoid the loops chord-length parameterisation produces at sharp turns.
+    Centripetal,
+    /// Chord length.
+    Chord,
+}
+
+/// In-place Thomas solve for a tridiagonal system: `a` sub-diagonal, `b` main,
+/// `c` super, `d` right-hand side, overwritten with the solution.
+fn solve_tridiagonal(a: &[f64], b: &[f64], c: &[f64], d: &mut [f64]) {
+    let n = d.len();
+    let mut scratch = vec![0.0f64; n];
+    scratch[0] = c[0] / b[0];
+    d[0] /= b[0];
+    for i in 1..n {
+        let m = b[i] - a[i] * scratch[i - 1];
+        scratch[i] = c[i] / m;
+        d[i] = (d[i] - a[i] * d[i - 1]) / m;
+    }
+    for i in (0..n - 1).rev() {
+        d[i] -= scratch[i] * d[i + 1];
     }
 }
 
@@ -644,6 +798,106 @@ mod tests {
         let curve = linear();
         assert!(curve.split_at(0.0).is_none());
         assert!(curve.split_at(1.0).is_none());
+    }
+
+    #[test]
+    fn an_interpolated_curve_passes_through_every_fit_point() {
+        let fit = [[0.0, 0.0], [1.0, 2.0], [3.0, 1.0], [5.0, 4.0]];
+        let curve =
+            NurbsCurve::interpolate(&fit, None, None, Parameterization::Chord).unwrap();
+        // Each fit point sits at the knot value its parameterisation gave it,
+        // and the joins carry multiplicity 3, so they are knots in the vector.
+        let (start, end) = curve.domain();
+        assert!(close(curve.point_at_knot(start), fit[0], 1e-9));
+        assert!(close(curve.point_at_knot(end), fit[3], 1e-9));
+        for target in fit {
+            let t = curve.parameter_at(target);
+            assert!(
+                close(curve.point_at(t), target, 1e-6),
+                "missed {target:?}, nearest was {:?}",
+                curve.point_at(t)
+            );
+        }
+    }
+
+    #[test]
+    fn two_fit_points_with_tangents_make_one_cubic() {
+        // The case a drawing produces most often for a simple curve, and the
+        // one that has no interior fit point to lean on.
+        let fit = [[0.0, 0.0], [10.0, 0.0]];
+        let curve = NurbsCurve::interpolate(
+            &fit,
+            Some([0.0, 1.0]),
+            Some([0.0, -1.0]),
+            Parameterization::Chord,
+        )
+        .unwrap();
+        assert_eq!(curve.degree(), 3);
+        assert_eq!(curve.control_points().len(), 4, "a single Bezier span");
+        assert!(close(curve.point_at(0.0), fit[0], 1e-9));
+        assert!(close(curve.point_at(1.0), fit[1], 1e-9));
+        // Leaves upward and arrives heading downward, so it arches over.
+        assert!(curve.point_at(0.5)[1] > 0.0, "should bow upward");
+    }
+
+    #[test]
+    fn the_stored_tangents_are_followed_at_the_ends() {
+        let fit = [[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]];
+        let curve = NurbsCurve::interpolate(
+            &fit,
+            Some([1.0, 2.0]),
+            Some([1.0, -2.0]),
+            Parameterization::Chord,
+        )
+        .unwrap();
+        // Direction leaving the start, by finite difference.
+        let a = curve.point_at(0.0);
+        let b = curve.point_at(0.001);
+        let leaving = (b[1] - a[1]) / (b[0] - a[0]);
+        assert!((leaving - 2.0).abs() < 0.05, "left along {leaving}, wanted 2");
+
+        let c = curve.point_at(0.999);
+        let d = curve.point_at(1.0);
+        let arriving = (d[1] - c[1]) / (d[0] - c[0]);
+        assert!((arriving + 2.0).abs() < 0.05, "arrived along {arriving}");
+    }
+
+    #[test]
+    fn interpolation_without_tangents_still_passes_through() {
+        let fit = [[0.0, 0.0], [2.0, 3.0], [4.0, -1.0]];
+        for mode in [
+            Parameterization::Uniform,
+            Parameterization::Centripetal,
+            Parameterization::Chord,
+        ] {
+            let curve = NurbsCurve::interpolate(&fit, None, None, mode).unwrap();
+            for target in fit {
+                let t = curve.parameter_at(target);
+                assert!(close(curve.point_at(t), target, 1e-6), "{mode:?} missed {target:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_interpolated_curve_can_be_split_like_any_other() {
+        let fit = [[0.0, 0.0], [1.0, 2.0], [3.0, 1.0], [5.0, 4.0]];
+        let curve =
+            NurbsCurve::interpolate(&fit, None, None, Parameterization::Chord).unwrap();
+        let (left, right) = curve.split_at(0.45).expect("should split");
+        assert!(close(left.point_at(1.0), right.point_at(0.0), 1e-9));
+        for i in 0..=10 {
+            let f = i as f64 / 10.0;
+            assert!(close(left.point_at(f), curve.point_at(f * 0.45), 1e-9));
+        }
+    }
+
+    #[test]
+    fn fewer_than_two_fit_points_is_not_a_curve() {
+        assert!(NurbsCurve::interpolate(&[], None, None, Parameterization::Chord).is_none());
+        assert!(
+            NurbsCurve::interpolate(&[[1.0, 1.0]], None, None, Parameterization::Chord)
+                .is_none()
+        );
     }
 
     #[test]
