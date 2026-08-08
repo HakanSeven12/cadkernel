@@ -62,6 +62,25 @@ impl PlanarCurve {
         flat.into_iter().map(|uv| self.lower(uv)).collect()
     }
 
+    /// Samples the curve into world-space points, cut so that no chord
+    /// departs from it by more than `tolerance`.
+    ///
+    /// The measure a drawing wants: a tolerance is a length, so an arc a
+    /// metre across and one a kilometre across each get the points they need
+    /// rather than the same count. See
+    /// [`Curve::tessellate_within`](crate::geom2d::Curve::tessellate_within).
+    ///
+    /// Only valid for a frame that preserves length — the tolerance is
+    /// measured in the plane's coordinates, and a scaled frame would stretch
+    /// it on the way out.
+    pub fn tessellate_within(&self, tolerance: f64) -> Vec<[f64; 3]> {
+        self.curve
+            .tessellate_within(tolerance)
+            .into_iter()
+            .map(|uv| self.lower(uv))
+            .collect()
+    }
+
     /// The plane's unit normal, or `None` if its axes do not span one.
     pub fn normal(&self) -> Option<[f64; 3]> {
         self.plane.normal()
@@ -239,6 +258,37 @@ mod tests {
             PlanarCurve::new(upright(), unit_arc()).normal(),
             Some([0.0, -1.0, 0.0])
         );
+    }
+
+    #[test]
+    fn a_tolerance_scales_the_point_count_with_the_size() {
+        // The reason this exists beside `tessellate`: the density form gives
+        // both of these the same polyline.
+        let small = PlanarCurve::flat(Curve::Arc(Arc {
+            centre: [0.0, 0.0],
+            radius: 1.0,
+            start_angle: 0.0,
+            end_angle: FRAC_PI_2,
+        }));
+        let large = PlanarCurve::flat(Curve::Arc(Arc {
+            centre: [0.0, 0.0],
+            radius: 10_000.0,
+            start_angle: 0.0,
+            end_angle: FRAC_PI_2,
+        }));
+        assert_eq!(small.tessellate(20.0).len(), large.tessellate(20.0).len());
+        assert!(large.tessellate_within(0.01).len() > small.tessellate_within(0.01).len() * 20);
+    }
+
+    #[test]
+    fn a_tolerance_sampling_lands_on_the_plane_too() {
+        let plane = Plane::orthonormal([3.0, 4.0, 5.0], [1.0, 1.0, 0.0], [0.0, 1.0, 1.0]).unwrap();
+        let curve = PlanarCurve::new(plane, unit_arc());
+        let points = curve.tessellate_within(0.001);
+        assert!(points.len() > 8);
+        for point in points {
+            assert!(plane.contains(point, 1e-9), "{point:?}");
+        }
     }
 
     #[test]
