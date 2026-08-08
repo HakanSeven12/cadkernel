@@ -9,6 +9,7 @@
 //! Everything here obeys the coordinate policy in [`frame`].
 
 pub mod angle;
+pub mod fillet;
 pub mod frame;
 pub mod intersect;
 #[cfg(feature = "offset")]
@@ -18,7 +19,10 @@ pub mod tessellate;
 
 pub use angle::{angle_within_arc, arc_parameter, arc_span, normalize_angle};
 pub use frame::Frame;
-pub use intersect::{circle_circle_angles, line_circle, line_ellipse, line_line};
+pub use fillet::{fillet_between_rays, Fillet};
+pub use intersect::{
+    circle_circle_angles, circle_circle_points, line_circle, line_ellipse, line_line,
+};
 #[cfg(feature = "offset")]
 pub use offset::offset_polyline;
 pub use polyline::{BulgeArc, Polyline, PolylineVertex};

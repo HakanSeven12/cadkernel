@@ -191,6 +191,27 @@ pub fn line_ellipse(p: [f64; 2], d: [f64; 2], ellipse: &Ellipse) -> Vec<(f64, f6
         .collect()
 }
 
+/// Where two circles meet, as points.
+///
+/// The same solutions [`circle_circle_angles`] reports, evaluated on the first
+/// circle — for callers placing geometry rather than cutting the circle.
+pub fn circle_circle_points(
+    centre1: [f64; 2],
+    radius1: f64,
+    centre2: [f64; 2],
+    radius2: f64,
+) -> Vec<[f64; 2]> {
+    circle_circle_angles(centre1, radius1, centre2, radius2)
+        .into_iter()
+        .map(|angle| {
+            [
+                centre1[0] + radius1 * angle.cos(),
+                centre1[1] + radius1 * angle.sin(),
+            ]
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +278,19 @@ mod tests {
         assert!((cosines[1] - 0.5).abs() < 1e-9);
         let sines: Vec<f64> = angles.iter().map(|a| a.sin()).collect();
         assert!((sines[0] + sines[1]).abs() < 1e-9, "should be mirrored");
+    }
+
+    #[test]
+    fn the_point_form_lands_on_both_circles() {
+        let pts = circle_circle_points([0.0, 0.0], 1.0, [1.0, 0.0], 1.0);
+        assert_eq!(pts.len(), 2);
+        for p in pts {
+            let on_first = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            let dx = p[0] - 1.0;
+            let on_second = (dx * dx + p[1] * p[1]).sqrt();
+            assert!((on_first - 1.0).abs() < 1e-9, "off circle 1: {on_first}");
+            assert!((on_second - 1.0).abs() < 1e-9, "off circle 2: {on_second}");
+        }
     }
 
     #[test]
