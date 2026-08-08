@@ -1,0 +1,34 @@
+//! A geometry kernel for CAD work: 2D curve algebra with a B-rep solid layer
+//! built on top of it.
+//!
+//! # Layering
+//!
+//! ```text
+//! acis    lift a SatDocument into `brep`, lower it back      [feature = "acis"]
+//!   │
+//! brep    owned mutable topology, SSI, boolean, blends       [feature = "brep"]
+//!   │
+//! geom2d  curves, intersection, offset, containment          [feature = "geom2d"]
+//! ```
+//!
+//! The direction matters. Splitting a face during a boolean means projecting
+//! the intersection curve into the face's `(u, v)` space and running a loop
+//! boolean there — a 2D problem. The quality of [`geom2d`] therefore caps the
+//! quality of [`brep`], and 2D is worth getting right first.
+//!
+//! # Coordinate policy
+//!
+//! Every entry point lifts its input into a local frame before doing any
+//! math, and shifts results back to world coordinates on the way out. See
+//! [`geom2d::frame`] for why this is an invariant rather than a convenience.
+
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+#[cfg(feature = "geom2d")]
+pub mod geom2d;
+
+#[cfg(feature = "brep")]
+pub mod brep;
+
+#[cfg(feature = "acis")]
+pub mod acis;

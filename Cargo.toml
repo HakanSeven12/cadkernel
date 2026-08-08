@@ -1,0 +1,29 @@
+[package]
+name = "cadkernel"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Geometry kernel for CAD: 2D curve operations and a B-rep solid layer"
+repository = "https://github.com/HakanSeven12/cadkernel"
+keywords = ["cad", "geometry", "brep", "nurbs", "kernel"]
+categories = ["mathematics", "graphics"]
+
+[features]
+default = ["geom2d"]
+
+# 2D curve algebra: curve types, intersection, offset, containment, chaining.
+# Depends on nothing outside this crate. The 3D layer is built on top of it,
+# because splitting a face during a boolean is a 2D problem in (u, v) space.
+geom2d = []
+
+# Owned, mutable B-rep topology plus the operations that act on it.
+brep = ["geom2d"]
+
+# Lifting a `SatDocument` into `brep` topology and lowering it back, so an
+# ACIS body can be edited and re-emitted. Keeps every file-format concern in
+# one feature; the kernel core stays format-agnostic.
+acis = ["brep"]
+
+[dependencies]
+
+[dev-dependencies]
