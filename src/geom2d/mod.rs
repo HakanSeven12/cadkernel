@@ -9,6 +9,7 @@
 //! Everything here obeys the coordinate policy in [`frame`].
 
 pub mod angle;
+pub mod arclength;
 pub mod containment;
 pub mod cross;
 pub mod curve;

@@ -105,45 +105,89 @@ impl NurbsCurve {
     /// weights are honoured rather than ignored.
     pub fn point_at_knot(&self, u: f64) -> [f64; 2] {
         let (start, end) = self.domain();
-        let u = u.clamp(start, end);
-        let span = self.span_containing(u);
-
-        // Lift into (w·x, w·y, w), interpolate there, project back.
-        let mut points: Vec<[f64; 3]> = (0..=self.degree)
-            .map(|j| {
-                let index = span + j - self.degree;
-                let w = self.weights[index];
-                let p = self.control_points[index];
-                [p[0] * w, p[1] * w, w]
-            })
-            .collect();
-
-        for round in 1..=self.degree {
-            for j in (round..=self.degree).rev() {
-                let index = span + j - self.degree;
-                let lower = self.knots[index];
-                let upper = self.knots[index + self.degree + 1 - round];
-                let alpha = if (upper - lower).abs() < 1e-15 {
-                    0.0
-                } else {
-                    (u - lower) / (upper - lower)
-                };
-                let (previous, current) = (points[j - 1], points[j]);
-                for (slot, (before, after)) in points[j]
-                    .iter_mut()
-                    .zip(previous.iter().zip(current.iter()))
-                {
-                    *slot = (1.0 - alpha) * before + alpha * after;
-                }
-            }
-        }
-
-        let result = points[self.degree];
+        let result = de_boor(
+            self.degree,
+            &self.knots,
+            &self.homogeneous(),
+            u.clamp(start, end),
+        );
         if result[2].abs() < 1e-15 {
             [result[0], result[1]]
         } else {
             [result[0] / result[2], result[1] / result[2]]
         }
+    }
+
+    /// The derivative `dC/du` at knot value `u`.
+    ///
+    /// Analytic, not a difference quotient. The homogeneous curve `A(u)` is a
+    /// B-spline of degree `p`, so `A'(u)` is one of degree `p − 1` over the
+    /// same knots with the two ends dropped and control points
+    /// `p·(Pw_{i+1} − Pw_i)/(U_{i+p+1} − U_{i+1})`. Projecting back through
+    /// the quotient rule gives `C' = (A'_{xy} − C·A'_w) / A_w`, which stays
+    /// exact for a rational curve — the place a difference quotient would
+    /// quietly lose the weights' effect.
+    ///
+    /// Zero for a degree-zero curve, which has no direction to report.
+    pub fn derivative_at_knot(&self, u: f64) -> [f64; 2] {
+        if self.degree == 0 {
+            return [0.0, 0.0];
+        }
+        let (start, end) = self.domain();
+        let u = u.clamp(start, end);
+        let homogeneous = self.homogeneous();
+        let degree = self.degree as f64;
+        let derivative: Vec<[f64; 3]> = (0..homogeneous.len() - 1)
+            .map(|i| {
+                let span = self.knots[i + self.degree + 1] - self.knots[i + 1];
+                let scale = if span.abs() < 1e-15 {
+                    0.0
+                } else {
+                    degree / span
+                };
+                let (before, after) = (homogeneous[i], homogeneous[i + 1]);
+                [
+                    (after[0] - before[0]) * scale,
+                    (after[1] - before[1]) * scale,
+                    (after[2] - before[2]) * scale,
+                ]
+            })
+            .collect();
+
+        let value = de_boor(self.degree, &self.knots, &homogeneous, u);
+        let slope = de_boor(
+            self.degree - 1,
+            &self.knots[1..self.knots.len() - 1],
+            &derivative,
+            u,
+        );
+        if value[2].abs() < 1e-15 {
+            return [slope[0], slope[1]];
+        }
+        let point = [value[0] / value[2], value[1] / value[2]];
+        [
+            (slope[0] - point[0] * slope[2]) / value[2],
+            (slope[1] - point[1] * slope[2]) / value[2],
+        ]
+    }
+
+    /// The derivative with respect to the `0..=1` parameter, so it composes
+    /// with [`point_at`](Self::point_at) rather than with
+    /// [`point_at_knot`](Self::point_at_knot).
+    pub fn derivative_at(&self, t: f64) -> [f64; 2] {
+        let (start, end) = self.domain();
+        let width = end - start;
+        let slope = self.derivative_at_knot(start + t.clamp(0.0, 1.0) * width);
+        [slope[0] * width, slope[1] * width]
+    }
+
+    /// The control points lifted into `(w·x, w·y, w)`.
+    fn homogeneous(&self) -> Vec<[f64; 3]> {
+        self.control_points
+            .iter()
+            .zip(self.weights.iter())
+            .map(|(p, &w)| [p[0] * w, p[1] * w, w])
+            .collect()
     }
 
     /// The point at `t`, which runs `0..=1` across the [`domain`].
@@ -479,6 +523,68 @@ impl NurbsCurve {
     }
 }
 
+/// de Boor's algorithm over an arbitrary degree, knot vector and set of
+/// homogeneous control points.
+///
+/// Free of `NurbsCurve` so that a curve's derivative — which has its own
+/// degree, knots and control points — can be evaluated by the same code that
+/// evaluates the curve.
+fn de_boor(degree: usize, knots: &[f64], points: &[[f64; 3]], u: f64) -> [f64; 3] {
+    if points.is_empty() {
+        return [0.0, 0.0, 0.0];
+    }
+    if degree == 0 {
+        // A step function: the value is whichever control point's span `u`
+        // falls in.
+        let index = knots
+            .iter()
+            .rposition(|knot| *knot <= u)
+            .unwrap_or(0)
+            .min(points.len() - 1);
+        return points[index];
+    }
+    let last = points.len() - 1;
+    let span = if u >= knots[last + 1] {
+        last
+    } else {
+        let mut low = degree;
+        let mut high = last + 1;
+        while high - low > 1 {
+            let middle = (low + high) / 2;
+            if u < knots[middle] {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        low
+    };
+
+    let mut working: Vec<[f64; 3]> = (0..=degree)
+        .map(|j| points[span + j - degree])
+        .collect();
+    for round in 1..=degree {
+        for j in (round..=degree).rev() {
+            let index = span + j - degree;
+            let lower = knots[index];
+            let upper = knots[index + degree + 1 - round];
+            let alpha = if (upper - lower).abs() < 1e-15 {
+                0.0
+            } else {
+                (u - lower) / (upper - lower)
+            };
+            let (previous, current) = (working[j - 1], working[j]);
+            for (slot, (before, after)) in working[j]
+                .iter_mut()
+                .zip(previous.iter().zip(current.iter()))
+            {
+                *slot = (1.0 - alpha) * before + alpha * after;
+            }
+        }
+    }
+    working[degree]
+}
+
 /// How fit points are spaced along the parameter when interpolating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parameterization {
@@ -543,6 +649,95 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// A rational quarter circle of radius 100 about the origin, the standard
+    /// case where ignoring weights gives a plausible but wrong answer.
+    fn rational_quarter() -> NurbsCurve {
+        let weight = std::f64::consts::FRAC_PI_4.cos();
+        NurbsCurve::new(
+            2,
+            vec![[100.0, 0.0], [100.0, 100.0], [0.0, 100.0]],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            Some(vec![1.0, weight, 1.0]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_derivative_matches_a_difference_quotient() {
+        for curve in [linear(), rational_quarter()] {
+            let (start, end) = curve.domain();
+            let width = end - start;
+            let step = width * 1e-6;
+            // Sampled between the tenths rather than on them, so no sample
+            // lands on an interior knot. A degree-one curve has a corner at
+            // each of those, where the derivative genuinely jumps and a
+            // central difference reports the average of the two sides — it
+            // would be measuring its own blind spot, not the curve.
+            for i in 0..10 {
+                let u = start + width * ((i as f64 + 0.5) / 10.0);
+                let analytic = curve.derivative_at_knot(u);
+                let before = curve.point_at_knot(u - step);
+                let after = curve.point_at_knot(u + step);
+                let numeric = [
+                    (after[0] - before[0]) / (2.0 * step),
+                    (after[1] - before[1]) / (2.0 * step),
+                ];
+                let scale = numeric[0].abs().max(numeric[1].abs()).max(1.0);
+                assert!(
+                    close(analytic, numeric, 1e-4 * scale),
+                    "u={u}: {analytic:?} vs {numeric:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_derivative_of_a_circle_is_perpendicular_to_its_radius() {
+        // The check a difference quotient could also pass, but which pins the
+        // weights: on a rational circle the tangent is exactly perpendicular
+        // to the radius everywhere, and dropping the weights breaks that.
+        let curve = rational_quarter();
+        for i in 0..=10 {
+            let t = i as f64 / 10.0;
+            let point = Vec2::from(curve.point_at(t));
+            let slope = Vec2::from(curve.derivative_at(t));
+            assert!(
+                (point.length() - 100.0).abs() < 1e-9,
+                "not on the circle at {t}"
+            );
+            let alignment = point.normalize().unwrap().dot(slope.normalize().unwrap());
+            assert!(alignment.abs() < 1e-9, "t={t}: alignment {alignment}");
+        }
+    }
+
+    #[test]
+    fn the_unit_parameter_derivative_scales_with_the_domain() {
+        // `derivative_at` composes with `point_at`, so its magnitude is the
+        // knot derivative times the domain width — the factor that makes a
+        // length integral over 0..=1 come out right.
+        let curve = rational_quarter();
+        let (start, end) = curve.domain();
+        let width = end - start;
+        let by_knot = curve.derivative_at_knot(start + 0.5 * width);
+        let by_unit = curve.derivative_at(0.5);
+        assert!(close(
+            by_unit,
+            [by_knot[0] * width, by_knot[1] * width],
+            1e-9
+        ));
+    }
+
+    #[test]
+    fn a_straight_run_has_a_constant_derivative() {
+        // Degree one, so each span is a straight segment and the derivative
+        // is the segment vector scaled by how much parameter it spans.
+        let curve = linear();
+        let first = curve.derivative_at_knot(0.25);
+        let second = curve.derivative_at_knot(0.4);
+        assert!(close(first, second, 1e-9), "{first:?} vs {second:?}");
+        assert!(first[1].abs() < 1e-9, "the first span runs along X");
     }
 
     #[test]
