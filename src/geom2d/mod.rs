@@ -19,6 +19,7 @@ pub mod nurbs;
 #[cfg(feature = "offset")]
 pub mod offset;
 pub mod polyline;
+pub mod snap;
 pub mod tessellate;
 pub mod vec;
 
@@ -35,6 +36,9 @@ pub use intersect::{
 #[cfg(feature = "offset")]
 pub use offset::offset_polyline;
 pub use polyline::{BulgeArc, Polyline, PolylineVertex};
+pub use snap::{
+    characteristic_points, nearest_to, perpendicular_from, tangent_from, SnapKind, SnapPoint,
+};
 pub use tessellate::{arc, ellipse_arc, lerp, DEFAULT_SEGMENTS_PER_RADIAN};
 pub use vec::Vec2;
 
