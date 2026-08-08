@@ -9,9 +9,22 @@
 //! corner along the parts of each line that survive. They carry the choice of
 //! corner, so this module never has to guess it, and the caller resolves them
 //! from whatever it has: a pick point, a segment's own extent, a rule.
+//!
+//! # Curves that do not meet at a corner
+//!
+//! A line and a circle usually do not cross at all, and two circles need not
+//! either, yet both pairs still have arcs tangent to them. There is no apex
+//! to start from, so [`fillets_between`] takes the other route: a circle of
+//! the right radius tangent to a curve has its centre on one of that curve's
+//! offsets, so every fillet is where an offset of one crosses an offset of
+//! the other. That covers the corner case too, and the two agree where they
+//! overlap.
 
 use super::angle::normalize_angle;
+use super::cross::intersect;
+use super::curve::{Circle, Curve, XLine};
 use super::vec::Vec2;
+use super::Tolerance;
 
 /// The arc that rounds a corner, and where it meets the two sides.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,15 +107,352 @@ pub fn fillet_between_rays(
     })
 }
 
+/// Every arc of `radius` tangent to both curves.
+///
+/// The general form of [`fillet_between_rays`], which only knows about two
+/// rays leaving a shared corner. Two curves need not share one — a line and a
+/// circle usually do not meet at all — so the corner cannot be the starting
+/// point.
+///
+/// # The construction
+///
+/// A circle of `radius` tangent to a curve has its centre `radius` away from
+/// it, which is to say on one of the curve's two offsets. So a circle tangent
+/// to *both* has its centre where an offset of one crosses an offset of the
+/// other, and every fillet is one of those crossings. Each side has two
+/// offsets and so there are up to four combinations, each of which may cross
+/// more than once; all of them come back, and choosing between them is the
+/// caller's — it is the one holding the pick points that say which corner was
+/// meant.
+///
+/// Tangent points then follow from the centre: the nearest point of each
+/// original curve to it.
+///
+/// Empty when neither offset pair crosses, and for curves whose offset is not
+/// itself a line or a circle — a spline, an ellipse. Those need the general
+/// offset machinery rather than this closed form.
+pub fn fillets_between(
+    a: &Curve,
+    b: &Curve,
+    radius: f64,
+    tolerance: Tolerance,
+) -> Vec<Fillet> {
+    if radius.is_nan() || radius <= 0.0 || !radius.is_finite() {
+        return Vec::new();
+    }
+    let (Some(a_offsets), Some(b_offsets)) = (offsets(a, radius), offsets(b, radius)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Fillet> = Vec::new();
+    for first in &a_offsets {
+        for second in &b_offsets {
+            for crossing in intersect(first, second, tolerance) {
+                let centre = Vec2::from(crossing.point);
+                let Some(tangent1) = touch_point(a, centre, radius, tolerance) else {
+                    continue;
+                };
+                let Some(tangent2) = touch_point(b, centre, radius, tolerance) else {
+                    continue;
+                };
+                let fillet = arc_through(centre, tangent1, tangent2);
+                // The four offset combinations meet at the same place where
+                // the two curves are tangent to each other, so the same
+                // centre can arrive more than once.
+                if !out.iter().any(|kept| {
+                    Vec2::from(kept.centre).distance(centre) <= tolerance.linear()
+                }) {
+                    out.push(fillet);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The two curves parallel to `curve` at `radius`, or `None` where that is
+/// not itself a line or a circle.
+///
+/// A line's offsets are the two lines beside it; a circle's are the two
+/// concentric circles, and the inner one only exists when the radius leaves
+/// something of it. The straight kinds are offset as infinite lines rather
+/// than as segments, because a fillet's tangent point routinely falls past
+/// the drawn end — which is what makes a fillet extend as well as trim.
+fn offsets(curve: &Curve, radius: f64) -> Option<Vec<Curve>> {
+    match curve {
+        Curve::Line(_) | Curve::Ray(_) | Curve::XLine(_) => {
+            let (origin, along) = curve.as_ray()?;
+            let across = Vec2::from(along).normalize()?.perpendicular();
+            Some(
+                [1.0, -1.0]
+                    .into_iter()
+                    .map(|side| {
+                        Curve::XLine(XLine {
+                            base: (Vec2::from(origin) + across * (radius * side)).to_array(),
+                            direction: along,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        Curve::Circle(circle) => Some(concentric(circle.centre, circle.radius, radius)),
+        Curve::Arc(arc) => Some(concentric(arc.centre, arc.radius, radius)),
+        _ => None,
+    }
+}
+
+fn concentric(centre: [f64; 2], own: f64, radius: f64) -> Vec<Curve> {
+    [own + radius, own - radius]
+        .into_iter()
+        .filter(|r| *r > 1e-12)
+        .map(|r| Curve::Circle(Circle { centre, radius: r }))
+        .collect()
+}
+
+/// Where a circle centred at `centre` touches `curve`.
+///
+/// The nearest point of the curve's own infinite extent, which is where a
+/// tangent circle meets it. `None` if that turns out not to be `radius` away
+/// after all, which weeds out a crossing of the wrong pair of offsets.
+fn touch_point(curve: &Curve, centre: Vec2, radius: f64, tolerance: Tolerance) -> Option<Vec2> {
+    let touch = match curve {
+        Curve::Line(_) | Curve::Ray(_) | Curve::XLine(_) => {
+            let (origin, along) = curve.as_ray()?;
+            let (origin, along) = (Vec2::from(origin), Vec2::from(along));
+            let squared = along.length_squared();
+            if squared <= 0.0 {
+                return None;
+            }
+            origin + along * ((centre - origin).dot(along) / squared)
+        }
+        Curve::Circle(circle) => {
+            let middle = Vec2::from(circle.centre);
+            let out = (centre - middle).normalize()?;
+            middle + out * circle.radius
+        }
+        Curve::Arc(arc) => {
+            let middle = Vec2::from(arc.centre);
+            let out = (centre - middle).normalize()?;
+            middle + out * arc.radius
+        }
+        _ => return None,
+    };
+    let off_by = (touch.distance(centre) - radius).abs();
+    (off_by <= tolerance.linear()).then_some(touch)
+}
+
+/// The arc from one tangent point to the other about `centre`, taking the
+/// shorter of the two ways round.
+///
+/// A fillet is the short way by definition: it rounds a corner rather than
+/// travelling the long way about it. Which of the two arcs between the same
+/// endpoints that is depends on the turn, so it is read off rather than
+/// assumed.
+fn arc_through(centre: Vec2, tangent1: Vec2, tangent2: Vec2) -> Fillet {
+    let angle1 = (tangent1 - centre).angle();
+    let angle2 = (tangent2 - centre).angle();
+    let forward = super::angle::arc_span(angle1, angle2);
+    let (start_angle, end_angle) = if forward <= std::f64::consts::PI {
+        (angle1, angle2)
+    } else {
+        (angle2, angle1)
+    };
+    Fillet {
+        tangent1: tangent1.to_array(),
+        tangent2: tangent2.to_array(),
+        centre: centre.to_array(),
+        start_angle: normalize_angle(start_angle),
+        end_angle: normalize_angle(end_angle),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::angle::arc_span;
+    use super::super::curve::Line;
     use std::f64::consts::{FRAC_PI_2, PI};
 
     /// A right-angle corner at the origin, opening into the first quadrant.
     fn right_angle(radius: f64) -> Fillet {
         fillet_between_rays([0.0, 0.0], [1.0, 0.0], [0.0, 1.0], radius).unwrap()
+    }
+
+    fn tol() -> Tolerance {
+        Tolerance::new(1e-9)
+    }
+
+    /// Every fillet the general form finds, checked for the property that
+    /// defines one: the centre is exactly `radius` from both curves, and each
+    /// tangent point is on its own curve and on the fillet arc.
+    fn check_tangency(a: &Curve, b: &Curve, radius: f64) -> Vec<Fillet> {
+        let found = fillets_between(a, b, radius, tol());
+        for fillet in &found {
+            let centre = Vec2::from(fillet.centre);
+            for (curve, tangent) in [(a, fillet.tangent1), (b, fillet.tangent2)] {
+                let tangent = Vec2::from(tangent);
+                assert!(
+                    (centre.distance(tangent) - radius).abs() < 1e-6,
+                    "tangent point {tangent:?} is not {radius} from {centre:?}"
+                );
+                // On the curve's own infinite extent: a fillet's touch may
+                // fall past a drawn end, which is what lets it extend.
+                let on_curve = match curve {
+                    Curve::Circle(circle) => {
+                        (tangent.distance(Vec2::from(circle.centre)) - circle.radius).abs()
+                    }
+                    Curve::Arc(arc) => {
+                        (tangent.distance(Vec2::from(arc.centre)) - arc.radius).abs()
+                    }
+                    _ => {
+                        let (origin, along) = curve.as_ray().expect("straight");
+                        let along = Vec2::from(along).normalize().unwrap();
+                        (tangent - Vec2::from(origin)).cross(along).abs()
+                    }
+                };
+                assert!(on_curve < 1e-6, "{tangent:?} is not on its curve");
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_line_and_a_circle_have_four_fillets_of_a_given_radius() {
+        // A circle of 10 at the origin and a line 20 below it. Rolling a
+        // circle of radius 5 between them can sit inside or outside the
+        // circle, and above or below the line — four places in all, though
+        // only some exist for any given geometry.
+        let circle = Curve::Circle(Circle {
+            centre: [0.0, 0.0],
+            radius: 10.0,
+        });
+        let line = Curve::Line(Line {
+            start: [-100.0, -20.0],
+            end: [100.0, -20.0],
+        });
+        let found = check_tangency(&circle, &line, 5.0);
+        assert!(!found.is_empty(), "expected at least one fillet");
+        for fillet in &found {
+            // Every centre sits five above or five below the line.
+            assert!(
+                (fillet.centre[1] + 15.0).abs() < 1e-6 || (fillet.centre[1] + 25.0).abs() < 1e-6,
+                "{:?}",
+                fillet.centre
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_tangent_to_a_circle_still_yields_a_fillet() {
+        // The line just touches the circle. The degenerate case a
+        // discriminant test gets wrong by a sign.
+        let circle = Curve::Circle(Circle {
+            centre: [0.0, 0.0],
+            radius: 10.0,
+        });
+        let line = Curve::Line(Line {
+            start: [-50.0, -10.0],
+            end: [50.0, -10.0],
+        });
+        assert!(!check_tangency(&circle, &line, 3.0).is_empty());
+    }
+
+    #[test]
+    fn two_circles_give_fillets_touching_both() {
+        let left = Curve::Circle(Circle {
+            centre: [-20.0, 0.0],
+            radius: 10.0,
+        });
+        let right = Curve::Circle(Circle {
+            centre: [20.0, 0.0],
+            radius: 10.0,
+        });
+        // A radius large enough to bridge the gap between them.
+        let found = check_tangency(&left, &right, 30.0);
+        assert!(!found.is_empty(), "expected a bridging fillet");
+    }
+
+    #[test]
+    fn two_lines_agree_with_the_corner_form() {
+        // The general construction has to land where the closed form does,
+        // or the two would disagree about the same corner.
+        let a = Curve::Line(Line {
+            start: [-10.0, 0.0],
+            end: [10.0, 0.0],
+        });
+        let b = Curve::Line(Line {
+            start: [0.0, -10.0],
+            end: [0.0, 10.0],
+        });
+        let corner = right_angle(2.0);
+        let found = check_tangency(&a, &b, 2.0);
+        // Four corners around the crossing, and the closed form's is one.
+        assert_eq!(found.len(), 4, "{found:?}");
+        assert!(found.iter().any(|fillet| {
+            Vec2::from(fillet.centre).distance(Vec2::from(corner.centre)) < 1e-9
+        }));
+    }
+
+    #[test]
+    fn circles_too_far_apart_have_no_fillet_of_that_radius() {
+        let left = Curve::Circle(Circle {
+            centre: [-1000.0, 0.0],
+            radius: 10.0,
+        });
+        let right = Curve::Circle(Circle {
+            centre: [1000.0, 0.0],
+            radius: 10.0,
+        });
+        assert!(fillets_between(&left, &right, 1.0, tol()).is_empty());
+    }
+
+    #[test]
+    fn a_curve_with_no_closed_form_offset_declines() {
+        let ellipse = Curve::Ellipse(super::super::EllipseArc {
+            ellipse: super::super::Ellipse {
+                centre: [0.0, 0.0],
+                major_radius: 10.0,
+                minor_radius: 5.0,
+                major_axis: [1.0, 0.0],
+            },
+            start_parameter: 0.0,
+            end_parameter: std::f64::consts::TAU,
+        });
+        let line = Curve::Line(Line {
+            start: [-50.0, -20.0],
+            end: [50.0, -20.0],
+        });
+        assert!(fillets_between(&ellipse, &line, 2.0, tol()).is_empty());
+    }
+
+    #[test]
+    fn a_nonsense_radius_is_refused_rather_than_producing_a_point() {
+        let a = Curve::Line(Line {
+            start: [-10.0, 0.0],
+            end: [10.0, 0.0],
+        });
+        let b = Curve::Line(Line {
+            start: [0.0, -10.0],
+            end: [0.0, 10.0],
+        });
+        for radius in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(fillets_between(&a, &b, radius, tol()).is_empty(), "{radius}");
+        }
+    }
+
+    #[test]
+    fn a_fillet_takes_the_short_way_round() {
+        let a = Curve::Line(Line {
+            start: [-10.0, 0.0],
+            end: [10.0, 0.0],
+        });
+        let b = Curve::Line(Line {
+            start: [0.0, -10.0],
+            end: [0.0, 10.0],
+        });
+        for fillet in fillets_between(&a, &b, 2.0, tol()) {
+            let sweep = arc_span(fillet.start_angle, fillet.end_angle);
+            assert!(sweep <= PI + 1e-9, "swept {sweep} the long way");
+        }
     }
 
     #[test]

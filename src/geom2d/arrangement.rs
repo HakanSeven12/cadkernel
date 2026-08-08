@@ -38,6 +38,7 @@
 
 use super::curve::Line;
 use super::vec::Vec2;
+use super::Tolerance;
 use std::collections::{HashMap, HashSet};
 
 /// How nearly parallel two segments must be before they are treated as
@@ -82,15 +83,11 @@ pub enum SegmentCrossing {
 /// a pile of unrelated lines and arcs that merely happen to cross.
 ///
 /// `tolerance` is the distance below which two points are the same one.
-pub fn bounded_faces(segments: &[Line], tolerance: f64) -> Vec<Vec<[f64; 2]>> {
+pub fn bounded_faces(segments: &[Line], tolerance: Tolerance) -> Vec<Vec<[f64; 2]>> {
     if segments.is_empty() {
         return Vec::new();
     }
-    let tolerance = if tolerance.is_finite() && tolerance > 0.0 {
-        tolerance
-    } else {
-        1.0e-9
-    };
+    let tolerance = tolerance.linear();
     let pieces = split_at_crossings(segments, tolerance);
     let graph = Graph::weld(&pieces, tolerance);
     graph.trace_faces()
@@ -122,7 +119,8 @@ pub fn signed_area(ring: &[[f64; 2]]) -> f64 {
 /// collinear and overlap, which a curve-level intersection does not: two
 /// coincident edges have no one crossing, and picking a point from the
 /// stretch would leave the rest of the overlap unsplit.
-pub fn segment_crossing(a: Line, b: Line, tolerance: f64) -> SegmentCrossing {
+pub fn segment_crossing(a: Line, b: Line, tolerance: Tolerance) -> SegmentCrossing {
+    let tolerance = tolerance.linear();
     let (a_start, a_end) = (Vec2::from(a.start), Vec2::from(a.end));
     let (b_start, b_end) = (Vec2::from(b.start), Vec2::from(b.end));
     let along_a = a_end - a_start;
@@ -219,7 +217,7 @@ fn split_at_crossings(segments: &[Line], tolerance: f64) -> Vec<Line> {
             if !bounds[index].overlaps(bounds[other], tolerance) {
                 continue;
             }
-            match segment_crossing(segments[index], segments[other], tolerance) {
+            match segment_crossing(segments[index], segments[other], Tolerance::new(tolerance)) {
                 SegmentCrossing::None => {}
                 SegmentCrossing::Point { a, b } => {
                     cuts[index].push(a.clamp(0.0, 1.0));
@@ -444,7 +442,9 @@ fn weld_point(
 mod tests {
     use super::*;
 
-    const TOL: f64 = 1.0e-6;
+    fn tol() -> Tolerance {
+        Tolerance::new(1.0e-6)
+    }
 
     fn line(a: [f64; 2], b: [f64; 2]) -> Line {
         Line { start: a, end: b }
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn four_segments_that_meet_enclose_one_region() {
-        let faces = bounded_faces(&rectangle(10.0, 5.0), TOL);
+        let faces = bounded_faces(&rectangle(10.0, 5.0), tol());
         assert_eq!(faces.len(), 1);
         assert!((signed_area(&faces[0]) - 50.0).abs() < 1e-9);
     }
@@ -474,7 +474,7 @@ mod tests {
             .map(|l| line(l.end, l.start))
             .collect();
         reversed.reverse();
-        let faces = bounded_faces(&reversed, TOL);
+        let faces = bounded_faces(&reversed, tol());
         assert_eq!(faces.len(), 1);
         assert!(signed_area(&faces[0]) > 0.0, "traced the outside");
     }
@@ -489,7 +489,7 @@ mod tests {
             line([0.0, -1.0], [0.0, 11.0]),
             line([10.0, -1.0], [10.0, 11.0]),
         ];
-        let faces = bounded_faces(&segments, TOL);
+        let faces = bounded_faces(&segments, tol());
         assert_eq!(faces.len(), 1, "{faces:?}");
         assert!((signed_area(&faces[0]) - 100.0).abs() < 1e-9);
     }
@@ -504,7 +504,7 @@ mod tests {
             // The divider.
             line([5.0, 0.0], [5.0, 10.0]),
         ];
-        let mut areas: Vec<f64> = bounded_faces(&segments, TOL)
+        let mut areas: Vec<f64> = bounded_faces(&segments, tol())
             .iter()
             .map(|ring| signed_area(ring))
             .collect();
@@ -524,9 +524,9 @@ mod tests {
             line([10.0, 10.0], [0.0, 10.0]),
             line([0.0, 10.0], [0.0, 0.0]),
         ];
-        assert_eq!(bounded_faces(&segments, TOL).len(), 1);
+        assert_eq!(bounded_faces(&segments, tol()).len(), 1);
         // With a tolerance below the gap there is genuinely nothing closed.
-        assert!(bounded_faces(&segments, 1e-12).is_empty());
+        assert!(bounded_faces(&segments, Tolerance::new(1e-12)).is_empty());
     }
 
     #[test]
@@ -535,14 +535,14 @@ mod tests {
             line([0.0, 0.0], [10.0, 0.0]),
             line([10.0, 0.0], [10.0, 10.0]),
         ];
-        assert!(bounded_faces(&segments, TOL).is_empty());
+        assert!(bounded_faces(&segments, tol()).is_empty());
     }
 
     #[test]
     fn a_spur_hanging_off_a_ring_does_not_become_its_own_face() {
         let mut segments = rectangle(10.0, 10.0);
         segments.push(line([5.0, 10.0], [5.0, 15.0]));
-        let faces = bounded_faces(&segments, TOL);
+        let faces = bounded_faces(&segments, tol());
         assert_eq!(faces.len(), 1, "{faces:?}");
         assert!((signed_area(&faces[0]) - 100.0).abs() < 1e-9);
     }
@@ -552,7 +552,7 @@ mod tests {
         let crossing = segment_crossing(
             line([0.0, 0.0], [10.0, 0.0]),
             line([4.0, 0.0], [14.0, 0.0]),
-            TOL,
+            tol(),
         );
         match crossing {
             SegmentCrossing::Overlap { a, b } => {
@@ -568,7 +568,7 @@ mod tests {
         let crossing = segment_crossing(
             line([0.0, 0.0], [10.0, 0.0]),
             line([10.0, 0.0], [20.0, 0.0]),
-            TOL,
+            tol(),
         );
         assert!(
             matches!(crossing, SegmentCrossing::Point { a, .. } if (a - 1.0).abs() < 1e-9),
@@ -582,7 +582,7 @@ mod tests {
             segment_crossing(
                 line([0.0, 0.0], [10.0, 0.0]),
                 line([0.0, 5.0], [10.0, 5.0]),
-                TOL
+                tol()
             ),
             SegmentCrossing::None
         );
@@ -593,7 +593,7 @@ mod tests {
         let crossing = segment_crossing(
             line([0.0, 0.0], [10.0, 0.0]),
             line([2.0, -1.0], [2.0, 1.0]),
-            TOL,
+            tol(),
         );
         match crossing {
             SegmentCrossing::Point { a, b } => {
@@ -627,7 +627,7 @@ mod tests {
                 )
             })
             .collect();
-        let faces = bounded_faces(&shifted, TOL);
+        let faces = bounded_faces(&shifted, tol());
         assert_eq!(faces.len(), 1);
         assert!((signed_area(&faces[0]) - 50.0).abs() < 1e-6);
     }
@@ -644,7 +644,7 @@ mod tests {
             line([1.0, -1.0], [1.0, 2.0]),
             line([2.0, -1.0], [2.0, 2.0]),
         ];
-        let faces = bounded_faces(&segments, TOL);
+        let faces = bounded_faces(&segments, tol());
         assert_eq!(faces.len(), 1, "{faces:?}");
         assert!((signed_area(&faces[0]) - 1.0).abs() < 1e-9);
     }
@@ -661,7 +661,7 @@ mod tests {
             line([10.0, 10.0], [0.0, 10.0]),
             line([0.0, 10.0], [0.0, 0.0]),
         ];
-        let faces = bounded_faces(&segments, TOL);
+        let faces = bounded_faces(&segments, tol());
         assert_eq!(faces.len(), 1, "{faces:?}");
         assert!((signed_area(&faces[0]) - 100.0).abs() < 1e-6);
     }
@@ -674,24 +674,26 @@ mod tests {
         let a = line([0.0, 0.0], [1.0e9, 1.0e-3]);
         let b = line([5.0e8, 5.0e-4 + 5.0e-7], [1.5e9, 1.5e-3 + 5.0e-7]);
         assert!(
-            matches!(segment_crossing(a, b, TOL), SegmentCrossing::Overlap { .. }),
+            matches!(segment_crossing(a, b, tol()), SegmentCrossing::Overlap { .. }),
             "{:?}",
-            segment_crossing(a, b, TOL)
+            segment_crossing(a, b, tol())
         );
     }
 
     #[test]
-    fn a_degenerate_tolerance_does_not_divide_by_nothing() {
-        for tolerance in [0.0, -1.0, f64::NAN] {
-            let faces = bounded_faces(&rectangle(10.0, 10.0), tolerance);
-            assert_eq!(faces.len(), 1, "tolerance {tolerance}");
-        }
+    fn a_tolerance_finer_than_the_geometry_still_finds_a_clean_ring() {
+        // `Tolerance` refuses a non-positive value at construction, so the
+        // degenerate case cannot reach here; what can is one far below what
+        // the geometry needs, and exact input still closes.
+        let faces = bounded_faces(&rectangle(10.0, 10.0), Tolerance::new(1e-15));
+        assert_eq!(faces.len(), 1);
+        assert!((signed_area(&faces[0]) - 100.0).abs() < 1e-9);
     }
 
     #[test]
     fn collapsed_segments_are_dropped_rather_than_welded_into_knots() {
         let mut segments = rectangle(10.0, 10.0);
         segments.push(line([3.0, 3.0], [3.0, 3.0]));
-        assert_eq!(bounded_faces(&segments, TOL).len(), 1);
+        assert_eq!(bounded_faces(&segments, tol()).len(), 1);
     }
 }

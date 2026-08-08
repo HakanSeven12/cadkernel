@@ -34,7 +34,7 @@ pub use cross::{intersect, Crossing};
 pub use curve::{Arc, Circle, Curve, EllipseArc, Extent, Line, Ray, XLine};
 pub use nurbs::{NurbsCurve, Parameterization};
 pub use frame::Frame;
-pub use fillet::{fillet_between_rays, Fillet};
+pub use fillet::{fillet_between_rays, fillets_between, Fillet};
 pub use intersect::{
     circle_circle_angles, circle_circle_points, line_circle, line_ellipse, line_line,
 };
