@@ -130,9 +130,13 @@ pub fn circle_circle_angles(
 /// [`Ellipse::point_at(t)`](Ellipse::point_at).
 ///
 /// Works by squashing the ellipse into a unit circle, solving there, and
-/// reading the angle back: the squash is a change of basis plus a scale on
-/// each axis, and `atan2` of the *unscaled* local coordinates recovers the
-/// parameter directly because the scaling preserves each component's sign.
+/// reading the parameter off the squashed coordinates — on the unit circle
+/// they *are* `(cos t, sin t)`.
+///
+/// The parameter has to come from the squashed pair, not the unscaled local
+/// one. `atan2(y, x)` on unscaled coordinates is the geometric angle at the
+/// centre, which only equals the parameter on a circle: for a 5:2 ellipse the
+/// two differ by more than twenty degrees near the diagonals.
 pub fn line_ellipse(p: [f64; 2], d: [f64; 2], ellipse: &Ellipse) -> Vec<(f64, f64)> {
     if ellipse.is_degenerate() {
         return Vec::new();
@@ -180,9 +184,9 @@ pub fn line_ellipse(p: [f64; 2], d: [f64; 2], ellipse: &Ellipse) -> Vec<(f64, f6
     line_params
         .into_iter()
         .map(|s| {
-            let x = local_x + s * dir_x;
-            let y = local_y + s * dir_y;
-            (s, y.atan2(x))
+            let cos_t = unit_x + s * unit_dx;
+            let sin_t = unit_y + s * unit_dy;
+            (s, sin_t.atan2(cos_t))
         })
         .collect()
 }
@@ -298,16 +302,56 @@ mod tests {
                 std::f64::consts::FRAC_1_SQRT_2,
             ],
         };
-        let p = [-20.0, 3.0];
-        let d = [1.0, 0.25];
+        // Skew, and through the centre, so it crosses twice well away from the
+        // axes — where a parameter mistaken for a centre angle goes furthest
+        // wrong.
+        let p = [-6.0, -4.0];
+        let d = [1.0, 0.3];
 
-        for (s, t) in line_ellipse(p, d, &ellipse) {
+        let hits = line_ellipse(p, d, &ellipse);
+        assert_eq!(hits.len(), 2, "expected two crossings, got {hits:?}");
+
+        for (s, t) in hits {
             let on_line = [p[0] + s * d[0], p[1] + s * d[1]];
             let on_ellipse = ellipse.point_at(t);
             assert!(
                 (on_line[0] - on_ellipse[0]).abs() < 1e-9
                     && (on_line[1] - on_ellipse[1]).abs() < 1e-9,
                 "line gave {on_line:?} but ellipse parameter gave {on_ellipse:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_returned_parameter_is_not_the_centre_angle() {
+        // Guards the mistake this function used to make: reading `atan2` off
+        // the unscaled local coordinates yields the geometric angle at the
+        // centre, which coincides with the parameter only on a circle. On a
+        // 5:2 ellipse the gap is tens of degrees, and every consumer that cuts
+        // an ellipse at a parameter inherits it.
+        let ellipse = Ellipse {
+            centre: [0.0, 0.0],
+            major_radius: 5.0,
+            minor_radius: 2.0,
+            major_axis: [1.0, 0.0],
+        };
+        // Horizontal line at y = 1, crossing the upper half either side of the
+        // minor axis.
+        let hits = line_ellipse([-10.0, 1.0], [1.0, 0.0], &ellipse);
+        assert_eq!(hits.len(), 2);
+
+        for (s, t) in hits {
+            let on_line = [-10.0 + s, 1.0];
+            let centre_angle = on_line[1].atan2(on_line[0]);
+            assert!(
+                (t - centre_angle).abs() > 0.1,
+                "t {t} collapsed onto the centre angle {centre_angle}"
+            );
+            // sin(t) = y / minor_radius is the defining relation.
+            assert!(
+                (t.sin() - 0.5).abs() < 1e-9,
+                "sin(t) should be y/minor_radius = 0.5, got {}",
+                t.sin()
             );
         }
     }
