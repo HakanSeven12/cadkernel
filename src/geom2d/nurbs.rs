@@ -230,6 +230,112 @@ impl NurbsCurve {
         (dx * dx + dy * dy).sqrt() < 1e-9
     }
 
+    /// Inserts the knot value `u` once, leaving the curve's shape unchanged.
+    ///
+    /// Boehm's algorithm: the control points either side of the affected span
+    /// are replaced by a blend of their neighbours, in homogeneous coordinates
+    /// so a rational curve stays exact. Adding knots is how a curve gets split
+    /// without approximating it — see [`split_at`](Self::split_at).
+    pub fn insert_knot(&mut self, u: f64) {
+        let (start, end) = self.domain();
+        if u <= start || u >= end {
+            return;
+        }
+        let span = self.span_containing(u);
+        let degree = self.degree;
+
+        let homogeneous: Vec<[f64; 3]> = self
+            .control_points
+            .iter()
+            .zip(&self.weights)
+            .map(|(p, w)| [p[0] * w, p[1] * w, *w])
+            .collect();
+
+        let mut updated: Vec<[f64; 3]> = Vec::with_capacity(homogeneous.len() + 1);
+        updated.extend_from_slice(&homogeneous[..=span - degree]);
+        for i in (span - degree + 1)..=span {
+            let lower = self.knots[i];
+            let upper = self.knots[i + degree];
+            let alpha = if (upper - lower).abs() < 1e-15 {
+                0.0
+            } else {
+                (u - lower) / (upper - lower)
+            };
+            updated.push([
+                (1.0 - alpha) * homogeneous[i - 1][0] + alpha * homogeneous[i][0],
+                (1.0 - alpha) * homogeneous[i - 1][1] + alpha * homogeneous[i][1],
+                (1.0 - alpha) * homogeneous[i - 1][2] + alpha * homogeneous[i][2],
+            ]);
+        }
+        updated.extend_from_slice(&homogeneous[span..]);
+
+        self.knots.insert(span + 1, u);
+        self.control_points = updated
+            .iter()
+            .map(|h| {
+                if h[2].abs() < 1e-15 {
+                    [h[0], h[1]]
+                } else {
+                    [h[0] / h[2], h[1] / h[2]]
+                }
+            })
+            .collect();
+        self.weights = updated.iter().map(|h| h[2]).collect();
+    }
+
+    /// Splits the curve at `t`, which runs `0..=1` across the domain.
+    ///
+    /// Both halves are exact: the knot is inserted until it has full
+    /// multiplicity, at which point the control points divide cleanly and each
+    /// half is a clamped curve in its own right. Weights survive, so splitting
+    /// a rational curve does not quietly turn it polynomial.
+    ///
+    /// `None` when the cut falls at or outside an end, where there is nothing
+    /// to divide.
+    pub fn split_at(&self, t: f64) -> Option<(Self, Self)> {
+        let (start, end) = self.domain();
+        let u = start + t.clamp(0.0, 1.0) * (end - start);
+        if u <= start + 1e-12 || u >= end - 1e-12 {
+            return None;
+        }
+
+        let mut work = self.clone();
+        let existing = work.knots.iter().filter(|k| (**k - u).abs() < 1e-12).count();
+        for _ in existing..self.degree {
+            work.insert_knot(u);
+        }
+
+        // With the knot at full multiplicity the control points divide at the
+        // last one that carries it.
+        let cut = work
+            .knots
+            .iter()
+            .rposition(|k| (*k - u).abs() < 1e-12)?;
+        let degree = self.degree;
+        let left_count = cut - degree + 1;
+
+        let left = Self {
+            degree,
+            knots: work.knots[..=cut]
+                .iter()
+                .copied()
+                .chain(std::iter::once(u))
+                .collect(),
+            control_points: work.control_points[..left_count].to_vec(),
+            weights: work.weights[..left_count].to_vec(),
+        };
+        let right = Self {
+            degree,
+            knots: std::iter::once(u)
+                .chain(work.knots[cut - degree + 1..].iter().copied())
+                .collect(),
+            control_points: work.control_points[left_count - 1..].to_vec(),
+            weights: work.weights[left_count - 1..].to_vec(),
+        };
+        (left.control_points.len() > degree && right.control_points.len() > degree)
+            .then_some((left, right))
+    }
+
     /// Index of the knot span holding `u`.
     fn span_containing(&self, u: f64) -> usize {
         let last = self.control_points.len() - 1;
@@ -449,6 +555,88 @@ mod tests {
         )
         .unwrap();
         assert!(closed.is_closed());
+    }
+
+    #[test]
+    fn inserting_a_knot_leaves_the_shape_alone() {
+        let curve = NurbsCurve::new(
+            3,
+            vec![[0.0, 0.0], [1.0, 5.0], [4.0, 5.0], [5.0, 0.0], [8.0, -3.0]],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let before: Vec<[f64; 2]> = (0..=40).map(|i| curve.point_at(i as f64 / 40.0)).collect();
+
+        let mut inserted = curve.clone();
+        inserted.insert_knot(0.37);
+        assert_eq!(inserted.control_points().len(), curve.control_points().len() + 1);
+
+        for (i, expected) in before.iter().enumerate() {
+            let got = inserted.point_at(i as f64 / 40.0);
+            assert!(close(got, *expected, 1e-9), "moved at {i}: {got:?} vs {expected:?}");
+        }
+    }
+
+    #[test]
+    fn both_halves_of_a_split_lie_on_the_original() {
+        let curve = NurbsCurve::new(
+            3,
+            vec![[0.0, 0.0], [1.0, 5.0], [4.0, 5.0], [5.0, 0.0], [8.0, -3.0]],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let (left, right) = curve.split_at(0.4).expect("should split");
+
+        // The halves meet where the cut was, and each covers its own stretch.
+        assert!(close(left.point_at(0.0), curve.point_at(0.0), 1e-9));
+        assert!(close(left.point_at(1.0), curve.point_at(0.4), 1e-9));
+        assert!(close(right.point_at(0.0), curve.point_at(0.4), 1e-9));
+        assert!(close(right.point_at(1.0), curve.point_at(1.0), 1e-9));
+
+        for i in 0..=20 {
+            let f = i as f64 / 20.0;
+            assert!(
+                close(left.point_at(f), curve.point_at(f * 0.4), 1e-9),
+                "left half drifted at {f}"
+            );
+            assert!(
+                close(right.point_at(f), curve.point_at(0.4 + f * 0.6), 1e-9),
+                "right half drifted at {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn splitting_a_rational_curve_keeps_it_rational() {
+        let weight = std::f64::consts::FRAC_1_SQRT_2;
+        let curve = NurbsCurve::new(
+            2,
+            vec![[1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            Some(vec![1.0, weight, 1.0]),
+        )
+        .unwrap();
+        let (left, right) = curve.split_at(0.5).expect("should split");
+        // Both halves must still trace the unit circle.
+        for half in [&left, &right] {
+            for i in 0..=10 {
+                let p = half.point_at(i as f64 / 10.0);
+                let radius = (p[0] * p[0] + p[1] * p[1]).sqrt();
+                assert!(
+                    (radius - 1.0).abs() < 1e-9,
+                    "half left the unit circle: {radius}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn splitting_at_an_end_has_nothing_to_divide() {
+        let curve = linear();
+        assert!(curve.split_at(0.0).is_none());
+        assert!(curve.split_at(1.0).is_none());
     }
 
     #[test]
