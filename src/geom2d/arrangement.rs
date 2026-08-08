@@ -633,6 +633,54 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_on_a_very_long_segment_keeps_its_world_scale() {
+        // The trap in merging cut parameters: a tolerance is a distance, so
+        // on a segment 10¹² long it is a parameter of 10⁻¹². Merging on a
+        // fixed parameter epsilon would collapse the two cuts a unit apart
+        // into one and the small region between them would vanish.
+        let segments = vec![
+            line([0.0, 0.0], [1.0e12, 0.0]),
+            line([0.0, 1.0], [1.0e12, 1.0]),
+            line([1.0, -1.0], [1.0, 2.0]),
+            line([2.0, -1.0], [2.0, 2.0]),
+        ];
+        let faces = bounded_faces(&segments, TOL);
+        assert_eq!(faces.len(), 1, "{faces:?}");
+        assert!((signed_area(&faces[0]) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_collinear_runs_that_overlap_still_close_a_ring() {
+        // The bottom edge arrives as two pieces that share a stretch rather
+        // than meeting end to end — which is what a hatch boundary picked out
+        // of overlapping drawn lines looks like.
+        let segments = vec![
+            line([0.0, 0.0], [7.0, 0.0]),
+            line([3.0, 0.0], [10.0, 0.0]),
+            line([10.0, 0.0], [10.0, 10.0]),
+            line([10.0, 10.0], [0.0, 10.0]),
+            line([0.0, 10.0], [0.0, 0.0]),
+        ];
+        let faces = bounded_faces(&segments, TOL);
+        assert_eq!(faces.len(), 1, "{faces:?}");
+        assert!((signed_area(&faces[0]) - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn near_collinear_segments_a_long_way_out_still_read_as_overlapping() {
+        // Nearly parallel and nearly touching, over a billion units. The
+        // parallel test has to scale with both lengths or this reads as a
+        // crossing at some absurd parameter.
+        let a = line([0.0, 0.0], [1.0e9, 1.0e-3]);
+        let b = line([5.0e8, 5.0e-4 + 5.0e-7], [1.5e9, 1.5e-3 + 5.0e-7]);
+        assert!(
+            matches!(segment_crossing(a, b, TOL), SegmentCrossing::Overlap { .. }),
+            "{:?}",
+            segment_crossing(a, b, TOL)
+        );
+    }
+
+    #[test]
     fn a_degenerate_tolerance_does_not_divide_by_nothing() {
         for tolerance in [0.0, -1.0, f64::NAN] {
             let faces = bounded_faces(&rectangle(10.0, 10.0), tolerance);
