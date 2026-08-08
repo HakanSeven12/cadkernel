@@ -110,6 +110,22 @@ impl Vec2 {
     pub fn lerp(self, other: Self, t: f64) -> Self {
         self + (other - self) * t
     }
+
+    /// How far this point is from the segment between `start` and `end`.
+    ///
+    /// The segment, not the line through it: a point past either end measures
+    /// to that end. A segment of no length measures to the point it collapsed
+    /// to, which keeps a degenerate input from producing a division by
+    /// nothing.
+    pub fn distance_to_segment(self, start: Self, end: Self) -> f64 {
+        let along = end - start;
+        let squared = along.length_squared();
+        if squared < 1e-24 {
+            return self.distance(start);
+        }
+        let t = ((self - start).dot(along) / squared).clamp(0.0, 1.0);
+        self.distance(start + along * t)
+    }
 }
 
 impl From<[f64; 2]> for Vec2 {
@@ -253,6 +269,23 @@ mod tests {
         assert_eq!(a.lerp(b, 0.0), a);
         assert_eq!(a.lerp(b, 1.0), b);
         assert_eq!(a.lerp(b, 0.5), Vec2::new(5.0, 10.0));
+    }
+
+    #[test]
+    fn the_distance_to_a_segment_measures_to_the_segment_not_its_line() {
+        let start = Vec2::new(0.0, 0.0);
+        let end = Vec2::new(10.0, 0.0);
+        // Beside it: the perpendicular.
+        assert_eq!(Vec2::new(4.0, 3.0).distance_to_segment(start, end), 3.0);
+        // Past the end: to the end, not to the line, which would say 3.
+        assert_eq!(Vec2::new(14.0, 3.0).distance_to_segment(start, end), 5.0);
+        assert_eq!(Vec2::new(-4.0, 3.0).distance_to_segment(start, end), 5.0);
+    }
+
+    #[test]
+    fn a_collapsed_segment_measures_to_the_point_it_became() {
+        let point = Vec2::new(3.0, 4.0);
+        assert_eq!(Vec2::ZERO.distance_to_segment(point, point), 5.0);
     }
 
     #[test]

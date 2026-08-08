@@ -17,6 +17,7 @@
 //! is kept.
 
 use super::angle::{arc_span, normalize_angle};
+use super::vec::Vec2;
 use super::Ellipse;
 
 /// Polyline density the editor has used for preview geometry: twenty segments
@@ -97,11 +98,11 @@ pub fn ellipse_arc(
 }
 
 /// A point a fraction `t` of the way from `from` to `to`.
+///
+/// The array-flavoured form of [`Vec2::lerp`], since this crate's signatures
+/// speak in arrays.
 pub fn lerp(from: [f64; 2], to: [f64; 2], t: f64) -> [f64; 2] {
-    [
-        from[0] + t * (to[0] - from[0]),
-        from[1] + t * (to[1] - from[1]),
-    ]
+    Vec2::from(from).lerp(Vec2::from(to), t).to_array()
 }
 
 #[cfg(test)]

@@ -70,10 +70,12 @@ pub fn intersect(a: &Curve, b: &Curve, tolerance: Tolerance) -> Vec<Crossing> {
         .collect();
 
     crossings.sort_by(|x, y| x.t_a.partial_cmp(&y.t_a).unwrap_or(std::cmp::Ordering::Equal));
-    crossings.dedup_by(|x, y| distance(x.point, y.point) <= tolerance.linear());
+    crossings.dedup_by(|x, y| Vec2::from(x.point).distance(Vec2::from(y.point)) <= tolerance.linear());
     crossings
 }
 
+/// Local shorthand for [`Vec2::distance`], since this file asks for it seven
+/// times with expressions for arguments.
 fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
     Vec2::from(a).distance(Vec2::from(b))
 }
@@ -194,7 +196,7 @@ impl Piece {
         let mut high = [start[0].max(end[0]), start[1].max(end[1])];
         for step in 1..4 {
             let point = curve.point_at(from + (to - from) * step as f64 / 4.0);
-            bow = bow.max(distance_to_segment(point, start, end));
+            bow = bow.max(Vec2::from(point).distance_to_segment(Vec2::from(start), Vec2::from(end)));
             low = [low[0].min(point[0]), low[1].min(point[1])];
             high = [high[0].max(point[0]), high[1].max(point[1])];
         }
@@ -219,17 +221,6 @@ impl Piece {
     fn middle(&self) -> f64 {
         (self.from + self.to) * 0.5
     }
-}
-
-fn distance_to_segment(point: [f64; 2], start: [f64; 2], end: [f64; 2]) -> f64 {
-    let (point, start) = (Vec2::from(point), Vec2::from(start));
-    let along = Vec2::from(end) - start;
-    let squared = along.length_squared();
-    if squared < 1e-24 {
-        return point.distance(start);
-    }
-    let t = ((point - start).dot(along) / squared).clamp(0.0, 1.0);
-    point.distance(start + along * t)
 }
 
 /// Halves the parameter ranges until both pieces are straight within
@@ -408,8 +399,8 @@ fn refine(a: &Curve, b: &Curve, guess: f64, tolerance: Tolerance) -> Option<[f64
     for _ in 0..40 {
         let on_b = b.point_at(b.parameter_at(point));
         let on_a = a.point_at(a.parameter_at(on_b));
-        let gap = distance(on_a, on_b);
-        let moved = distance(on_a, point);
+        let gap = Vec2::from(on_a).distance(Vec2::from(on_b));
+        let moved = Vec2::from(on_a).distance(Vec2::from(point));
         point = on_a;
         if gap <= limit {
             return Some(point);
@@ -499,7 +490,7 @@ mod tests {
             assert!(
                 backward
                     .iter()
-                    .any(|other| distance(other.point, hit.point) < 1e-6),
+                    .any(|other| Vec2::from(other.point).distance(Vec2::from(hit.point)) < 1e-6),
                 "missing {hit:?}"
             );
         }
