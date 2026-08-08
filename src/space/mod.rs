@@ -12,6 +12,7 @@
 //! planar B-rep face.
 
 pub mod plane;
+pub mod polygon;
 pub mod vec;
 
 #[cfg(feature = "geom2d")]
