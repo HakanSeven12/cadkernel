@@ -320,27 +320,32 @@ impl NurbsSurface3 {
         )
     }
 
-    /// The unit normal at `(s, t)`, from the two surface directions.
+    /// The unit normal at knot parameters `(u, v)`.
     ///
     /// `None` at a point where the net is degenerate — a pole, or a row of
     /// coincident control points — since there is no plane there to be
     /// perpendicular to and any answer would be invented.
-    pub fn normal_at(&self, s: f64, t: f64) -> Option<[f64; 3]> {
+    pub fn normal_at_knot(&self, u: f64, v: f64) -> Option<[f64; 3]> {
         let ((u0, u1), (v0, v1)) = self.domain();
         let (u_span, v_span) = (u1 - u0, v1 - v0);
         if u_span <= 0.0 || v_span <= 0.0 {
             return None;
         }
-        let (u, v) = (
-            u0 + u_span * s.clamp(0.0, 1.0),
-            v0 + v_span * t.clamp(0.0, 1.0),
-        );
         let (du, dv) = (u_span * 1e-4, v_span * 1e-4);
         let along_u = Vec3::from(self.point_at_knot((u + du).min(u1), v))
             - Vec3::from(self.point_at_knot((u - du).max(u0), v));
         let along_v = Vec3::from(self.point_at_knot(u, (v + dv).min(v1)))
             - Vec3::from(self.point_at_knot(u, (v - dv).max(v0)));
         along_u.cross(along_v).normalize().map(Vec3::to_array)
+    }
+
+    /// The same at `(s, t)` in `0..=1` each.
+    pub fn normal_at(&self, s: f64, t: f64) -> Option<[f64; 3]> {
+        let ((u0, u1), (v0, v1)) = self.domain();
+        self.normal_at_knot(
+            u0 + (u1 - u0) * s.clamp(0.0, 1.0),
+            v0 + (v1 - v0) * t.clamp(0.0, 1.0),
+        )
     }
 }
 

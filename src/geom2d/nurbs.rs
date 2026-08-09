@@ -15,7 +15,11 @@
 //! off. Weights are carried here and applied in homogeneous coordinates.
 
 use super::vec::Vec2;
-use crate::space::spline::{clamped_uniform_knots, de_boor};
+use crate::space::spline::de_boor;
+/// Re-exported from [`space::spline`](crate::space::spline), where it now
+/// lives so a space curve can use it too. Kept reachable here because a
+/// caller building a plane curve looks for it beside one.
+pub use crate::space::spline::clamped_uniform_knots;
 
 /// A non-uniform rational B-spline curve in the plane.
 #[derive(Debug, Clone, PartialEq)]
