@@ -37,6 +37,7 @@ pub mod make;
 pub mod mesh;
 pub mod pcurve;
 pub mod split;
+pub mod sweep;
 pub mod topology;
 
 pub use arena::{Arena, Key};
@@ -45,6 +46,7 @@ pub use geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Sur
 pub use boolean::{combine, Operation};
 pub use classify::{contains_point, Containment};
 pub use mesh::{body as mesh_body, Mesh};
+pub use sweep::extrude;
 pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};
 pub use topology::{
