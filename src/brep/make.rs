@@ -10,10 +10,11 @@
 //! inconsistent body is a builder that will.
 
 use super::arena::Key;
-use super::geometry::{Curve3, Line3, Surface};
+use super::geometry::{Circle3, Curve3, Cylinder, Line3, Surface};
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, Loop, Lump, Shell, Vertex, VertexKey,
 };
+use std::f64::consts::TAU;
 use super::Provenance;
 use crate::space::{Plane, Vec3};
 
@@ -148,6 +149,176 @@ pub fn cuboid(origin: [f64; 3], size: [f64; 3]) -> Option<Body> {
     body.lumps.get_mut(lump)?.shells = vec![shell];
     body.roots = vec![lump];
     Some(body)
+}
+
+/// A right circular cylinder standing on `base`, `height` tall.
+///
+/// Three faces — the two discs and the wall — and the smallest topology that
+/// describes them: two circular edges, one seam running between them, and two
+/// vertices where the seam meets each rim.
+///
+/// The discs are bounded by a single coedge each, which is what a loop looks
+/// like when its edge closes on itself. Requiring two would mean inventing a
+/// split in a rim that has none.
+///
+/// `None` for a radius or height that is not positive.
+pub fn cylinder(base: [f64; 3], radius: f64, height: f64) -> Option<Body> {
+    if radius.is_nan() || height.is_nan() || radius <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let mut body = Body::new();
+    let bottom_plane = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
+    let top_origin = (Vec3::from(base) + Vec3::Z * height).to_array();
+    let top_plane = Plane::orthonormal(top_origin, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
+
+    // The seam sits where the frame's own x axis meets each rim.
+    let seam_low = bottom_plane.point_at([radius, 0.0]);
+    let seam_high = top_plane.point_at([radius, 0.0]);
+    let low = body.vertices.insert(Vertex {
+        point: seam_low,
+        provenance: Provenance::Synthesized,
+    });
+    let high = body.vertices.insert(Vertex {
+        point: seam_high,
+        provenance: Provenance::Synthesized,
+    });
+
+    let bottom_circle = body.curves.insert(Curve3::Circle(Circle3 {
+        plane: bottom_plane,
+        radius,
+    }));
+    let top_circle = body.curves.insert(Curve3::Circle(Circle3 {
+        plane: top_plane,
+        radius,
+    }));
+    let seam_line = body.curves.insert(Curve3::Line(Line3 {
+        origin: seam_low,
+        direction: (Vec3::from(seam_high) - Vec3::from(seam_low)).to_array(),
+    }));
+
+    let rim_low = body.edges.insert(Edge {
+        curve: bottom_circle,
+        start_parameter: 0.0,
+        end_parameter: TAU,
+        start: low,
+        end: low,
+        coedges: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let rim_high = body.edges.insert(Edge {
+        curve: top_circle,
+        start_parameter: 0.0,
+        end_parameter: TAU,
+        start: high,
+        end: high,
+        coedges: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let seam = body.edges.insert(Edge {
+        curve: seam_line,
+        start_parameter: 0.0,
+        end_parameter: 1.0,
+        start: low,
+        end: high,
+        coedges: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+
+    let lump = body.lumps.insert(Lump {
+        shells: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let shell = body.shells.insert(Shell {
+        faces: Vec::new(),
+        owner: lump,
+        provenance: Provenance::Synthesized,
+    });
+
+    // The bottom disc faces down, so its own plane — which faces up — is the
+    // wrong way round and the face says so rather than a second plane being
+    // made for it.
+    let bottom = disc(&mut body, shell, bottom_plane, rim_low, false)?;
+    let top = disc(&mut body, shell, top_plane, rim_high, true)?;
+    let wall = body.surfaces.insert(Surface::Cylinder(Cylinder {
+        base: bottom_plane,
+        radius,
+    }));
+    let side = body.faces.insert(Face {
+        surface: wall,
+        forward: true,
+        loops: Vec::new(),
+        owner: shell,
+        provenance: Provenance::Synthesized,
+    });
+    let ring = body.loops.insert(Loop {
+        coedges: Vec::new(),
+        owner: side,
+        provenance: Provenance::Synthesized,
+    });
+    // Round the bottom rim, up the seam, back round the top rim, down again.
+    let mut coedges = Vec::with_capacity(4);
+    for (edge, forward) in [
+        (rim_low, true),
+        (seam, true),
+        (rim_high, false),
+        (seam, false),
+    ] {
+        let coedge = body.coedges.insert(Coedge {
+            edge,
+            forward,
+            owner: ring,
+            provenance: Provenance::Synthesized,
+        });
+        body.edges.get_mut(edge)?.coedges.push(coedge);
+        coedges.push(coedge);
+    }
+    body.loops.get_mut(ring)?.coedges = coedges;
+    body.faces.get_mut(side)?.loops = vec![ring];
+    body.shells.get_mut(shell)?.faces.push(side);
+
+    let _ = (bottom, top);
+    body.lumps.get_mut(lump)?.shells = vec![shell];
+    body.roots = vec![lump];
+    Some(body)
+}
+
+/// One end cap: a planar face bounded by the rim alone.
+fn disc(
+    body: &mut Body,
+    shell: super::topology::ShellKey,
+    plane: Plane,
+    rim: EdgeKey,
+    forward: bool,
+) -> Option<super::topology::FaceKey> {
+    let surface = body.surfaces.insert(Surface::Plane(plane));
+    let face = body.faces.insert(Face {
+        surface,
+        forward,
+        loops: Vec::new(),
+        owner: shell,
+        provenance: Provenance::Synthesized,
+    });
+    let ring = body.loops.insert(Loop {
+        coedges: Vec::new(),
+        owner: face,
+        provenance: Provenance::Synthesized,
+    });
+    let coedge = body.coedges.insert(Coedge {
+        edge: rim,
+        // A cap's loop runs counter-clockwise seen from outside it, which for
+        // the one facing down is clockwise seen from above — the rim
+        // traversed backwards. So the sense follows the face's own, and the
+        // wall takes the opposite of each: that is what makes a rim one
+        // shared edge instead of two coincident ones.
+        forward,
+        owner: ring,
+        provenance: Provenance::Synthesized,
+    });
+    body.edges.get_mut(rim)?.coedges.push(coedge);
+    body.loops.get_mut(ring)?.coedges = vec![coedge];
+    body.faces.get_mut(face)?.loops = vec![ring];
+    body.shells.get_mut(shell)?.faces.push(face);
+    Some(face)
 }
 
 /// Which of the twelve edges joins two corners, and whether the given order
@@ -311,6 +482,38 @@ mod tests {
             assert_ne!(partner, key);
             assert_eq!(body.partner(partner), Some(key));
         }
+    }
+
+    #[test]
+    fn a_cylinder_has_the_parts_a_cylinder_has() {
+        let solid = cylinder([0.0; 3], 5.0, 10.0).expect("a cylinder");
+        assert_eq!(solid.faces.len(), 3, "two caps and a wall");
+        assert_eq!(solid.edges.len(), 3, "two rims and a seam");
+        assert_eq!(solid.vertices.len(), 2, "where the seam meets each rim");
+        let flaws = solid.validate();
+        assert!(flaws.is_empty(), "{flaws:?}");
+        assert_eq!(solid.euler_characteristic(), 2);
+    }
+
+    #[test]
+    fn a_cylinders_rims_are_each_shared_by_two_faces() {
+        let solid = cylinder([0.0; 3], 3.0, 4.0).unwrap();
+        for (key, edge) in solid.edges.iter() {
+            assert_eq!(edge.coedges.len(), 2, "edge {key:?}");
+            let senses: Vec<bool> = edge
+                .coedges
+                .iter()
+                .map(|c| solid.coedges.get(*c).unwrap().forward)
+                .collect();
+            assert_ne!(senses[0], senses[1], "edge {key:?} runs one way twice");
+        }
+    }
+
+    #[test]
+    fn a_cylinder_with_no_size_is_refused() {
+        assert!(cylinder([0.0; 3], 0.0, 1.0).is_none());
+        assert!(cylinder([0.0; 3], 1.0, -1.0).is_none());
+        assert!(cylinder([0.0; 3], f64::NAN, 1.0).is_none());
     }
 
     #[test]

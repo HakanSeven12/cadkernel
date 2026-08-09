@@ -142,11 +142,17 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
 }
 
 /// A face's loops as curves in its surface's parameter space, each trimmed
-/// to the edge it came from.
+/// to the edge it came from and oriented the way its loop runs.
 ///
-/// The trimming is the part that matters. A straight edge projects to an
-/// infinite line, and a boundary made of infinite lines encloses nothing and
-/// reports every point as lying on it.
+/// The trimming is the part that matters for containment. A straight edge
+/// projects to an infinite line, and a boundary made of infinite lines
+/// encloses nothing and reports every point as lying on it.
+///
+/// The orientation matters for anything walking the ring. An edge has one
+/// direction and its two coedges disagree about it, so a boundary built from
+/// the edges runs backwards wherever the loop does — half the time on any
+/// closed solid. A caller chaining the pieces then gets a ring in no order at
+/// all.
 ///
 /// `None` when any edge's projection has no closed form: a boundary with a
 /// piece missing is worse than none, since a caller would take the rest for
@@ -165,6 +171,12 @@ pub fn face_boundary(
         let curve = body.curves.get(edge.curve)?;
         let flat = project(surface, curve, tolerance)?;
         let (start, end) = body.edge_endpoints(edge_key)?;
+        // The loop's own direction, not the edge's.
+        let (start, end) = if body.coedges.get(coedge)?.forward {
+            (start, end)
+        } else {
+            (end, start)
+        };
         let (from, to) = (
             surface.parameters_at(start)?,
             surface.parameters_at(end)?,

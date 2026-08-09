@@ -353,7 +353,16 @@ impl Body {
         }
 
         for (key, ring) in self.loops.iter() {
-            if ring.coedges.len() < 2 {
+            // One coedge is a loop only when its edge closes on itself — the
+            // rim of a disc, the seam of a full revolution. Anything else
+            // needs at least two to get back where it started.
+            let closed_alone = ring.coedges.len() == 1
+                && self
+                    .coedges
+                    .get(ring.coedges[0])
+                    .and_then(|coedge| self.edges.get(coedge.edge))
+                    .is_some_and(|edge| edge.start == edge.end);
+            if ring.coedges.is_empty() || (ring.coedges.len() < 2 && !closed_alone) {
                 flaws.push(Flaw::DegenerateLoop(key));
                 continue;
             }
