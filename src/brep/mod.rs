@@ -30,6 +30,7 @@ pub mod arena;
 pub mod geometry;
 pub mod intersect;
 pub mod make;
+pub mod pcurve;
 pub mod topology;
 
 pub use arena::{Arena, Key};
