@@ -26,6 +26,18 @@
 //! anything the kernel does not model is lost on the way through. With it,
 //! the blast radius of an edit is the edit.
 
+pub mod arena;
+pub mod geometry;
+pub mod make;
+pub mod topology;
+
+pub use arena::{Arena, Key};
+pub use geometry::{Circle3, Cone, Curve3, Cylinder, Line3, Sphere, Surface, Torus};
+pub use topology::{
+    Body, Coedge, CoedgeKey, CurveKey, Edge, EdgeKey, Face, FaceKey, Flaw, Loop, LoopKey, Lump,
+    LumpKey, Shell, ShellKey, SurfaceKey, Vertex, VertexKey,
+};
+
 /// A node's origin in the document it was lifted from.
 ///
 /// Opaque here on purpose: this layer knows a node came from record *n* of
