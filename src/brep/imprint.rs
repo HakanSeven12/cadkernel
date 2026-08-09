@@ -22,6 +22,7 @@ use super::geometry::Curve3;
 use super::intersect::{surfaces, Meeting};
 use super::split::split_face;
 use super::topology::{Body, FaceKey};
+use crate::space::Vec3;
 
 /// Why an imprint could not be completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,70 @@ pub fn imprint(a: &mut Body, b: &mut Body, tolerance: f64) -> Result<Imprint, Sn
     })
 }
 
+/// Whether two faces share any area rather than merely a plane.
+///
+/// Measured on their boxes, shrunk by the tolerance so a pair meeting along
+/// an edge — which is what coplanar side walls of stacked solids do — reads
+/// as apart rather than as an overlap with nothing in it.
+///
+/// A face that cannot be bounded is treated as overlapping, since "cannot
+/// exclude" is the only safe answer a box test may give.
+fn overlap(a: &Body, one: FaceKey, b: &Body, other: FaceKey, tolerance: f64) -> bool {
+    let (Some(near), Some(far)) = (face_bounds(a, one), face_bounds(b, other)) else {
+        return true;
+    };
+    shrunk(near, tolerance).overlaps(&shrunk(far, tolerance))
+}
+
+/// A box pulled in on every axis that has room to spare.
+///
+/// A face's box is flat in one direction by definition, and pulling that one
+/// in turns it inside out — every coplanar pair then reads as apart, and a
+/// wall that genuinely overlaps is passed over without a word.
+fn shrunk(bounds: Aabb, by: f64) -> Aabb {
+    let mut out = bounds;
+    for axis in 0..3 {
+        if bounds.max[axis] - bounds.min[axis] > 2.0 * by {
+            out.min[axis] += by;
+            out.max[axis] -= by;
+        }
+    }
+    out
+}
+
+/// Whether two faces on the same surface cover the same region of it.
+///
+/// Compared by their corners rather than by area: two rings enclosing the
+/// same area can be different shapes, and what matters here is that neither
+/// face has any part the other does not.
+pub fn same_ground(
+    a: &Body,
+    one: FaceKey,
+    b: &Body,
+    other: FaceKey,
+    tolerance: f64,
+) -> bool {
+    let corners = |body: &Body, face: FaceKey| -> Vec<Vec3> {
+        body.face_coedges(face)
+            .iter()
+            .filter_map(|coedge| body.coedge_vertices(*coedge))
+            .filter_map(|(from, _)| Some(Vec3::from(body.vertices.get(from)?.point)))
+            .collect()
+    };
+    let near = corners(a, one);
+    let far = corners(b, other);
+    if near.is_empty() || near.len() != far.len() {
+        return false;
+    }
+    near.iter().all(|point| {
+        far.iter()
+            .any(|other| point.distance(*other) <= tolerance)
+    }) && far.iter().all(|point| {
+        near.iter()
+            .any(|other| point.distance(*other) <= tolerance)
+    })
+}
+
 /// Curves shared by a pair of faces.
 struct Shared {
     curves: Vec<Curve3>,
@@ -102,7 +167,24 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
             match surfaces(one_surface, other_surface, tolerance) {
                 Meeting::None | Meeting::Points(_) => {}
                 Meeting::Curves(curves) => out.push(Shared { curves }),
-                Meeting::Coincident => return Err(Snag::Coincident),
+                // Two faces on one surface. Where they cover exactly the same
+                // ground there is nothing to imprint — the boolean decides
+                // which copy of the shared wall survives from the two
+                // normals. Where one covers more than the other, the overlap
+                // has to be cut out of both, which is a 2D boolean in the
+                // shared plane and a piece of its own.
+                Meeting::Coincident => {
+                    // Coplanar is not the same as overlapping: two boxes
+                    // stacked face to face have four pairs of side walls on
+                    // one plane each, meeting along a line and sharing no
+                    // area at all. Only a genuine overlap has anything to
+                    // decide.
+                    if overlap(a, *one, b, *other, tolerance)
+                        && !same_ground(a, *one, b, *other, tolerance)
+                    {
+                        return Err(Snag::Coincident);
+                    }
+                }
                 Meeting::Unknown => return Err(Snag::NoClosedForm),
             }
         }
@@ -223,13 +305,20 @@ mod tests {
     }
 
     #[test]
-    fn coincident_faces_are_refused_rather_than_half_handled() {
-        // Two boxes stacked exactly. Their touching faces lie on one plane,
-        // and what that leaves needs their overlap worked out in parameter
-        // space — a different operation, and one whose absence must not look
-        // like success.
+    fn faces_meeting_on_one_plane_are_only_a_problem_when_they_overlap() {
+        // Stacked exactly: the two that meet cover the same ground and the
+        // four pairs of side walls share a plane without sharing any area.
+        // Neither needs cutting, so there is nothing to imprint.
         let mut a = cuboid([0.0; 3], [10.0, 10.0, 10.0]).unwrap();
         let mut b = cuboid([0.0, 0.0, 10.0], [10.0, 10.0, 10.0]).unwrap();
+        let result = imprint(&mut a, &mut b, TOL).expect("nothing to cut");
+        assert_eq!(result.cuts, 0);
+
+        // A smaller box on top: its bottom covers part of the other's top,
+        // and separating the two needs a boolean in that plane — an
+        // operation of its own, whose absence must not look like success.
+        let mut a = cuboid([0.0; 3], [10.0, 10.0, 10.0]).unwrap();
+        let mut b = cuboid([0.0, 0.0, 10.0], [4.0, 4.0, 4.0]).unwrap();
         assert_eq!(imprint(&mut a, &mut b, TOL), Err(Snag::Coincident));
     }
 

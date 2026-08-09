@@ -29,6 +29,7 @@ use super::pcurve;
 use super::topology::{Body, Face, FaceKey, Lump, Shell};
 use super::Provenance;
 use crate::geom2d::Curve;
+use super::geometry::Surface;
 use crate::space::Vec3;
 
 /// Which combination to take.
@@ -71,13 +72,21 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
     result.roots = vec![lump];
 
     let mut kept = 0;
-    for (body, other, wanted, flip) in [(&a, &b, keep_a, false), (&b, &a, keep_b, flip_b)] {
+    for (body, other, wanted, flip, first) in [
+        (&a, &b, keep_a, false, true),
+        (&b, &a, keep_b, flip_b, false),
+    ] {
         for face in body.face_keys() {
+            // A shared wall is settled by the two normals rather than by
+            // which side it is on: it is on both.
+            if let Some(twin) = coincident_twin(body, other, face, tolerance) {
+                if keeps_shared_wall(body, face, other, twin, flip_b, first) {
+                    copy_face(&mut result, body, face, shell, flip)?;
+                    kept += 1;
+                }
+                continue;
+            }
             match face_side(body, other, face, tolerance) {
-                // A face lying on the other's surface is a shared wall.
-                // Which copy of it the result keeps depends on the operation
-                // and on both normals, and getting it wrong leaves either a
-                // doubled wall or none. Not decided here.
                 Containment::OnBoundary => return Err(Snag::Coincident),
                 Containment::Unknown => return Err(Snag::CutRefused),
                 side if side == wanted => {
@@ -94,6 +103,77 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
         return Ok(Body::new());
     }
     Ok(result)
+}
+
+/// The other body's face covering the same ground as this one, if there is
+/// one.
+fn coincident_twin(
+    body: &Body,
+    other: &Body,
+    face: FaceKey,
+    tolerance: f64,
+) -> Option<FaceKey> {
+    let surface = body.surfaces.get(body.faces.get(face)?.surface)?;
+    other.face_keys().find(|candidate| {
+        other
+            .faces
+            .get(*candidate)
+            .and_then(|node| other.surfaces.get(node.surface))
+            .is_some_and(|theirs| same_surface(surface, theirs, tolerance))
+            && super::imprint::same_ground(body, face, other, *candidate, tolerance)
+    })
+}
+
+/// Whether two surfaces are the same one, ignoring how each is parameterised.
+fn same_surface(one: &Surface, other: &Surface, tolerance: f64) -> bool {
+    // Compared by what each says about the other's frame origin and by their
+    // normals, which is enough for the planar case a shared wall is and does
+    // not depend on either having picked the same u direction.
+    let (Some(first), Some(second)) = (one.frame().normal(), other.frame().normal()) else {
+        return false;
+    };
+    let parallel = Vec3::from(first).is_parallel_to(Vec3::from(second), tolerance);
+    parallel
+        && one.distance_to(other.frame().origin).abs() <= tolerance
+        && other.distance_to(one.frame().origin).abs() <= tolerance
+}
+
+/// Whether this side's copy of a shared wall survives.
+///
+/// Two faces covering the same ground are both on the boundary of the result
+/// or neither is, and which it is comes from their normals once the
+/// operation's own flip has been applied:
+///
+/// - facing the **same** way, the wall is real and exactly one copy is kept —
+///   the first body's, arbitrarily but consistently
+/// - facing **opposite** ways, the two solids are on either side of it, so it
+///   is interior and both copies go
+///
+/// A difference flips the second solid, which turns two boxes stacked face to
+/// face from opposite into same — and that is what leaves the first one whole
+/// instead of open at the top.
+fn keeps_shared_wall(
+    body: &Body,
+    face: FaceKey,
+    other: &Body,
+    twin: FaceKey,
+    flip_second: bool,
+    is_first: bool,
+) -> bool {
+    let outward = |body: &Body, face: FaceKey, flipped: bool| -> Option<Vec3> {
+        let node = body.faces.get(face)?;
+        let normal = Vec3::from(body.surfaces.get(node.surface)?.frame().normal()?);
+        Some(if node.forward != flipped { normal } else { -normal })
+    };
+    // Each face is flipped only if it belongs to the second solid and the
+    // operation turns that solid around.
+    let (Some(mine), Some(theirs)) = (
+        outward(body, face, flip_second && !is_first),
+        outward(other, twin, flip_second && is_first),
+    ) else {
+        return false;
+    };
+    mine.dot(theirs) > 0.0 && is_first
 }
 
 /// Whether a face is inside the other solid, outside it, or on its surface.
@@ -411,13 +491,75 @@ mod tests {
         assert_eq!(bounds.max, [4.0; 3]);
     }
 
+    /// Two boxes stacked face to face, the shared wall covering exactly the
+    /// same ground on both.
+    fn stacked() -> (Body, Body) {
+        (
+            cuboid([0.0; 3], [10.0; 3]).unwrap(),
+            cuboid([0.0, 0.0, 10.0], [10.0; 3]).unwrap(),
+        )
+    }
+
     #[test]
-    fn a_boolean_it_cannot_do_exactly_is_refused() {
-        // Stacked boxes share a face, which needs their overlap worked out
-        // in parameter space. Half-doing it would leave a doubled wall or
-        // none, and the result would look finished either way.
+    fn stacked_boxes_union_into_one_solid_with_no_wall_between() {
+        let (a, b) = stacked();
+        let result = combine(a, b, Operation::Union, TOL).expect("a stack unions");
+        let bounds = body_bounds(&result).unwrap();
+        assert_eq!(bounds.min, [0.0; 3]);
+        assert_eq!(bounds.max, [10.0, 10.0, 20.0]);
+        // Five sides each, and the two that met are gone.
+        assert_eq!(result.faces.len(), 10);
+        assert!(result.validate().is_empty());
+        assert_eq!(result.euler_characteristic(), 2);
+    }
+
+    #[test]
+    fn a_stack_differenced_leaves_the_first_box_whole() {
+        // The flip is what does it: the second solid's bottom turns to face
+        // up, matching the first's top, so the wall is real and one copy
+        // stays. Without it the result would be open at the top.
+        let (a, b) = stacked();
+        let result = combine(a, b, Operation::Difference, TOL).expect("a stack differs");
+        assert_eq!(result.faces.len(), 6, "the first box, untouched");
+        let bounds = body_bounds(&result).unwrap();
+        assert_eq!(bounds.max, [10.0; 3]);
+        assert!(result.validate().is_empty());
+    }
+
+    #[test]
+    fn a_stack_intersects_to_nothing() {
+        // They share a face and no volume.
+        let (a, b) = stacked();
+        let result = combine(a, b, Operation::Intersection, TOL).expect("a stack intersects");
+        assert_eq!(result.faces.len(), 0);
+    }
+
+    #[test]
+    fn two_identical_solids_union_to_one_of_them() {
+        let a = cuboid([0.0; 3], [4.0; 3]).unwrap();
+        let b = cuboid([0.0; 3], [4.0; 3]).unwrap();
+        let result = combine(a, b, Operation::Union, TOL).expect("identical boxes union");
+        assert_eq!(result.faces.len(), 6, "one box, not two");
+        assert!(result.validate().is_empty());
+        assert_eq!(result.euler_characteristic(), 2);
+    }
+
+    #[test]
+    fn a_solid_differenced_by_itself_leaves_nothing() {
+        let a = cuboid([0.0; 3], [4.0; 3]).unwrap();
+        let b = cuboid([0.0; 3], [4.0; 3]).unwrap();
+        let result = combine(a, b, Operation::Difference, TOL).expect("a box minus itself");
+        assert_eq!(result.faces.len(), 0);
+    }
+
+    #[test]
+    fn a_partly_overlapping_wall_is_still_refused() {
+        // The shared plane holds one face's region and part of another's,
+        // which needs the overlap cut out of both — a 2D boolean in that
+        // plane, and a piece of its own. Half-doing it leaves a doubled wall
+        // or none, and the result looks finished either way.
         let a = cuboid([0.0; 3], [10.0; 3]).unwrap();
-        let b = cuboid([0.0, 0.0, 10.0], [10.0; 3]).unwrap();
+        let b = cuboid([0.0, 0.0, 10.0], [4.0, 4.0, 4.0]).unwrap();
         assert_eq!(
             combine(a, b, Operation::Union, TOL).err(),
             Some(Snag::Coincident)
