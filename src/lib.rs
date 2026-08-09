@@ -32,8 +32,8 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-/// Unconditional: a plane and a vector depend on nothing, and a caller that
-/// wants only the ACIS layer still has to say where a face's frame points.
+/// Unconditional: a plane and a vector depend on nothing, and a caller
+/// bridging a file format still has to say where a face's frame points.
 pub mod space;
 
 #[cfg(feature = "geom2d")]
