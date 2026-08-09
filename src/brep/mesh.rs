@@ -123,41 +123,42 @@ pub fn face(body: &Body, face: FaceKey, sag: f64, tolerance: f64) -> Option<Mesh
     let mut taken = 0;
     for ring in &node.loops {
         let count = body.loops.get(*ring)?.coedges.len();
-        let mut points: Vec<[f64; 2]> = Vec::new();
-        for (order, curve) in boundary.get(taken..taken + count)?.iter().enumerate() {
-            let mut sampled = curve.tessellate_within(sag);
-            if sampled.len() < 2 {
-                continue;
-            }
-            // The straight kinds come out of the projection already running
-            // the loop's way; a circle or a spline carries its direction in
-            // its own parameter, so the run is turned round when it starts at
-            // the wrong end.
-            if let Some(last) = points.last() {
-                let head = distance(*last, sampled[0]);
-                let tail = distance(*last, sampled[sampled.len() - 1]);
-                if tail < head {
-                    sampled.reverse();
-                }
-            } else if count > 1 {
-                // Nothing to chain onto yet, so the first piece is oriented
-                // against the next one instead.
-                let next = &boundary[taken + 1];
-                let following = next.point_at(0.0);
-                if distance(sampled[0], following) < distance(sampled[sampled.len() - 1], following)
-                {
-                    sampled.reverse();
-                }
-            }
-            let skip = usize::from(
-                points
-                    .last()
-                    .is_some_and(|last| distance(*last, sampled[0]) <= tolerance),
-            );
-            points.extend_from_slice(&sampled[skip..]);
-            let _ = order;
-        }
+        let mut pending: Vec<Vec<[f64; 2]>> = boundary
+            .get(taken..taken + count)?
+            .iter()
+            .map(|curve| curve.tessellate_within(sag))
+            .filter(|sampled| sampled.len() >= 2)
+            .collect();
         taken += count;
+        let Some(mut points) = pending.pop() else {
+            continue;
+        };
+        // Walk the ring by whichever piece continues it, rather than by the
+        // order the pieces arrived in. A loop's coedges are supposed to be
+        // stored in order, and in a file they are not always: two sides of a
+        // rectangle came back both starting from the same corner. Reversing
+        // the next piece in the list cannot fix that — the ring joins itself
+        // in the wrong place, crosses, and the face is dropped.
+        while !pending.is_empty() {
+            let head = *points.last()?;
+            let mut best = (f64::INFINITY, 0usize, false);
+            for (index, piece) in pending.iter().enumerate() {
+                let front = distance(head, piece[0]);
+                let back = distance(head, piece[piece.len() - 1]);
+                if front < best.0 {
+                    best = (front, index, false);
+                }
+                if back < best.0 {
+                    best = (back, index, true);
+                }
+            }
+            let mut next = pending.remove(best.1);
+            if best.2 {
+                next.reverse();
+            }
+            let skip = usize::from(distance(head, next[0]) <= tolerance);
+            points.extend_from_slice(&next[skip..]);
+        }
         if points.len() >= 3 {
             rings.push(points);
         }
