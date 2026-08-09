@@ -55,6 +55,11 @@ pub struct Cylinder {
 }
 
 /// A right circular cone.
+///
+/// Both nappes, as ACIS stores it: past the apex the radius passes through
+/// zero and grows again on the mirrored half, and a single record covers the
+/// pair. A ray up the side of one therefore meets the other as well, and a
+/// caller wanting only one nappe bounds it with the face's own extent.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cone {
     /// The frame at the reference circle, as for a cylinder.
@@ -136,6 +141,115 @@ impl Surface {
         }
     }
 
+    /// The `(u, v)` of a point on the surface — the inverse of
+    /// [`point_at`](Self::point_at).
+    ///
+    /// A point off the surface is answered for the nearest point on it, so a
+    /// caller holding an intersection result does not have to be exact
+    /// first. `None` only where the frame is degenerate, or at a place with
+    /// no single answer — a sphere's pole, where every longitude meets.
+    pub fn parameters_at(&self, point: [f64; 3]) -> Option<(f64, f64)> {
+        match self {
+            Self::Plane(plane) => {
+                let local = plane.project(point)?;
+                Some((local[0], local[1]))
+            }
+            Self::Cylinder(cylinder) => {
+                let local = cylinder.base.project(point)?;
+                let height = height_above(&cylinder.base, point)?;
+                Some((local[1].atan2(local[0]), height))
+            }
+            Self::Cone(cone) => {
+                let local = cone.base.project(point)?;
+                let height = height_above(&cone.base, point)?;
+                Some((local[1].atan2(local[0]), height))
+            }
+            Self::Sphere(sphere) => {
+                let local = sphere.frame.project(point)?;
+                let height = height_above(&sphere.frame, point)?;
+                let ring = local[0].hypot(local[1]);
+                if ring <= 0.0 {
+                    // A pole. Every longitude passes through it, so there is
+                    // no `u` to report rather than an arbitrary one.
+                    return None;
+                }
+                Some((local[1].atan2(local[0]), height.atan2(ring)))
+            }
+            Self::Torus(torus) => {
+                let local = torus.frame.project(point)?;
+                let height = height_above(&torus.frame, point)?;
+                let ring = local[0].hypot(local[1]);
+                Some((
+                    local[1].atan2(local[0]),
+                    height.atan2(ring - torus.major_radius),
+                ))
+            }
+        }
+    }
+
+    /// Where a ray meets the surface, as distances along `direction`.
+    ///
+    /// In order, and including negative ones — behind the origin is still on
+    /// the surface, and a caller counting crossings ahead filters for itself.
+    ///
+    /// `None` for a torus: its section is a quartic and this kernel has no
+    /// solver for one. As everywhere else here, that is said rather than
+    /// answered with an empty list a caller would read as "no hits".
+    pub fn ray_hits(&self, origin: [f64; 3], direction: [f64; 3]) -> Option<Vec<f64>> {
+        let start = Vec3::from(origin);
+        let along = Vec3::from(direction);
+        match self {
+            Self::Plane(plane) => {
+                let normal = Vec3::from(plane.normal()?);
+                let slope = along.dot(normal);
+                if slope == 0.0 {
+                    // Parallel: either no hit, or the ray lies in the plane
+                    // and every point is one. Neither is a crossing.
+                    return Some(Vec::new());
+                }
+                Some(vec![-plane.distance_to(origin)? / slope])
+            }
+            Self::Sphere(sphere) => {
+                let offset = start - Vec3::from(sphere.frame.origin);
+                Some(roots(
+                    along.length_squared(),
+                    2.0 * offset.dot(along),
+                    offset.length_squared() - sphere.radius * sphere.radius,
+                ))
+            }
+            Self::Cylinder(cylinder) => {
+                let axis = Vec3::from(cylinder.base.normal()?);
+                let offset = start - Vec3::from(cylinder.base.origin);
+                let (across_offset, across_along) =
+                    (perpendicular(offset, axis), perpendicular(along, axis));
+                Some(roots(
+                    across_along.length_squared(),
+                    2.0 * across_offset.dot(across_along),
+                    across_offset.length_squared() - cylinder.radius * cylinder.radius,
+                ))
+            }
+            Self::Cone(cone) => {
+                let axis = Vec3::from(cone.base.normal()?);
+                let offset = start - Vec3::from(cone.base.origin);
+                let (across_offset, across_along) =
+                    (perpendicular(offset, axis), perpendicular(along, axis));
+                // The radius shrinks along the axis, so the condition is
+                // |q perpendicular| = radius at that height rather than a
+                // constant.
+                let slope = cone.half_angle.tan();
+                let (up_offset, up_along) = (offset.dot(axis), along.dot(axis));
+                let at_start = cone.radius - slope * up_offset;
+                let shrink = slope * up_along;
+                Some(roots(
+                    across_along.length_squared() - shrink * shrink,
+                    2.0 * (across_offset.dot(across_along) + at_start * shrink),
+                    across_offset.length_squared() - at_start * at_start,
+                ))
+            }
+            Self::Torus(_) => None,
+        }
+    }
+
     /// Whether `point` lies on the surface, to within `tolerance`.
     ///
     /// The check a lift wants: a file's topology says a face sits on a
@@ -179,6 +293,46 @@ fn offset_along_normal(frame: &Plane, point: [f64; 3], distance: f64) -> [f64; 3
         Some(normal) => (Vec3::from(point) + Vec3::from(normal) * distance).to_array(),
         None => point,
     }
+}
+
+/// How far `point` sits along a frame's normal.
+fn height_above(frame: &Plane, point: [f64; 3]) -> Option<f64> {
+    frame.distance_to(point)
+}
+
+/// The part of `vector` that is not along `axis`, which must be unit.
+fn perpendicular(vector: Vec3, axis: Vec3) -> Vec3 {
+    vector - axis * vector.dot(axis)
+}
+
+/// Real roots of `a·t² + b·t + c`, in order.
+///
+/// Falls back to the linear case when the quadratic term vanishes, which is
+/// how a ray parallel to a cone's own slope is answered rather than divided
+/// by nothing.
+fn roots(a: f64, b: f64, c: f64) -> Vec<f64> {
+    if a.abs() <= f64::MIN_POSITIVE {
+        if b.abs() <= f64::MIN_POSITIVE {
+            return Vec::new();
+        }
+        return vec![-c / b];
+    }
+    let discriminant = b * b - 4.0 * a * c;
+    if discriminant < 0.0 {
+        return Vec::new();
+    }
+    let root = discriminant.sqrt();
+    // The stable pairing: computing both roots from the subtraction loses
+    // the small one entirely when b dwarfs the discriminant.
+    let stable = -0.5 * (b + b.signum() * root);
+    let mut out = if stable == 0.0 {
+        vec![0.0]
+    } else {
+        vec![stable / a, c / stable]
+    };
+    out.sort_by(f64::total_cmp);
+    out.dedup_by(|x, y| x == y);
+    out
 }
 
 /// How far `point` is along a frame's axis, and how far from it.
