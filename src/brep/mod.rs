@@ -27,6 +27,7 @@
 //! the blast radius of an edit is the edit.
 
 pub mod arena;
+pub mod boolean;
 pub mod bounds;
 pub mod classify;
 pub mod geometry;
@@ -40,6 +41,7 @@ pub mod topology;
 pub use arena::{Arena, Key};
 pub use bounds::{body_bounds, face_bounds, Aabb};
 pub use geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
+pub use boolean::{combine, Operation};
 pub use classify::{contains_point, Containment};
 pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};
