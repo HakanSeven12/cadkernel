@@ -116,9 +116,9 @@ pub fn face(body: &Body, face: FaceKey, sag: f64, tolerance: f64) -> Option<Mesh
         return None;
     }
 
-    // The outer loop bounds the face; the rest cut holes in it. They arrive
-    // in that order, one curve per coedge, so the rings are rebuilt by
-    // walking each loop's own coedges.
+    // One curve per coedge, so the rings are rebuilt by walking each loop's
+    // own coedges. Which of them bounds the face is settled in `fill`, by
+    // area rather than by the order they were listed in.
     let mut rings: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut taken = 0;
     for ring in &node.loops {
@@ -167,7 +167,11 @@ pub fn face(body: &Body, face: FaceKey, sag: f64, tolerance: f64) -> Option<Mesh
 
 /// Triangulates a face over the rings its boundary makes in `(u, v)`.
 ///
-/// The first bounds it and the rest cut holes out of it.
+/// Which ring bounds the face and which cut holes in it is decided by area,
+/// not by the order they arrive in. Nothing guarantees that order: a face
+/// lifted from a file lists its loops however the file did, and taking the
+/// first one on trust draws a plate with its bolt hole filled in and the
+/// metal around it missing — a picture that looks deliberate.
 fn fill(
     body: &Body,
     face: FaceKey,
@@ -175,8 +179,23 @@ fn fill(
     rings: &[Vec<[f64; 2]>],
     sag: f64,
 ) -> Option<Mesh> {
-    let (outer, holes) = rings.split_first()?;
-    let (parameters, triangles) = triangulate(outer, holes);
+    let widest = rings
+        .iter()
+        .enumerate()
+        .max_by(|a, b| {
+            crate::geom2d::signed_area(a.1)
+                .abs()
+                .total_cmp(&crate::geom2d::signed_area(b.1).abs())
+        })
+        .map(|(index, _)| index)?;
+    let outer = &rings[widest];
+    let holes: Vec<Vec<[f64; 2]>> = rings
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != widest)
+        .map(|(_, ring)| ring.clone())
+        .collect();
+    let (parameters, triangles) = triangulate(outer, &holes);
     if triangles.is_empty() {
         return None;
     }
@@ -397,6 +416,65 @@ mod tests {
                 "a triangle faced inwards at {corner:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_hole_stays_a_hole_however_its_loop_was_listed() {
+        // A plate with a hole through it. Nothing says the outer loop comes
+        // first — a face lifted from a file lists its loops however the file
+        // did — so the ring that bounds the face is chosen by area. Taking
+        // the first on trust fills the hole and empties the metal, which is a
+        // picture that looks deliberate.
+        // A ring of square section: its two flat faces are annuli, each
+        // bounded by an outer rim with an inner one cut out of it.
+        use crate::geom2d::{Curve as Curve2, Line};
+        let corners = [[4.0, 0.0], [7.0, 0.0], [7.0, 2.0], [4.0, 2.0]];
+        let profile: Vec<Curve2> = (0..4)
+            .map(|index| {
+                Curve2::Line(Line {
+                    start: corners[index],
+                    end: corners[(index + 1) % 4],
+                })
+            })
+            .collect();
+        let plane =
+            crate::space::Plane::orthonormal([0.0; 3], [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]).unwrap();
+        let drilled = crate::brep::revolve(plane, &profile, [0.0; 3], [0.0, 0.0, 1.0], TAU)
+            .expect("a ring");
+
+        let holed = drilled
+            .faces
+            .iter()
+            .find(|(_, face)| face.loops.len() == 2)
+            .map(|(key, _)| key)
+            .expect("a face with a hole in it");
+
+        let area = |body: &Body, face| {
+            crate::brep::mesh::face(body, face, 0.01, 1e-9)
+                .map(|mesh| {
+                    mesh.triangles
+                        .iter()
+                        .map(|t| {
+                            let at = |i: usize| Vec3::from(mesh.positions[t[i]]);
+                            (at(1) - at(0)).cross(at(2) - at(0)).length() * 0.5
+                        })
+                        .sum::<f64>()
+                })
+                .unwrap_or(0.0)
+        };
+        let expected = std::f64::consts::PI * (49.0 - 16.0);
+        let drawn = area(&drilled, holed);
+        assert!(
+            (drawn - expected).abs() < 0.02 * expected,
+            "{drawn} vs {expected}"
+        );
+
+        // And the same face with its loops listed the other way round has to
+        // come out identical.
+        let mut swapped = drilled.clone();
+        swapped.faces.get_mut(holed).unwrap().loops.swap(0, 1);
+        let other = area(&swapped, holed);
+        assert!((drawn - other).abs() < 1e-9, "{drawn} vs {other}");
     }
 
     #[test]
