@@ -137,6 +137,23 @@ struct Shared {
     curves: Vec<Curve3>,
 }
 
+/// The curves a face's own boundary runs along.
+///
+/// What cuts a partly shared wall into its shared and unshared parts. They
+/// are used as whole curves rather than as the segments the edges cover, so
+/// a boundary line may cut somewhere the edge itself does not reach — which
+/// leaves an extra edge and never a different shape, since an imprint only
+/// ever adds them.
+fn boundary_curves(body: &Body, face: FaceKey) -> Vec<Curve3> {
+    body.face_coedges(face)
+        .iter()
+        .filter_map(|coedge| {
+            let edge = body.edges.get(body.coedges.get(*coedge)?.edge)?;
+            body.curves.get(edge.curve).cloned()
+        })
+        .collect()
+}
+
 /// Every curve the two bodies' faces share.
 fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag> {
     let near: Vec<(FaceKey, Option<Aabb>)> =
@@ -170,9 +187,14 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
                 // Two faces on one surface. Where they cover exactly the same
                 // ground there is nothing to imprint — the boolean decides
                 // which copy of the shared wall survives from the two
-                // normals. Where one covers more than the other, the overlap
-                // has to be cut out of both, which is a 2D boolean in the
-                // shared plane and a piece of its own.
+                // normals.
+                //
+                // Where one covers more than the other, what separates the
+                // shared part from the rest is the *other face's own
+                // boundary*, already sitting in the shared plane. Cutting
+                // each along it is the imprint: afterwards every piece is
+                // either the whole of a shared wall or none of one, which is
+                // the only case the boolean has an answer for.
                 Meeting::Coincident => {
                     // Coplanar is not the same as overlapping: two boxes
                     // stacked face to face have four pairs of side walls on
@@ -182,7 +204,12 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
                     if overlap(a, *one, b, *other, tolerance)
                         && !same_ground(a, *one, b, *other, tolerance)
                     {
-                        return Err(Snag::Coincident);
+                        let mut curves = boundary_curves(a, *one);
+                        curves.extend(boundary_curves(b, *other));
+                        if curves.is_empty() {
+                            return Err(Snag::Coincident);
+                        }
+                        out.push(Shared { curves });
                     }
                 }
                 Meeting::Unknown => return Err(Snag::NoClosedForm),
@@ -305,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn faces_meeting_on_one_plane_are_only_a_problem_when_they_overlap() {
+    fn faces_meeting_on_one_plane_need_nothing_when_they_cover_it_alike() {
         // Stacked exactly: the two that meet cover the same ground and the
         // four pairs of side walls share a plane without sharing any area.
         // Neither needs cutting, so there is nothing to imprint.
@@ -313,13 +340,40 @@ mod tests {
         let mut b = cuboid([0.0, 0.0, 10.0], [10.0, 10.0, 10.0]).unwrap();
         let result = imprint(&mut a, &mut b, TOL).expect("nothing to cut");
         assert_eq!(result.cuts, 0);
+    }
 
-        // A smaller box on top: its bottom covers part of the other's top,
-        // and separating the two needs a boolean in that plane — an
-        // operation of its own, whose absence must not look like success.
+    #[test]
+    fn a_wall_shared_in_part_is_cut_where_the_sharing_stops() {
+        // A smaller box on top: its bottom covers a corner of the other's
+        // top. What separates the shared part from the rest is the small
+        // box's own boundary, so cutting the big face along it leaves pieces
+        // that are each wholly shared or wholly not — which is the only
+        // shape the boolean has an answer for.
         let mut a = cuboid([0.0; 3], [10.0, 10.0, 10.0]).unwrap();
         let mut b = cuboid([0.0, 0.0, 10.0], [4.0, 4.0, 4.0]).unwrap();
-        assert_eq!(imprint(&mut a, &mut b, TOL), Err(Snag::Coincident));
+        let before = (a.faces.len(), b.faces.len());
+        let result = imprint(&mut a, &mut b, TOL).expect("a wall to cut");
+        assert!(result.cuts > 0, "{result:?}");
+        assert!(a.faces.len() > before.0, "the big face was divided");
+        assert_eq!(b.faces.len(), before.1, "the small one had nothing to lose");
+        // An imprint only adds edges, so both are still solids.
+        assert!(a.validate().is_empty());
+        assert!(b.validate().is_empty());
+        assert_eq!(a.euler_characteristic(), 2);
+        assert_eq!(b.euler_characteristic(), 2);
+
+        // And the piece that matches the small box's footprint really is one
+        // face now, rather than a corner of a larger one.
+        let footprint = a.face_keys().filter(|face| {
+            face_bounds(&a, *face).is_some_and(|box_| {
+                (box_.min[2] - 10.0).abs() < TOL
+                    && (box_.max[0] - 4.0).abs() < TOL
+                    && (box_.max[1] - 4.0).abs() < TOL
+                    && box_.min[0].abs() < TOL
+                    && box_.min[1].abs() < TOL
+            })
+        });
+        assert_eq!(footprint.count(), 1);
     }
 
     #[test]

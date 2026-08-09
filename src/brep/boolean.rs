@@ -552,18 +552,52 @@ mod tests {
         assert_eq!(result.faces.len(), 0);
     }
 
+    /// How much a body encloses once meshed. Positive when it is the right
+    /// way out; a shared wall left in twice, or taken out twice, changes it.
+    fn volume(solid: &Body) -> f64 {
+        let mesh = super::super::mesh::body(solid, 0.005, 1e-9);
+        mesh.triangles
+            .iter()
+            .map(|triangle| {
+                let at = |index: usize| {
+                    crate::space::Vec3::from(mesh.positions[triangle[index]])
+                };
+                at(0).cross(at(1)).dot(at(2)) / 6.0
+            })
+            .sum()
+    }
+
     #[test]
-    fn a_partly_overlapping_wall_is_still_refused() {
-        // The shared plane holds one face's region and part of another's,
-        // which needs the overlap cut out of both — a 2D boolean in that
-        // plane, and a piece of its own. Half-doing it leaves a doubled wall
-        // or none, and the result looks finished either way.
+    fn a_wall_shared_in_part_is_resolved_rather_than_refused() {
+        // A small box standing on a big one. They meet over a corner of the
+        // big one's top face — the shared plane holds all of one region and
+        // part of the other — and the imprint now cuts the larger face where
+        // the sharing stops, so each piece is wholly shared or wholly not.
+        //
+        // The volume is the check: a doubled wall or a missing one both leave
+        // something that looks finished.
         let a = cuboid([0.0; 3], [10.0; 3]).unwrap();
         let b = cuboid([0.0, 0.0, 10.0], [4.0, 4.0, 4.0]).unwrap();
-        assert_eq!(
-            combine(a, b, Operation::Union, TOL).err(),
-            Some(Snag::Coincident)
+        let result = combine(a, b, Operation::Union, TOL).expect("a stacked union");
+        assert!(result.validate().is_empty());
+        assert!(
+            (volume(&result) - (1000.0 + 64.0)).abs() < 1e-6,
+            "{}",
+            volume(&result)
         );
+    }
+
+    #[test]
+    fn a_box_standing_on_another_can_be_cut_back_out_of_it() {
+        // The same pair the other way about. What the difference leaves is
+        // the big box untouched — the small one sits on top of it rather
+        // than in it — which only comes out right if the shared wall is
+        // resolved rather than doubled.
+        let a = cuboid([0.0; 3], [10.0; 3]).unwrap();
+        let b = cuboid([0.0, 0.0, 10.0], [4.0, 4.0, 4.0]).unwrap();
+        let result = combine(a, b, Operation::Difference, TOL).expect("a stacked difference");
+        assert!(result.validate().is_empty());
+        assert!((volume(&result) - 1000.0).abs() < 1e-6, "{}", volume(&result));
     }
 
     #[test]
