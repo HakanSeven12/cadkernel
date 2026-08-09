@@ -229,6 +229,11 @@ impl Body {
         self.faces.keys()
     }
 
+    /// Every edge in the body. What a wireframe walks.
+    pub fn edge_keys(&self) -> impl Iterator<Item = EdgeKey> + '_ {
+        self.edges.keys()
+    }
+
     /// The coedges of a face, outer loop first.
     pub fn face_coedges(&self, face: FaceKey) -> Vec<CoedgeKey> {
         let Some(face) = self.faces.get(face) else {
