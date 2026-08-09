@@ -111,6 +111,13 @@ pub fn face(body: &Body, face: FaceKey, sag: f64, tolerance: f64) -> Option<Mesh
     if let Some(domain) = whole_surface(body, face, surface) {
         return fill(body, face, surface, &[domain], sag);
     }
+    // A tube: closed the whole way round, bounded by a rim at each end and no
+    // seam between them. Its boundary is two closed circles, which trace no
+    // ring in (u, v) at all — but the region is not in doubt, being the whole
+    // turn between the two heights the rims sit at.
+    if let Some(domain) = banded(body, face, surface) {
+        return fill(body, face, surface, &[domain], sag);
+    }
     let boundary = pcurve::face_boundary(body, face, tolerance)?;
     if boundary.is_empty() {
         return None;
@@ -216,6 +223,52 @@ fn fill(
         }
     }
     Some(mesh)
+}
+
+/// The band a tube covers, as a ring in `(u, v)`.
+///
+/// A cylinder or cone face can be bounded by two rims and nothing else: it
+/// wraps the whole way round, so there is no seam cutting it open and no ring
+/// for its boundary to trace. Each rim is a closed circle, shared with the
+/// disc that caps it, and projects to a line spanning a full turn — two of
+/// those do not join up.
+///
+/// What they do say is where the band starts and stops, which with a full
+/// turn of `u` is the whole region. `None` for anything else: a face bounded
+/// by arcs and generators traces a proper ring and goes the ordinary way.
+fn banded(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+) -> Option<Vec<[f64; 2]>> {
+    use super::geometry::Surface;
+    if !matches!(surface, Surface::Cylinder(_) | Surface::Cone(_)) {
+        return None;
+    }
+    let node = body.faces.get(face)?;
+    if node.loops.len() != 2 {
+        return None;
+    }
+    let mut heights = Vec::with_capacity(2);
+    for ring in &node.loops {
+        let coedges = &body.loops.get(*ring)?.coedges;
+        // One coedge, closing on itself: a rim rather than a chain of pieces.
+        let [only] = coedges[..] else { return None };
+        let edge = body.coedges.get(only)?.edge;
+        let node = body.edges.get(edge)?;
+        if node.start != node.end {
+            return None;
+        }
+        let point = body.vertices.get(node.start)?.point;
+        heights.push(surface.parameters_at(point)?.1);
+    }
+    let (low, high) = (
+        heights[0].min(heights[1]),
+        heights[0].max(heights[1]),
+    );
+    (high - low > 0.0).then(|| {
+        vec![[0.0, low], [TAU, low], [TAU, high], [0.0, high]]
+    })
 }
 
 /// The whole of a closed surface, as a ring in `(u, v)`, when that is what a
@@ -417,6 +470,66 @@ mod tests {
                 "a triangle faced inwards at {corner:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_tube_with_no_seam_still_knows_the_band_it_covers() {
+        // A cylinder wall bounded by a rim at each end and nothing else: it
+        // wraps the whole way round, so no seam cuts it open and its boundary
+        // traces no ring in (u, v). Files carry solids shaped that way, and
+        // the face was dropped for want of a ring to fill.
+        let mut solid = crate::brep::make::cylinder([0.0; 3], 3.0, 6.0).unwrap();
+        let wall = solid
+            .faces
+            .iter()
+            .find(|(_, face)| {
+                matches!(
+                    solid.surfaces.get(face.surface),
+                    Some(crate::brep::Surface::Cylinder(_))
+                )
+            })
+            .map(|(key, _)| key)
+            .unwrap();
+
+        // Take the seam away, leaving the wall on its two rims alone.
+        let ring = solid.faces.get(wall).unwrap().loops[0];
+        let kept: Vec<_> = solid
+            .loops
+            .get(ring)
+            .unwrap()
+            .coedges
+            .iter()
+            .copied()
+            .filter(|coedge| {
+                let edge = solid.coedges.get(*coedge).unwrap().edge;
+                let node = solid.edges.get(edge).unwrap();
+                node.start == node.end
+            })
+            .collect();
+        assert_eq!(kept.len(), 2, "two rims");
+        let face = solid.faces.get_mut(wall).unwrap();
+        face.loops = Vec::new();
+        for coedge in kept {
+            let owner = solid.loops.insert(crate::brep::topology::Loop {
+                coedges: vec![coedge],
+                owner: wall,
+                provenance: crate::brep::Provenance::Synthesized,
+            });
+            solid.coedges.get_mut(coedge).unwrap().owner = owner;
+            solid.faces.get_mut(wall).unwrap().loops.push(owner);
+        }
+
+        let mesh = crate::brep::mesh::face(&solid, wall, 0.01, 1e-9).expect("a drawn wall");
+        let area: f64 = mesh
+            .triangles
+            .iter()
+            .map(|t| {
+                let at = |i: usize| Vec3::from(mesh.positions[t[i]]);
+                (at(1) - at(0)).cross(at(2) - at(0)).length() * 0.5
+            })
+            .sum();
+        let expected = TAU * 3.0 * 6.0;
+        assert!((area - expected).abs() < 0.02 * expected, "{area} vs {expected}");
     }
 
     #[test]
