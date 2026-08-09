@@ -141,6 +141,50 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
     }
 }
 
+/// A face's loops as curves in its surface's parameter space, each trimmed
+/// to the edge it came from.
+///
+/// The trimming is the part that matters. A straight edge projects to an
+/// infinite line, and a boundary made of infinite lines encloses nothing and
+/// reports every point as lying on it.
+///
+/// `None` when any edge's projection has no closed form: a boundary with a
+/// piece missing is worse than none, since a caller would take the rest for
+/// the whole.
+pub fn face_boundary(
+    body: &super::topology::Body,
+    face: super::topology::FaceKey,
+    tolerance: f64,
+) -> Option<Vec<Curve>> {
+    let node = body.faces.get(face)?;
+    let surface = body.surfaces.get(node.surface)?;
+    let mut out = Vec::new();
+    for coedge in body.face_coedges(face) {
+        let edge_key = body.coedges.get(coedge)?.edge;
+        let edge = body.edges.get(edge_key)?;
+        let curve = body.curves.get(edge.curve)?;
+        let flat = project(surface, curve, tolerance)?;
+        let (start, end) = body.edge_endpoints(edge_key)?;
+        let (from, to) = (
+            surface.parameters_at(start)?,
+            surface.parameters_at(end)?,
+        );
+        out.push(trim_to(flat, [from.0, from.1], [to.0, to.1]));
+    }
+    Some(out)
+}
+
+/// The part of a projected boundary curve between two parameter-space points.
+fn trim_to(curve: Curve, from: [f64; 2], to: [f64; 2]) -> Curve {
+    match curve {
+        // The kinds that run past their edge become the segment between the
+        // two ends. A straight edge's projection is straight, so nothing is
+        // lost by saying so.
+        Curve::XLine(_) | Curve::Ray(_) => Curve::Line(Line { start: from, end: to }),
+        other => other,
+    }
+}
+
 /// A line of constant `v`, spanning one full turn of `u`.
 ///
 /// Bounded rather than infinite because `u` on a closed surface is periodic:

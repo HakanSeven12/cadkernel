@@ -27,7 +27,7 @@
 
 use super::pcurve;
 use super::topology::{Body, FaceKey};
-use crate::geom2d::{contains as inside_loops, Curve, Tolerance};
+use crate::geom2d::{contains as inside_loops, Tolerance};
 use crate::space::Vec3;
 
 /// Where a point stands relative to a solid.
@@ -130,7 +130,7 @@ fn face_hits(
 ) -> Option<Vec<f64>> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
-    let boundary = face_boundary(body, face, tolerance)?;
+    let boundary = pcurve::face_boundary(body, face, tolerance)?;
     let mut out = Vec::new();
     for distance in surface.ray_hits(origin, direction)? {
         let point = (Vec3::from(origin) + Vec3::from(direction) * distance).to_array();
@@ -146,45 +146,6 @@ fn face_hits(
     Some(out)
 }
 
-/// A face's loops as curves in its surface's parameter space.
-fn face_boundary(body: &Body, face: FaceKey, tolerance: f64) -> Option<Vec<Curve>> {
-    let node = body.faces.get(face)?;
-    let surface = body.surfaces.get(node.surface)?;
-    let mut out = Vec::new();
-    for coedge in body.face_coedges(face) {
-        let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
-        let curve = body.curves.get(edge.curve)?;
-        // A boundary edge whose projection has no closed form leaves the face
-        // unbounded as far as containment is concerned, which is worse than
-        // declining.
-        let flat = pcurve::project(surface, curve, tolerance)?;
-        // Trimmed to the edge's own span: the projection of a straight edge
-        // is an infinite line, and a boundary made of infinite lines encloses
-        // nothing.
-        let (start, end) = body.edge_endpoints(body.coedges.get(coedge)?.edge)?;
-        let (from, to) = (
-            surface.parameters_at(start)?,
-            surface.parameters_at(end)?,
-        );
-        out.push(trim_to(flat, [from.0, from.1], [to.0, to.1]));
-    }
-    Some(out)
-}
-
-/// The part of a projected boundary curve between two parameter-space points.
-fn trim_to(curve: Curve, from: [f64; 2], to: [f64; 2]) -> Curve {
-    match curve {
-        // The kinds that run past their edge become the segment between the
-        // two ends. A straight edge's projection is straight, so nothing is
-        // lost by saying so.
-        Curve::XLine(_) | Curve::Ray(_) => Curve::Line(crate::geom2d::Line {
-            start: from,
-            end: to,
-        }),
-        other => other,
-    }
-}
-
 /// How far `point` is from a face, or `None` if that cannot be measured.
 fn face_distance(body: &Body, face: FaceKey, point: [f64; 3], tolerance: f64) -> Option<f64> {
     let node = body.faces.get(face)?;
@@ -195,7 +156,7 @@ fn face_distance(body: &Body, face: FaceKey, point: [f64; 3], tolerance: f64) ->
     }
     // Close to the surface, so whether it is on the *face* depends on the
     // boundary.
-    let boundary = face_boundary(body, face, tolerance)?;
+    let boundary = pcurve::face_boundary(body, face, tolerance)?;
     let (u, v) = surface.parameters_at(point)?;
     if inside_loops(&boundary, [u, v], Tolerance::new(tolerance)) {
         Some(gap)

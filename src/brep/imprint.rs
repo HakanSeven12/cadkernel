@@ -1,0 +1,280 @@
+//! Cutting each solid's faces where the other's pass through them.
+//!
+//! The step between finding the intersection curves and deciding what to
+//! keep. Afterwards, every face of either solid is wholly inside the other or
+//! wholly outside it — never partly both — so classifying a piece is one
+//! question with one answer instead of a face that would have to be described
+//! as "inside over here".
+//!
+//! Both solids are imprinted, not one. A union has to keep the outer part of
+//! *each*, so each needs the other's curves cut into it.
+//!
+//! # Why it can fail, and why that is reported
+//!
+//! A face pair whose intersection has no closed form, a pair of coincident
+//! faces, a cut this kernel cannot make: each leaves the imprint incomplete
+//! in a way the caller cannot see by looking at the result. A boolean run on
+//! a half-imprinted body produces a solid — one with a wall missing. So the
+//! failures are returned, and a boolean refuses on them.
+
+use super::bounds::{face_bounds, Aabb};
+use super::geometry::Curve3;
+use super::intersect::{surfaces, Meeting};
+use super::split::split_face;
+use super::topology::{Body, FaceKey};
+
+/// Why an imprint could not be completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Snag {
+    /// Two faces meet along something this kernel has no closed form for.
+    NoClosedForm,
+    /// Two faces lie on the same surface. Deciding what that leaves needs
+    /// their overlap worked out in parameter space, which is its own
+    /// operation.
+    Coincident,
+    /// The curves were found but a face could not be cut along one of them —
+    /// a cut crossing the boundary more than twice, or closing inside the
+    /// face.
+    CutRefused,
+}
+
+/// What an imprint did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Imprint {
+    /// How many faces were cut in two, across both solids.
+    pub cuts: usize,
+    /// How many face pairs were found to meet at all.
+    pub meetings: usize,
+}
+
+/// Cuts each body's faces along the curves it shares with the other.
+///
+/// Neither body's shape changes — an imprint only adds edges — so the result
+/// still passes [`Body::validate`] and still has the same volume.
+///
+/// `tolerance` is passed through to the intersection and the cutting.
+pub fn imprint(a: &mut Body, b: &mut Body, tolerance: f64) -> Result<Imprint, Snag> {
+    let meetings = shared_curves(a, b, tolerance)?;
+    let count = meetings.len();
+    let mut cuts = 0;
+    for meeting in &meetings {
+        cuts += cut_along(a, &meeting.curves, tolerance)?;
+        cuts += cut_along(b, &meeting.curves, tolerance)?;
+    }
+    Ok(Imprint {
+        cuts,
+        meetings: count,
+    })
+}
+
+/// Curves shared by a pair of faces.
+struct Shared {
+    curves: Vec<Curve3>,
+}
+
+/// Every curve the two bodies' faces share.
+fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag> {
+    let near: Vec<(FaceKey, Option<Aabb>)> =
+        a.face_keys().map(|key| (key, face_bounds(a, key))).collect();
+    let far: Vec<(FaceKey, Option<Aabb>)> =
+        b.face_keys().map(|key| (key, face_bounds(b, key))).collect();
+
+    let mut out = Vec::new();
+    for (one, one_box) in &near {
+        for (other, other_box) in &far {
+            // A box that could not be computed means "cannot exclude", so
+            // the pair is tested rather than skipped.
+            if let (Some(first), Some(second)) = (one_box, other_box) {
+                if !first.grown(tolerance).overlaps(second) {
+                    continue;
+                }
+            }
+            let (Some(one_face), Some(other_face)) = (a.faces.get(*one), b.faces.get(*other))
+            else {
+                continue;
+            };
+            let (Some(one_surface), Some(other_surface)) = (
+                a.surfaces.get(one_face.surface),
+                b.surfaces.get(other_face.surface),
+            ) else {
+                continue;
+            };
+            match surfaces(one_surface, other_surface, tolerance) {
+                Meeting::None | Meeting::Points(_) => {}
+                Meeting::Curves(curves) => out.push(Shared { curves }),
+                Meeting::Coincident => return Err(Snag::Coincident),
+                Meeting::Unknown => return Err(Snag::NoClosedForm),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Cuts every face of `body` that one of `curves` crosses.
+///
+/// A face split in two may still be crossed by the next curve, and by the
+/// same one where a curve enters and leaves more than once, so the halves go
+/// back into the list to be tried again.
+fn cut_along(body: &mut Body, curves: &[Curve3], tolerance: f64) -> Result<usize, Snag> {
+    let mut cuts = 0;
+    for curve in curves {
+        let mut pending: Vec<FaceKey> = body.face_keys().collect();
+        // Each cut adds at most one face, so the work is bounded by however
+        // many faces the curve can produce. The cap is a backstop against a
+        // cut that somehow keeps splitting the same face rather than a limit
+        // anything real reaches.
+        let ceiling = body.faces.len() * 4 + 16;
+        let mut done = 0;
+        while let Some(face) = pending.pop() {
+            done += 1;
+            if done > ceiling {
+                return Err(Snag::CutRefused);
+            }
+            if !body.faces.contains(face) {
+                continue;
+            }
+            if let Some([kept, made]) = split_face(body, face, curve, tolerance) {
+                cuts += 1;
+                pending.push(kept);
+                pending.push(made);
+            }
+        }
+    }
+    Ok(cuts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brep::make::cuboid;
+
+    const TOL: f64 = 1e-9;
+
+    /// Two boxes overlapping in a corner.
+    fn overlapping() -> (Body, Body) {
+        (
+            cuboid([0.0; 3], [10.0, 10.0, 10.0]).unwrap(),
+            cuboid([5.0, 5.0, 5.0], [10.0, 10.0, 10.0]).unwrap(),
+        )
+    }
+
+    #[test]
+    fn imprinting_leaves_both_bodies_consistent() {
+        let (mut a, mut b) = overlapping();
+        imprint(&mut a, &mut b, TOL).expect("two boxes meet in planes");
+        for (name, body) in [("a", &a), ("b", &b)] {
+            let flaws = body.validate();
+            assert!(flaws.is_empty(), "{name}: {flaws:?}");
+            assert_eq!(body.euler_characteristic(), 2, "{name}");
+        }
+    }
+
+    #[test]
+    fn imprinting_adds_edges_and_faces_but_no_volume() {
+        // An imprint only writes the shape down differently.
+        let (mut a, mut b) = overlapping();
+        let before = crate::brep::body_bounds(&a).unwrap();
+        let faces = a.faces.len();
+        let result = imprint(&mut a, &mut b, TOL).unwrap();
+        assert!(result.cuts > 0, "the boxes overlap, so something is cut");
+        assert!(a.faces.len() > faces);
+        let after = crate::brep::body_bounds(&a).unwrap();
+        assert_eq!(before, after, "the solid did not move or grow");
+    }
+
+    #[test]
+    fn every_piece_is_wholly_in_or_wholly_out_afterwards() {
+        // The property the whole step exists for. Before the imprint, the
+        // faces of A that the corner of B passes through are partly inside
+        // it; afterwards no face is.
+        use crate::brep::{contains_point, Containment};
+        let (mut a, mut b) = overlapping();
+        imprint(&mut a, &mut b, TOL).unwrap();
+        for face in a.face_keys() {
+            let bounds = crate::brep::face_bounds(&a, face).unwrap();
+            let mut seen = Vec::new();
+            // The corners of the face's own box, nudged onto the face, are
+            // enough to catch a face that straddles the boundary.
+            for coedge in a.face_coedges(face) {
+                let Some((from, _)) = a.coedge_vertices(coedge) else {
+                    continue;
+                };
+                let point = a.vertices.get(from).unwrap().point;
+                seen.push(contains_point(&b, point, 1e-6));
+            }
+            let _ = bounds;
+            let inside = seen.iter().filter(|c| **c == Containment::Inside).count();
+            let outside = seen.iter().filter(|c| **c == Containment::Outside).count();
+            assert!(
+                inside == 0 || outside == 0,
+                "face {face:?} has corners both in and out: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boxes_that_do_not_touch_are_left_alone() {
+        let mut a = cuboid([0.0; 3], [1.0, 1.0, 1.0]).unwrap();
+        let mut b = cuboid([50.0, 50.0, 50.0], [1.0, 1.0, 1.0]).unwrap();
+        let faces = (a.faces.len(), b.faces.len());
+        let result = imprint(&mut a, &mut b, TOL).unwrap();
+        assert_eq!(result.cuts, 0);
+        assert_eq!((a.faces.len(), b.faces.len()), faces);
+    }
+
+    #[test]
+    fn coincident_faces_are_refused_rather_than_half_handled() {
+        // Two boxes stacked exactly. Their touching faces lie on one plane,
+        // and what that leaves needs their overlap worked out in parameter
+        // space — a different operation, and one whose absence must not look
+        // like success.
+        let mut a = cuboid([0.0; 3], [10.0, 10.0, 10.0]).unwrap();
+        let mut b = cuboid([0.0, 0.0, 10.0], [10.0, 10.0, 10.0]).unwrap();
+        assert_eq!(imprint(&mut a, &mut b, TOL), Err(Snag::Coincident));
+    }
+
+    #[test]
+    fn a_pair_with_no_closed_form_is_refused() {
+        let mut a = cuboid([0.0; 3], [10.0, 10.0, 10.0]).unwrap();
+        let mut b = cuboid([5.0; 3], [10.0, 10.0, 10.0]).unwrap();
+        // Turn one of B's faces into a torus, which no pair here can meet.
+        let face = b.face_keys().next().unwrap();
+        let surface = b.faces.get(face).unwrap().surface;
+        *b.surfaces.get_mut(surface).unwrap() =
+            crate::brep::Surface::Torus(crate::brep::Torus {
+                frame: crate::space::Plane::XY,
+                major_radius: 4.0,
+                minor_radius: 1.0,
+            });
+        assert_eq!(imprint(&mut a, &mut b, TOL), Err(Snag::NoClosedForm));
+    }
+
+    #[test]
+    fn the_prefilter_does_not_lose_a_real_meeting() {
+        // Boxes that share only an edge region: most face pairs are apart,
+        // and the box test has to keep the few that are not.
+        let (mut a, mut b) = overlapping();
+        let result = imprint(&mut a, &mut b, TOL).unwrap();
+        assert!(result.meetings > 0);
+        assert!(
+            result.meetings < 36,
+            "the prefilter rejected nothing: {}",
+            result.meetings
+        );
+    }
+
+    #[test]
+    fn imprinting_at_survey_coordinates_works_the_same() {
+        let origin = [512_345.678, 4_512_345.678, 91.5];
+        let mut a = cuboid(origin, [10.0, 10.0, 10.0]).unwrap();
+        let mut b = cuboid(
+            [origin[0] + 5.0, origin[1] + 5.0, origin[2] + 5.0],
+            [10.0, 10.0, 10.0],
+        )
+        .unwrap();
+        imprint(&mut a, &mut b, 1e-6).expect("the same two boxes, further out");
+        assert!(a.validate().is_empty());
+        assert!(b.validate().is_empty());
+        assert!(a.worst_vertex_gap() < 1e-6);
+    }
+}

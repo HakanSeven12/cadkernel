@@ -25,7 +25,7 @@ use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, FaceKey, Loop, Vertex, VertexKey,
 };
 use super::Provenance;
-use crate::geom2d::{intersect as cross, Tolerance};
+use crate::geom2d::{distance_to, intersect as cross, Tolerance};
 use crate::space::Vec3;
 
 /// Splits an edge at a parameter along its curve, returning the two halves.
@@ -205,6 +205,25 @@ pub fn split_face(
     }
     let [first, second] = [ends[0], ends[1]];
     if first == second {
+        return None;
+    }
+
+    // A cut that runs along the boundary divides nothing. It happens
+    // naturally the moment a face has already been cut: the new edge lies on
+    // the cutter, its two ends are vertices, and the next pass finds the same
+    // two landings and cuts again — the same face for ever. Asked of the
+    // midpoint rather than the ends, since a genuine cut also touches the
+    // boundary at both of those.
+    let midway = cutter.point_at(
+        0.5 * (cutter.parameter_at(body.vertices.get(first)?.point)
+            + cutter.parameter_at(body.vertices.get(second)?.point)),
+    );
+    let boundary = pcurve::face_boundary(body, face, tolerance)?;
+    let (u, v) = surface.parameters_at(midway)?;
+    if boundary
+        .iter()
+        .any(|edge| distance_to(edge, [u, v]) <= tolerance)
+    {
         return None;
     }
 
