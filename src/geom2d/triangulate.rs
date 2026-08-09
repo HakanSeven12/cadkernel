@@ -1,0 +1,439 @@
+//! Filling a polygon with triangles.
+//!
+//! Every surface that has to be drawn or measured by area ends up needing
+//! this: a face's boundary in its own parameter space is a ring of points,
+//! and a renderer wants triangles.
+//!
+//! # Ear clipping, and why holes are bridged rather than special-cased
+//!
+//! The method is the simple one: find a corner whose triangle contains no
+//! other vertex, cut it off, repeat. It is quadratic in the worst case and
+//! linear in practice for the polygons a drawing produces, and — unlike the
+//! faster sweep methods — it needs no ordering structure that a nearly
+//! degenerate polygon can corrupt.
+//!
+//! Holes are joined to the outer ring by a bridge: a pair of coincident edges
+//! run out to the hole, round it, and back. The result is one ring with a
+//! slit in it, which ear clipping then handles with no cases of its own. The
+//! slit's two edges are zero-width and vanish in the triangulation.
+//!
+//! # What it will not do
+//!
+//! A self-intersecting ring has no inside to fill, and no triangulation of it
+//! is right. That returns nothing rather than a plausible mesh, on the
+//! principle that a caller can draw nothing but cannot un-draw a wrong shape.
+
+use super::vec::Vec2;
+
+/// Triangles filling `outer`, with `holes` removed.
+///
+/// Each triangle is three indices into a single point list, which is returned
+/// alongside: the outer ring first, then each hole in turn. A caller mapping
+/// the result somewhere else — onto a surface, into a vertex buffer — then
+/// transforms the points once rather than once per triangle.
+///
+/// Rings need not be closed by repeating their first point, and their winding
+/// does not matter: the outer is taken counter-clockwise and holes clockwise,
+/// whichever way they arrive.
+pub fn polygon(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
+    let mut points: Vec<Vec2> = orient(outer, true);
+    if points.len() < 3 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut ring: Vec<usize> = (0..points.len()).collect();
+
+    // Holes are bridged into the outer ring in order of how far right they
+    // reach, so an inner hole is joined to the ring the outer one already
+    // became rather than to the original.
+    let mut pending: Vec<Vec<Vec2>> = holes
+        .iter()
+        .map(|hole| orient(hole, false))
+        .filter(|hole| hole.len() >= 3)
+        .collect();
+    pending.sort_by(|a, b| rightmost(b).1.x.total_cmp(&rightmost(a).1.x));
+    for hole in pending {
+        bridge(&mut points, &mut ring, hole);
+    }
+
+    let triangles = clip_ears(&points, ring);
+    (points.into_iter().map(Vec2::to_array).collect(), triangles)
+}
+
+/// A ring as points, wound the way asked for.
+fn orient(ring: &[[f64; 2]], counter_clockwise: bool) -> Vec<Vec2> {
+    let mut points: Vec<Vec2> = ring.iter().copied().map(Vec2::from).collect();
+    // A ring given closed carries its first point twice, which every step
+    // below would treat as a zero-length edge.
+    if points.len() > 1 && points[0] == points[points.len() - 1] {
+        points.pop();
+    }
+    if (signed_area(&points) > 0.0) != counter_clockwise {
+        points.reverse();
+    }
+    points
+}
+
+fn signed_area(points: &[Vec2]) -> f64 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let origin = points[0];
+    (1..points.len() - 1)
+        .map(|index| (points[index] - origin).cross(points[index + 1] - origin))
+        .sum::<f64>()
+        * 0.5
+}
+
+/// The index and position of a ring's rightmost point.
+fn rightmost(ring: &[Vec2]) -> (usize, Vec2) {
+    let mut best = 0;
+    for (index, point) in ring.iter().enumerate() {
+        if point.x > ring[best].x {
+            best = index;
+        }
+    }
+    (best, ring[best])
+}
+
+/// Joins a hole into the ring with a two-edge bridge.
+///
+/// The bridge runs from the hole's rightmost point to a vertex of the ring
+/// that can see it. Rightmost because every other vertex of the hole is to
+/// its left, so nothing of the hole itself is in the way.
+///
+/// Finding the far end is the part that has to be done properly. "The nearest
+/// vertex nothing crosses" is not enough: with two holes it happily picks a
+/// vertex of the other one and runs the bridge straight through it, crossing
+/// no edge and enclosing the wrong region — which shows up as a ring with no
+/// ear anywhere and no triangles at all.
+///
+/// So it is the standard construction: cast a ray to the right, take the edge
+/// it hits first, and bridge to that edge's rightmost end — unless some
+/// reflex vertex stands inside the triangle the three of them make, in which
+/// case the one nearest the ray's direction is taken instead. That vertex is
+/// visible by construction rather than by test.
+fn bridge(points: &mut Vec<Vec2>, ring: &mut Vec<usize>, hole: Vec<Vec2>) {
+    let (start, from) = rightmost(&hole);
+    let Some(at) = bridge_target(points, ring, from) else {
+        return;
+    };
+
+    let base = points.len();
+    points.extend(hole.iter().copied());
+
+    // Out along the bridge, once round the hole, and back. The two coincident
+    // edges are a slit of no width, which ear clipping then treats like any
+    // other part of the ring.
+    let mut spliced: Vec<usize> = Vec::with_capacity(ring.len() + hole.len() + 2);
+    spliced.extend_from_slice(&ring[..=at]);
+    for step in 0..hole.len() {
+        spliced.push(base + (start + step) % hole.len());
+    }
+    spliced.push(base + start);
+    spliced.push(ring[at]);
+    spliced.extend_from_slice(&ring[at + 1..]);
+    *ring = spliced;
+}
+
+/// Which ring vertex to bridge a hole to.
+fn bridge_target(points: &[Vec2], ring: &[usize], from: Vec2) -> Option<usize> {
+    let count = ring.len();
+    // The first ring edge a ray to the right runs into.
+    let mut nearest = f64::INFINITY;
+    let mut hit_edge = None;
+    for index in 0..count {
+        let next = (index + 1) % count;
+        let (a, b) = (points[ring[index]], points[ring[next]]);
+        // Only an edge straddling the ray's height can be hit, and one lying
+        // along it cannot be hit at a single place.
+        if (a.y > from.y) == (b.y > from.y) {
+            continue;
+        }
+        let along = (from.y - a.y) / (b.y - a.y);
+        let x = a.x + (b.x - a.x) * along;
+        if x >= from.x && x < nearest {
+            nearest = x;
+            hit_edge = Some((index, next));
+        }
+    }
+    let (first, second) = hit_edge?;
+    let crossing = Vec2::new(nearest, from.y);
+    // The endpoint further right is the one the bridge can reach without
+    // leaving the polygon.
+    let candidate = if points[ring[first]].x >= points[ring[second]].x {
+        first
+    } else {
+        second
+    };
+
+    // Anything reflex standing inside the triangle blocks the view of it. The
+    // one closest to straight ahead is visible instead.
+    let corner = points[ring[candidate]];
+    let mut best = candidate;
+    let mut best_angle = f64::INFINITY;
+    for index in 0..count {
+        if index == candidate {
+            continue;
+        }
+        let point = points[ring[index]];
+        if !is_reflex(points, ring, index) {
+            continue;
+        }
+        if !inside(from, crossing, corner, point) && !inside(from, corner, crossing, point) {
+            continue;
+        }
+        let angle = ((point.y - from.y) / (point - from).length().max(f64::MIN_POSITIVE))
+            .abs();
+        if angle < best_angle {
+            best_angle = angle;
+            best = index;
+        }
+    }
+    Some(best)
+}
+
+/// Whether the ring turns clockwise at a vertex, in a counter-clockwise ring.
+fn is_reflex(points: &[Vec2], ring: &[usize], at: usize) -> bool {
+    let count = ring.len();
+    let before = points[ring[(at + count - 1) % count]];
+    let here = points[ring[at]];
+    let after = points[ring[(at + 1) % count]];
+    (here - before).cross(after - here) < 0.0
+}
+
+/// Cuts corners off until nothing is left.
+fn clip_ears(points: &[Vec2], mut ring: Vec<usize>) -> Vec<[usize; 3]> {
+    let mut out = Vec::with_capacity(ring.len().saturating_sub(2));
+    // Every ear removes one vertex, so the loop cannot run longer than the
+    // ring — but a polygon with no ear at all (self-intersecting) would spin,
+    // so the failures are counted rather than assumed away.
+    let mut failures = 0;
+    while ring.len() > 3 {
+        if failures > ring.len() {
+            // No ear anywhere: the ring crosses itself and there is no
+            // triangulation to find.
+            return Vec::new();
+        }
+        let count = ring.len();
+        let mut cut = None;
+        for at in 0..count {
+            if is_ear(points, &ring, at) {
+                cut = Some(at);
+                break;
+            }
+        }
+        match cut {
+            Some(at) => {
+                let count = ring.len();
+                out.push([
+                    ring[(at + count - 1) % count],
+                    ring[at],
+                    ring[(at + 1) % count],
+                ]);
+                ring.remove(at);
+                failures = 0;
+            }
+            None => failures += 1,
+        }
+    }
+    if ring.len() == 3 {
+        out.push([ring[0], ring[1], ring[2]]);
+    }
+    out
+}
+
+/// Whether the corner at `at` can be cut off.
+fn is_ear(points: &[Vec2], ring: &[usize], at: usize) -> bool {
+    let count = ring.len();
+    let (a, b, c) = (
+        points[ring[(at + count - 1) % count]],
+        points[ring[at]],
+        points[ring[(at + 1) % count]],
+    );
+    // A reflex corner is not an ear, and neither is a collapsed one: cutting
+    // either produces a triangle outside the polygon or none at all.
+    let turn = (b - a).cross(c - b);
+    if turn <= 0.0 {
+        return false;
+    }
+    // And nothing else may be inside the triangle, or the cut would swallow
+    // part of the polygon.
+    //
+    // A vertex that *is* one of the corners is skipped by position and by
+    // place. Bridging a hole leaves the ring visiting two points twice, and
+    // those copies sit exactly on the triangle's edges — counted as inside,
+    // they reject every candidate and nothing is ever an ear.
+    (0..count).all(|other| {
+        if other == at || other == (at + count - 1) % count || other == (at + 1) % count {
+            return true;
+        }
+        let point = points[ring[other]];
+        if point == a || point == b || point == c {
+            return true;
+        }
+        !inside(a, b, c, point)
+    })
+}
+
+/// Whether a point is within a triangle, edges included.
+fn inside(a: Vec2, b: Vec2, c: Vec2, point: Vec2) -> bool {
+    let side = |p: Vec2, q: Vec2| (q - p).cross(point - p);
+    side(a, b) >= 0.0 && side(b, c) >= 0.0 && side(c, a) >= 0.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area(points: &[[f64; 2]], triangles: &[[usize; 3]]) -> f64 {
+        triangles
+            .iter()
+            .map(|triangle| {
+                let a = Vec2::from(points[triangle[0]]);
+                let b = Vec2::from(points[triangle[1]]);
+                let c = Vec2::from(points[triangle[2]]);
+                (b - a).cross(c - a).abs() * 0.5
+            })
+            .sum()
+    }
+
+    fn square(size: f64) -> Vec<[f64; 2]> {
+        vec![[0.0, 0.0], [size, 0.0], [size, size], [0.0, size]]
+    }
+
+    #[test]
+    fn a_square_becomes_two_triangles_covering_it() {
+        let (points, triangles) = polygon(&square(10.0), &[]);
+        assert_eq!(triangles.len(), 2);
+        assert!((area(&points, &triangles) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn winding_does_not_matter() {
+        let mut backwards = square(10.0);
+        backwards.reverse();
+        let (points, triangles) = polygon(&backwards, &[]);
+        assert!((area(&points, &triangles) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_ring_closed_by_repeating_its_first_point_is_not_counted_twice() {
+        let mut closed = square(10.0);
+        closed.push(closed[0]);
+        let (points, triangles) = polygon(&closed, &[]);
+        assert_eq!(triangles.len(), 2, "a repeated point is not a vertex");
+        assert!((area(&points, &triangles) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_concave_polygon_is_filled_without_leaving_its_outline() {
+        // An L, whose reflex corner is not an ear and must not be cut.
+        let shape = vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 4.0],
+            [4.0, 4.0],
+            [4.0, 10.0],
+            [0.0, 10.0],
+        ];
+        let (points, triangles) = polygon(&shape, &[]);
+        assert_eq!(triangles.len(), 4, "six vertices, four triangles");
+        assert!((area(&points, &triangles) - 64.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_hole_is_left_empty() {
+        let hole = vec![[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]];
+        let (points, triangles) = polygon(&square(10.0), &[hole]);
+        assert!(!triangles.is_empty());
+        // A hundred less the sixteen the hole takes out.
+        assert!(
+            (area(&points, &triangles) - 84.0).abs() < 1e-9,
+            "{}",
+            area(&points, &triangles)
+        );
+    }
+
+    #[test]
+    fn two_holes_are_both_left_empty() {
+        let holes = vec![
+            vec![[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]],
+            vec![[6.0, 6.0], [9.0, 6.0], [9.0, 9.0], [6.0, 9.0]],
+        ];
+        let (points, triangles) = polygon(&square(10.0), &holes);
+        assert!((area(&points, &triangles) - (100.0 - 4.0 - 9.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn every_triangle_stays_inside_the_polygon() {
+        // The property area alone would not catch: a triangulation can have
+        // the right total and still put a triangle outside and another twice
+        // over.
+        let shape = vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 4.0],
+            [4.0, 4.0],
+            [4.0, 10.0],
+            [0.0, 10.0],
+        ];
+        let (points, triangles) = polygon(&shape, &[]);
+        for triangle in &triangles {
+            let centre = (Vec2::from(points[triangle[0]])
+                + Vec2::from(points[triangle[1]])
+                + Vec2::from(points[triangle[2]]))
+                / 3.0;
+            let inside_l = (centre.x <= 10.0 && centre.y <= 4.0)
+                || (centre.x <= 4.0 && centre.y <= 10.0);
+            assert!(inside_l && centre.x >= 0.0 && centre.y >= 0.0, "{centre:?}");
+        }
+    }
+
+    #[test]
+    fn a_self_crossing_ring_terminates_rather_than_spinning() {
+        // A bowtie has no inside, so no triangulation of it is right. What
+        // matters is that ear clipping stops looking rather than searching a
+        // ring it can never reduce — the loop counts its failures for this.
+        let bowtie = vec![[0.0, 0.0], [10.0, 10.0], [10.0, 0.0], [0.0, 10.0]];
+        let (points, triangles) = polygon(&bowtie, &[]);
+        for triangle in &triangles {
+            let a = Vec2::from(points[triangle[0]]);
+            let b = Vec2::from(points[triangle[1]]);
+            let c = Vec2::from(points[triangle[2]]);
+            assert!((b - a).cross(c - a).abs() > 0.0, "a collapsed triangle");
+        }
+    }
+
+    #[test]
+    fn too_few_points_is_no_polygon() {
+        assert_eq!(polygon(&[], &[]).1.len(), 0);
+        assert_eq!(polygon(&[[0.0, 0.0], [1.0, 0.0]], &[]).1.len(), 0);
+    }
+
+    #[test]
+    fn a_polygon_at_survey_coordinates_still_covers_itself() {
+        let origin = [512_345.678, 4_512_345.678];
+        let shifted: Vec<[f64; 2]> = square(10.0)
+            .iter()
+            .map(|p| [origin[0] + p[0], origin[1] + p[1]])
+            .collect();
+        let (points, triangles) = polygon(&shifted, &[]);
+        assert!((area(&points, &triangles) - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_many_sided_ring_is_fully_triangulated() {
+        // A circle's worth of vertices, which is what a curved face's
+        // boundary comes in as.
+        let ring: Vec<[f64; 2]> = (0..64)
+            .map(|step| {
+                let angle = std::f64::consts::TAU * step as f64 / 64.0;
+                [10.0 * angle.cos(), 10.0 * angle.sin()]
+            })
+            .collect();
+        let (points, triangles) = polygon(&ring, &[]);
+        assert_eq!(triangles.len(), 62, "n − 2 triangles");
+        let expected = 0.5 * 64.0 * 100.0 * (std::f64::consts::TAU / 64.0).sin();
+        assert!((area(&points, &triangles) - expected).abs() < 1e-6);
+    }
+}

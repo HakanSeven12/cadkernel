@@ -26,6 +26,7 @@ pub mod offset;
 pub mod polyline;
 pub mod snap;
 pub mod tessellate;
+pub mod triangulate;
 pub mod transform;
 pub mod vec;
 
@@ -49,6 +50,7 @@ pub use snap::{
 };
 pub use tessellate::{arc, ellipse_arc, lerp, DEFAULT_SEGMENTS_PER_RADIAN};
 pub use transform::Transform;
+pub use triangulate::polygon as triangulate;
 pub use vec::Vec2;
 
 /// An ellipse in the plane.
