@@ -203,6 +203,13 @@ pub enum Curve3 {
     /// A circle or a circular arc, lying in `plane`. `t` is the angle in
     /// radians measured from the plane's x axis.
     Circle(Circle3),
+    /// An ellipse, lying in `plane`. `t` is the ellipse's own parameter, not
+    /// an angle — the two differ everywhere except on the axes.
+    ///
+    /// Where a plane cuts a cylinder at a slant this is what they share
+    /// exactly; approximating it with a circle or a spline would put the
+    /// seam of every such cut slightly off.
+    Ellipse(Ellipse3),
     /// A spline curve lying in a plane. The planar case is what a drawing and
     /// a planar face's boundary produce; a spline that genuinely wanders in
     /// space is not modelled yet and stays with its source record.
@@ -232,6 +239,17 @@ pub struct Circle3 {
     pub radius: f64,
 }
 
+/// An ellipse in space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ellipse3 {
+    /// Centre, and the frame it lies in. Its x axis is the major direction.
+    pub plane: Plane,
+    /// Half-length along the frame's x axis.
+    pub major_radius: f64,
+    /// Half-length along its y axis.
+    pub minor_radius: f64,
+}
+
 impl Curve3 {
     /// The point at parameter `t`.
     pub fn point_at(&self, t: f64) -> [f64; 3] {
@@ -242,6 +260,10 @@ impl Curve3 {
             Self::Circle(circle) => circle
                 .plane
                 .point_at([circle.radius * t.cos(), circle.radius * t.sin()]),
+            Self::Ellipse(ellipse) => ellipse.plane.point_at([
+                ellipse.major_radius * t.cos(),
+                ellipse.minor_radius * t.sin(),
+            ]),
             Self::PlanarSpline { plane, curve } => plane.point_at(curve.point_at(t)),
         }
     }
@@ -263,6 +285,14 @@ impl Curve3 {
             }
             Self::Circle(circle) => match circle.plane.project(point) {
                 Some(local) => local[1].atan2(local[0]),
+                None => 0.0,
+            },
+            Self::Ellipse(ellipse) => match ellipse.plane.project(point) {
+                // Squashed onto the unit circle, where the parameter reads
+                // straight off. Taking the angle of the raw point instead
+                // would be wrong by up to the eccentricity.
+                Some(local) => (local[1] / ellipse.minor_radius)
+                    .atan2(local[0] / ellipse.major_radius),
                 None => 0.0,
             },
             Self::PlanarSpline { plane, curve } => match plane.project(point) {

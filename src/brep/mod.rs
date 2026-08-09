@@ -28,11 +28,13 @@
 
 pub mod arena;
 pub mod geometry;
+pub mod intersect;
 pub mod make;
 pub mod topology;
 
 pub use arena::{Arena, Key};
-pub use geometry::{Circle3, Cone, Curve3, Cylinder, Line3, Sphere, Surface, Torus};
+pub use geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
+pub use intersect::{surfaces as intersect_surfaces, Meeting};
 pub use topology::{
     Body, Coedge, CoedgeKey, CurveKey, Edge, EdgeKey, Face, FaceKey, Flaw, Loop, LoopKey, Lump,
     LumpKey, Shell, ShellKey, SurfaceKey, Vertex, VertexKey,

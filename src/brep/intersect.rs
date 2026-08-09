@@ -1,0 +1,731 @@
+//! What two surfaces share.
+//!
+//! The question a boolean is built on: to cut one solid with another, the
+//! curves where their faces meet have to be found first, and everything
+//! afterwards — splitting faces, choosing which pieces to keep, stitching the
+//! result — depends on those curves being right.
+//!
+//! # Exactly, or not at all
+//!
+//! Where a closed form exists it is used and the answer is exact. Two spheres
+//! share a circle; a plane and a cylinder share an ellipse; two planes share
+//! a line. Marching a numeric intersection across those would put every seam
+//! a tolerance off its true place, and the error compounds through each
+//! boolean.
+//!
+//! Where no closed form is implemented the answer is [`Meeting::Unknown`],
+//! not an empty one. The distinction matters more than it looks: a caller
+//! told "they do not meet" will happily union two solids that overlap and
+//! produce a shape with a hole in it, while one told "I cannot say" can
+//! refuse. Silence about ignorance is the expensive failure here.
+//!
+//! # What is not here yet
+//!
+//! The general quartic cases — two cylinders at an angle, a sphere against a
+//! cone — need a marching intersector with a bounded step and a way to find
+//! every branch. That is a piece of its own; until it exists those pairs say
+//! `Unknown`.
+
+use super::geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface};
+use crate::space::{Plane, Vec3};
+
+/// What two surfaces have in common.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Meeting {
+    /// Nothing. They are apart.
+    None,
+    /// These curves, exactly.
+    Curves(Vec<Curve3>),
+    /// These isolated points — a tangency rather than a crossing.
+    Points(Vec<[f64; 3]>),
+    /// The same surface, over whatever region both cover.
+    Coincident,
+    /// No closed form for this pair is implemented, and none was
+    /// approximated. Not the same as [`None`](Meeting::None): a caller must
+    /// refuse rather than assume they are apart.
+    Unknown,
+}
+
+/// Where two surfaces meet.
+///
+/// `tolerance` decides when two directions count as parallel and when a
+/// near-tangency is treated as a touch.
+pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
+    match (a, b) {
+        (Surface::Plane(one), Surface::Plane(other)) => planes(one, other, tolerance),
+        (Surface::Plane(plane), Surface::Sphere(sphere))
+        | (Surface::Sphere(sphere), Surface::Plane(plane)) => {
+            plane_sphere(plane, sphere, tolerance)
+        }
+        (Surface::Sphere(one), Surface::Sphere(other)) => spheres(one, other, tolerance),
+        (Surface::Plane(plane), Surface::Cylinder(cylinder))
+        | (Surface::Cylinder(cylinder), Surface::Plane(plane)) => {
+            plane_cylinder(plane, cylinder, tolerance)
+        }
+        (Surface::Plane(plane), Surface::Cone(cone))
+        | (Surface::Cone(cone), Surface::Plane(plane)) => plane_cone(plane, cone, tolerance),
+        (Surface::Cylinder(one), Surface::Cylinder(other)) => {
+            cylinders(one, other, tolerance)
+        }
+        _ => Meeting::Unknown,
+    }
+}
+
+/// Two planes: a line, nothing, or the same plane.
+fn planes(one: &Plane, other: &Plane, tolerance: f64) -> Meeting {
+    let (Some(first), Some(second)) = (one.normal(), other.normal()) else {
+        return Meeting::Unknown;
+    };
+    let (first, second) = (Vec3::from(first), Vec3::from(second));
+    let along = first.cross(second);
+    if along.length() <= tolerance {
+        // Parallel. The same plane if either origin lies on the other.
+        return if other.contains(one.origin, tolerance) {
+            Meeting::Coincident
+        } else {
+            Meeting::None
+        };
+    }
+    // A point on the line, as the combination of the two normals that
+    // satisfies both plane equations. Solved rather than found by dropping an
+    // axis, which fails whenever the line runs along the axis dropped.
+    let one_offset = first.dot(Vec3::from(one.origin));
+    let other_offset = second.dot(Vec3::from(other.origin));
+    let cosine = first.dot(second);
+    let determinant = 1.0 - cosine * cosine;
+    let scale_first = (one_offset - other_offset * cosine) / determinant;
+    let scale_second = (other_offset - one_offset * cosine) / determinant;
+    let origin = first * scale_first + second * scale_second;
+    Meeting::Curves(vec![Curve3::Line(Line3 {
+        origin: origin.to_array(),
+        direction: along
+            .normalize()
+            .map_or(along, |unit| unit)
+            .to_array(),
+    })])
+}
+
+/// A plane and a sphere: a circle, a point of tangency, or nothing.
+fn plane_sphere(plane: &Plane, sphere: &Sphere, tolerance: f64) -> Meeting {
+    let Some(offset) = plane.distance_to(sphere.frame.origin) else {
+        return Meeting::Unknown;
+    };
+    let Some(normal) = plane.normal() else {
+        return Meeting::Unknown;
+    };
+    let centre = Vec3::from(sphere.frame.origin) - Vec3::from(normal) * offset;
+    let gap = offset.abs() - sphere.radius;
+    if gap > tolerance {
+        return Meeting::None;
+    }
+    if gap.abs() <= tolerance {
+        return Meeting::Points(vec![centre.to_array()]);
+    }
+    let radius = (sphere.radius * sphere.radius - offset * offset).max(0.0).sqrt();
+    circle_on(centre, Vec3::from(normal), radius, tolerance)
+}
+
+/// Two spheres: a circle, a point, nothing, or the same sphere.
+fn spheres(one: &Sphere, other: &Sphere, tolerance: f64) -> Meeting {
+    let from = Vec3::from(one.frame.origin);
+    let to = Vec3::from(other.frame.origin);
+    let apart = to - from;
+    let distance = apart.length();
+    if distance <= tolerance {
+        return if (one.radius - other.radius).abs() <= tolerance {
+            Meeting::Coincident
+        } else {
+            // Concentric and different: one is wholly inside the other.
+            Meeting::None
+        };
+    }
+    let outer = one.radius + other.radius;
+    let inner = (one.radius - other.radius).abs();
+    if distance - outer > tolerance || inner - distance > tolerance {
+        return Meeting::None;
+    }
+    let Some(axis) = apart.normalize() else {
+        return Meeting::Unknown;
+    };
+    // How far along the line of centres the shared plane sits.
+    let along = (distance * distance + one.radius * one.radius - other.radius * other.radius)
+        / (2.0 * distance);
+    let centre = from + axis * along;
+    let squared = one.radius * one.radius - along * along;
+    if squared <= tolerance * tolerance {
+        return Meeting::Points(vec![centre.to_array()]);
+    }
+    circle_on(centre, axis, squared.sqrt(), tolerance)
+}
+
+/// A plane and a cylinder: a circle, an ellipse, one or two lines, or
+/// nothing.
+fn plane_cylinder(plane: &Plane, cylinder: &Cylinder, tolerance: f64) -> Meeting {
+    let (Some(normal), Some(axis)) = (plane.normal(), cylinder.base.normal()) else {
+        return Meeting::Unknown;
+    };
+    let (normal, axis) = (Vec3::from(normal), Vec3::from(axis));
+    let cosine = normal.dot(axis);
+
+    if cosine.abs() <= tolerance {
+        // The plane runs along the axis: it cuts two generators, grazes one,
+        // or misses.
+        let Some(offset) = plane.distance_to(cylinder.base.origin) else {
+            return Meeting::Unknown;
+        };
+        let gap = offset.abs() - cylinder.radius;
+        if gap > tolerance {
+            return Meeting::None;
+        }
+        // From the axis point, step onto the plane and then along it, by
+        // however much the chord allows.
+        let on_plane = Vec3::from(cylinder.base.origin) - normal * offset;
+        if gap.abs() <= tolerance {
+            return Meeting::Curves(vec![Curve3::Line(Line3 {
+                origin: on_plane.to_array(),
+                direction: axis.to_array(),
+            })]);
+        }
+        let half = (cylinder.radius * cylinder.radius - offset * offset)
+            .max(0.0)
+            .sqrt();
+        let Some(across) = axis.cross(normal).normalize() else {
+            return Meeting::Unknown;
+        };
+        return Meeting::Curves(
+            [half, -half]
+                .into_iter()
+                .map(|side| {
+                    Curve3::Line(Line3 {
+                        origin: (on_plane + across * side).to_array(),
+                        direction: axis.to_array(),
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    // The plane crosses the axis, so the section is closed. Where it crosses
+    // is the section's centre.
+    let Some(centre) = axis_meets_plane(cylinder.base.origin, axis, plane) else {
+        return Meeting::Unknown;
+    };
+    if (cosine.abs() - 1.0).abs() <= tolerance {
+        return circle_on(centre, axis, cylinder.radius, tolerance);
+    }
+    // Minor axis across the tilt, where the section is as narrow as the
+    // cylinder; major along it, stretched by how far the plane leans.
+    let Some(minor) = axis.cross(normal).normalize() else {
+        return Meeting::Unknown;
+    };
+    let Some(major) = normal.cross(minor).normalize() else {
+        return Meeting::Unknown;
+    };
+    let Some(frame) = Plane::orthonormal(centre.to_array(), major.to_array(), normal.to_array())
+    else {
+        return Meeting::Unknown;
+    };
+    Meeting::Curves(vec![Curve3::Ellipse(Ellipse3 {
+        plane: frame,
+        major_radius: cylinder.radius / cosine.abs(),
+        minor_radius: cylinder.radius,
+    })])
+}
+
+/// A plane and a cone.
+///
+/// Handled exactly where the section is a circle — the plane square to the
+/// axis — or a pair of generators through the apex. The slanted sections are
+/// ellipses, parabolas and hyperbolas; the last two have no representation in
+/// [`Curve3`] yet, so rather than return two of the three the whole slanted
+/// case says [`Meeting::Unknown`].
+fn plane_cone(plane: &Plane, cone: &Cone, tolerance: f64) -> Meeting {
+    let (Some(normal), Some(axis)) = (plane.normal(), cone.base.normal()) else {
+        return Meeting::Unknown;
+    };
+    let (normal, axis) = (Vec3::from(normal), Vec3::from(axis));
+    let cosine = normal.dot(axis);
+
+    if (cosine.abs() - 1.0).abs() <= tolerance {
+        // Square to the axis: a circle whose radius is the cone's at that
+        // height.
+        let Some(centre) = axis_meets_plane(cone.base.origin, axis, plane) else {
+            return Meeting::Unknown;
+        };
+        let height = (centre - Vec3::from(cone.base.origin)).dot(axis);
+        let radius = cone.radius - height * cone.half_angle.tan();
+        if radius.abs() <= tolerance {
+            // The plane passes through the apex.
+            return Meeting::Points(vec![centre.to_array()]);
+        }
+        if radius < 0.0 {
+            // Past the apex, on the mirrored nappe. A cone record covers both
+            // in ACIS, so this is a real circle rather than an error.
+            return circle_on(centre, axis, -radius, tolerance);
+        }
+        return circle_on(centre, axis, radius, tolerance);
+    }
+    Meeting::Unknown
+}
+
+/// Two cylinders. Coaxial and parallel-axis cases only; crossing axes give a
+/// quartic that has no closed form here.
+fn cylinders(one: &Cylinder, other: &Cylinder, tolerance: f64) -> Meeting {
+    let (Some(first), Some(second)) = (one.base.normal(), other.base.normal()) else {
+        return Meeting::Unknown;
+    };
+    let (first, second) = (Vec3::from(first), Vec3::from(second));
+    if first.cross(second).length() > tolerance {
+        return Meeting::Unknown;
+    }
+    // Parallel axes. How far apart they are decides everything.
+    let between = Vec3::from(other.base.origin) - Vec3::from(one.base.origin);
+    let across = between - first * between.dot(first);
+    let distance = across.length();
+    if distance <= tolerance {
+        return if (one.radius - other.radius).abs() <= tolerance {
+            Meeting::Coincident
+        } else {
+            Meeting::None
+        };
+    }
+    let outer = one.radius + other.radius;
+    let inner = (one.radius - other.radius).abs();
+    if distance - outer > tolerance || inner - distance > tolerance {
+        return Meeting::None;
+    }
+    let Some(towards) = across.normalize() else {
+        return Meeting::Unknown;
+    };
+    // The generators they share sit where the two circles cross, swept along
+    // the common axis direction.
+    let along = (distance * distance + one.radius * one.radius - other.radius * other.radius)
+        / (2.0 * distance);
+    let midpoint = Vec3::from(one.base.origin) + towards * along;
+    let squared = one.radius * one.radius - along * along;
+    if squared <= tolerance * tolerance {
+        return Meeting::Curves(vec![Curve3::Line(Line3 {
+            origin: midpoint.to_array(),
+            direction: first.to_array(),
+        })]);
+    }
+    let Some(sideways) = first.cross(towards).normalize() else {
+        return Meeting::Unknown;
+    };
+    let half = squared.sqrt();
+    Meeting::Curves(
+        [half, -half]
+            .into_iter()
+            .map(|side| {
+                Curve3::Line(Line3 {
+                    origin: (midpoint + sideways * side).to_array(),
+                    direction: first.to_array(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// A circle of `radius` about `centre`, lying square to `normal`.
+fn circle_on(centre: Vec3, normal: Vec3, radius: f64, tolerance: f64) -> Meeting {
+    if radius <= tolerance {
+        return Meeting::Points(vec![centre.to_array()]);
+    }
+    // Any direction in the plane will do for where the angle starts; the
+    // circle is the same set whichever is picked.
+    let seed = if normal.x.abs() < 0.9 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let Some(frame) = Plane::orthonormal(centre.to_array(), seed.to_array(), normal.to_array())
+    else {
+        return Meeting::Unknown;
+    };
+    Meeting::Curves(vec![Curve3::Circle(Circle3 {
+        plane: frame,
+        radius,
+    })])
+}
+
+/// Where a line through `origin` along `axis` crosses `plane`.
+fn axis_meets_plane(origin: [f64; 3], axis: Vec3, plane: &Plane) -> Option<Vec3> {
+    let normal = Vec3::from(plane.normal()?);
+    let slope = axis.dot(normal);
+    if slope == 0.0 {
+        return None;
+    }
+    let offset = plane.distance_to(origin)?;
+    Some(Vec3::from(origin) - axis * (offset / slope))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::{FRAC_PI_4, TAU};
+
+    const TOL: f64 = 1e-9;
+
+    fn plane_at(origin: [f64; 3], normal: [f64; 3]) -> Plane {
+        let seed = if normal[0].abs() < 0.9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        Plane::orthonormal(origin, seed, normal).unwrap()
+    }
+
+    /// Every point of every curve reported, checked against both surfaces.
+    /// The property that matters: an intersection curve is what the two share,
+    /// so it must lie on each.
+    fn assert_on_both(a: &Surface, b: &Surface, meeting: &Meeting) {
+        let Meeting::Curves(curves) = meeting else {
+            panic!("expected curves, got {meeting:?}");
+        };
+        assert!(!curves.is_empty());
+        for curve in curves {
+            for i in 0..=12 {
+                // Lines are parameterised by length, the closed kinds by
+                // angle; both are sampled over a range wide enough to show a
+                // curve leaving its surface.
+                let t = match curve {
+                    Curve3::Line(_) => -5.0 + 10.0 * i as f64 / 12.0,
+                    _ => TAU * i as f64 / 12.0,
+                };
+                let point = curve.point_at(t);
+                assert!(
+                    a.contains(point, 1e-6),
+                    "{point:?} is {} off the first surface",
+                    a.distance_to(point)
+                );
+                assert!(
+                    b.contains(point, 1e-6),
+                    "{point:?} is {} off the second surface",
+                    b.distance_to(point)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_planes_share_a_line() {
+        let ground = Surface::Plane(plane_at([0.0; 3], [0.0, 0.0, 1.0]));
+        let wall = Surface::Plane(plane_at([0.0; 3], [1.0, 0.0, 0.0]));
+        let meeting = surfaces(&ground, &wall, TOL);
+        assert_on_both(&ground, &wall, &meeting);
+    }
+
+    #[test]
+    fn two_planes_meeting_along_an_axis_still_find_the_line() {
+        // The case dropping a coordinate to solve gets wrong: the shared line
+        // runs along the axis that would be dropped.
+        let one = Surface::Plane(plane_at([0.0, 0.0, 3.0], [0.0, 1.0, 1.0]));
+        let other = Surface::Plane(plane_at([0.0, 0.0, 3.0], [0.0, 1.0, -1.0]));
+        let meeting = surfaces(&one, &other, TOL);
+        assert_on_both(&one, &other, &meeting);
+    }
+
+    #[test]
+    fn parallel_planes_are_apart_or_the_same() {
+        let low = Surface::Plane(plane_at([0.0; 3], [0.0, 0.0, 1.0]));
+        let high = Surface::Plane(plane_at([0.0, 0.0, 5.0], [0.0, 0.0, 1.0]));
+        assert_eq!(surfaces(&low, &high, TOL), Meeting::None);
+        let same = Surface::Plane(plane_at([9.0, 9.0, 0.0], [0.0, 0.0, 1.0]));
+        assert_eq!(surfaces(&low, &same, TOL), Meeting::Coincident);
+    }
+
+    #[test]
+    fn a_plane_cuts_a_sphere_in_a_circle() {
+        let sphere = Surface::Sphere(Sphere {
+            frame: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 5.0,
+        });
+        let plane = Surface::Plane(plane_at([0.0, 0.0, 3.0], [0.0, 0.0, 1.0]));
+        let meeting = surfaces(&sphere, &plane, TOL);
+        assert_on_both(&sphere, &plane, &meeting);
+        let Meeting::Curves(curves) = &meeting else {
+            unreachable!()
+        };
+        let Curve3::Circle(circle) = &curves[0] else {
+            panic!("expected a circle");
+        };
+        // 3-4-5.
+        assert!((circle.radius - 4.0).abs() < 1e-9, "{}", circle.radius);
+    }
+
+    #[test]
+    fn a_plane_that_grazes_a_sphere_touches_at_a_point() {
+        let sphere = Surface::Sphere(Sphere {
+            frame: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 5.0,
+        });
+        let plane = Surface::Plane(plane_at([0.0, 0.0, 5.0], [0.0, 0.0, 1.0]));
+        match surfaces(&sphere, &plane, 1e-6) {
+            Meeting::Points(points) => {
+                assert_eq!(points.len(), 1);
+                assert!((points[0][2] - 5.0).abs() < 1e-9);
+            }
+            other => panic!("expected a touch, got {other:?}"),
+        }
+        let clear = Surface::Plane(plane_at([0.0, 0.0, 6.0], [0.0, 0.0, 1.0]));
+        assert_eq!(surfaces(&sphere, &clear, TOL), Meeting::None);
+    }
+
+    #[test]
+    fn two_spheres_share_a_circle() {
+        let one = Surface::Sphere(Sphere {
+            frame: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 5.0,
+        });
+        let other = Surface::Sphere(Sphere {
+            frame: plane_at([6.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            radius: 5.0,
+        });
+        let meeting = surfaces(&one, &other, TOL);
+        assert_on_both(&one, &other, &meeting);
+        let Meeting::Curves(curves) = &meeting else {
+            unreachable!()
+        };
+        let Curve3::Circle(circle) = &curves[0] else {
+            panic!("expected a circle");
+        };
+        assert!((circle.radius - 4.0).abs() < 1e-9);
+        assert!((circle.plane.origin[0] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spheres_apart_touching_and_identical() {
+        let at = |x: f64, radius: f64| {
+            Surface::Sphere(Sphere {
+                frame: plane_at([x, 0.0, 0.0], [0.0, 0.0, 1.0]),
+                radius,
+            })
+        };
+        assert_eq!(surfaces(&at(0.0, 1.0), &at(10.0, 1.0), TOL), Meeting::None);
+        assert_eq!(
+            surfaces(&at(0.0, 1.0), &at(0.0, 1.0), TOL),
+            Meeting::Coincident
+        );
+        // Nested, never touching.
+        assert_eq!(surfaces(&at(0.0, 5.0), &at(0.0, 1.0), TOL), Meeting::None);
+        match surfaces(&at(0.0, 1.0), &at(2.0, 1.0), 1e-6) {
+            Meeting::Points(points) => assert!((points[0][0] - 1.0).abs() < 1e-9),
+            other => panic!("expected a touch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plane_square_to_a_cylinder_cuts_a_circle() {
+        let cylinder = Surface::Cylinder(Cylinder {
+            base: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 3.0,
+        });
+        let plane = Surface::Plane(plane_at([0.0, 0.0, 7.0], [0.0, 0.0, 1.0]));
+        let meeting = surfaces(&cylinder, &plane, TOL);
+        assert_on_both(&cylinder, &plane, &meeting);
+        let Meeting::Curves(curves) = &meeting else {
+            unreachable!()
+        };
+        let Curve3::Circle(circle) = &curves[0] else {
+            panic!("expected a circle, got {:?}", curves[0]);
+        };
+        assert!((circle.radius - 3.0).abs() < 1e-9);
+        assert!((circle.plane.origin[2] - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_slanted_plane_cuts_a_cylinder_in_an_ellipse() {
+        let cylinder = Surface::Cylinder(Cylinder {
+            base: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 3.0,
+        });
+        // Forty-five degrees, so the major axis is the radius times √2.
+        let plane = Surface::Plane(plane_at([0.0; 3], [0.0, 1.0, 1.0]));
+        let meeting = surfaces(&cylinder, &plane, TOL);
+        assert_on_both(&cylinder, &plane, &meeting);
+        let Meeting::Curves(curves) = &meeting else {
+            unreachable!()
+        };
+        let Curve3::Ellipse(ellipse) = &curves[0] else {
+            panic!("expected an ellipse, got {:?}", curves[0]);
+        };
+        assert!((ellipse.minor_radius - 3.0).abs() < 1e-9);
+        assert!(
+            (ellipse.major_radius - 3.0 * std::f64::consts::SQRT_2).abs() < 1e-9,
+            "{}",
+            ellipse.major_radius
+        );
+    }
+
+    #[test]
+    fn a_plane_along_a_cylinder_cuts_two_generators() {
+        let cylinder = Surface::Cylinder(Cylinder {
+            base: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 5.0,
+        });
+        // Parallel to the axis, three units off it: a chord of half-width 4.
+        let plane = Surface::Plane(plane_at([3.0, 0.0, 0.0], [1.0, 0.0, 0.0]));
+        let meeting = surfaces(&cylinder, &plane, TOL);
+        assert_on_both(&cylinder, &plane, &meeting);
+        let Meeting::Curves(curves) = &meeting else {
+            unreachable!()
+        };
+        assert_eq!(curves.len(), 2);
+        for curve in curves {
+            let Curve3::Line(line) = curve else {
+                panic!("expected lines");
+            };
+            assert!((line.origin[0] - 3.0).abs() < 1e-9);
+            assert!((line.origin[1].abs() - 4.0).abs() < 1e-9, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_plane_that_grazes_a_cylinder_gives_one_generator() {
+        let cylinder = Surface::Cylinder(Cylinder {
+            base: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 5.0,
+        });
+        let plane = Surface::Plane(plane_at([5.0, 0.0, 0.0], [1.0, 0.0, 0.0]));
+        let meeting = surfaces(&cylinder, &plane, 1e-6);
+        assert_on_both(&cylinder, &plane, &meeting);
+        let Meeting::Curves(curves) = &meeting else {
+            unreachable!()
+        };
+        assert_eq!(curves.len(), 1);
+        let far = Surface::Plane(plane_at([6.0, 0.0, 0.0], [1.0, 0.0, 0.0]));
+        assert_eq!(surfaces(&cylinder, &far, TOL), Meeting::None);
+    }
+
+    #[test]
+    fn a_plane_square_to_a_cone_cuts_the_circle_at_that_height() {
+        let cone = Surface::Cone(Cone {
+            base: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 10.0,
+            half_angle: FRAC_PI_4,
+        });
+        let plane = Surface::Plane(plane_at([0.0, 0.0, 4.0], [0.0, 0.0, 1.0]));
+        let meeting = surfaces(&cone, &plane, TOL);
+        assert_on_both(&cone, &plane, &meeting);
+        let Meeting::Curves(curves) = &meeting else {
+            unreachable!()
+        };
+        let Curve3::Circle(circle) = &curves[0] else {
+            panic!("expected a circle");
+        };
+        // Forty-five degrees, so a unit of height costs a unit of radius.
+        assert!((circle.radius - 6.0).abs() < 1e-9, "{}", circle.radius);
+    }
+
+    #[test]
+    fn a_plane_through_a_cone_apex_touches_at_a_point() {
+        let cone = Surface::Cone(Cone {
+            base: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 10.0,
+            half_angle: FRAC_PI_4,
+        });
+        let plane = Surface::Plane(plane_at([0.0, 0.0, 10.0], [0.0, 0.0, 1.0]));
+        match surfaces(&cone, &plane, 1e-6) {
+            Meeting::Points(points) => assert!((points[0][2] - 10.0).abs() < 1e-9),
+            other => panic!("expected the apex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_slanted_plane_on_a_cone_says_it_does_not_know() {
+        // A parabola or a hyperbola has no representation here yet, and
+        // returning only the elliptical cases would be a silent gap.
+        let cone = Surface::Cone(Cone {
+            base: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 10.0,
+            half_angle: FRAC_PI_4,
+        });
+        let plane = Surface::Plane(plane_at([0.0; 3], [0.0, 1.0, 1.0]));
+        assert_eq!(surfaces(&cone, &plane, TOL), Meeting::Unknown);
+    }
+
+    #[test]
+    fn parallel_cylinders_share_their_generators() {
+        let at = |x: f64, radius: f64| {
+            Surface::Cylinder(Cylinder {
+                base: plane_at([x, 0.0, 0.0], [0.0, 0.0, 1.0]),
+                radius,
+            })
+        };
+        let one = at(0.0, 5.0);
+        let other = at(6.0, 5.0);
+        let meeting = surfaces(&one, &other, TOL);
+        assert_on_both(&one, &other, &meeting);
+        let Meeting::Curves(curves) = &meeting else {
+            unreachable!()
+        };
+        assert_eq!(curves.len(), 2);
+
+        assert_eq!(surfaces(&at(0.0, 1.0), &at(10.0, 1.0), TOL), Meeting::None);
+        assert_eq!(
+            surfaces(&at(0.0, 3.0), &at(0.0, 3.0), TOL),
+            Meeting::Coincident
+        );
+        assert_eq!(surfaces(&at(0.0, 3.0), &at(0.0, 1.0), TOL), Meeting::None);
+    }
+
+    #[test]
+    fn crossing_cylinders_say_they_are_not_known_rather_than_apart() {
+        // The failure the distinction exists for: told "None", a union would
+        // put these two side by side and leave the shape they actually share
+        // as a hole.
+        let upright = Surface::Cylinder(Cylinder {
+            base: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 2.0,
+        });
+        let across = Surface::Cylinder(Cylinder {
+            base: plane_at([0.0; 3], [1.0, 0.0, 0.0]),
+            radius: 2.0,
+        });
+        assert_eq!(surfaces(&upright, &across, TOL), Meeting::Unknown);
+    }
+
+    #[test]
+    fn a_torus_is_not_claimed_to_be_understood() {
+        let torus = Surface::Torus(super::super::Torus {
+            frame: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            major_radius: 10.0,
+            minor_radius: 2.0,
+        });
+        let plane = Surface::Plane(plane_at([0.0; 3], [0.0, 0.0, 1.0]));
+        assert_eq!(surfaces(&torus, &plane, TOL), Meeting::Unknown);
+    }
+
+    #[test]
+    fn the_answer_does_not_depend_on_which_surface_comes_first() {
+        let sphere = Surface::Sphere(Sphere {
+            frame: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
+            radius: 5.0,
+        });
+        let plane = Surface::Plane(plane_at([0.0, 0.0, 3.0], [0.0, 0.0, 1.0]));
+        let one = surfaces(&sphere, &plane, TOL);
+        let other = surfaces(&plane, &sphere, TOL);
+        assert_eq!(one, other);
+    }
+
+    #[test]
+    fn survey_coordinates_find_the_same_intersection() {
+        let origin = [512_345.678, 4_512_345.678, 91.5];
+        let sphere = Surface::Sphere(Sphere {
+            frame: plane_at(origin, [0.0, 0.0, 1.0]),
+            radius: 5.0,
+        });
+        let plane = Surface::Plane(plane_at(
+            [origin[0], origin[1], origin[2] + 3.0],
+            [0.0, 0.0, 1.0],
+        ));
+        let meeting = surfaces(&sphere, &plane, 1e-6);
+        let Meeting::Curves(curves) = &meeting else {
+            panic!("expected a circle, got {meeting:?}");
+        };
+        let Curve3::Circle(circle) = &curves[0] else {
+            unreachable!()
+        };
+        assert!((circle.radius - 4.0).abs() < 1e-6, "{}", circle.radius);
+    }
+}
