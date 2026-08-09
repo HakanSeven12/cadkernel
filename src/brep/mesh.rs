@@ -28,6 +28,7 @@ use super::pcurve;
 use super::topology::{Body, FaceKey};
 use crate::geom2d::triangulate;
 use crate::space::Vec3;
+use std::f64::consts::{FRAC_PI_2, TAU};
 
 /// A triangulated solid.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -102,6 +103,14 @@ pub fn body(body: &Body, sag: f64, tolerance: f64) -> Mesh {
 pub fn face(body: &Body, face: FaceKey, sag: f64, tolerance: f64) -> Option<Mesh> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
+    // A face bounded by nothing but its own seams is the whole of its
+    // surface, and its region in (u, v) is the whole parameter rectangle.
+    // Worth asking first, because a sphere's seam ends at the poles where
+    // longitude has no value at all — the boundary cannot be projected, and
+    // taking that for "cannot be drawn" left every sphere missing.
+    if let Some(domain) = whole_surface(body, face, surface) {
+        return fill(body, face, surface, &[domain], sag);
+    }
     let boundary = pcurve::face_boundary(body, face, tolerance)?;
     if boundary.is_empty() {
         return None;
@@ -153,6 +162,19 @@ pub fn face(body: &Body, face: FaceKey, sag: f64, tolerance: f64) -> Option<Mesh
             rings.push(points);
         }
     }
+    fill(body, face, surface, &rings, sag)
+}
+
+/// Triangulates a face over the rings its boundary makes in `(u, v)`.
+///
+/// The first bounds it and the rest cut holes out of it.
+fn fill(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+    rings: &[Vec<[f64; 2]>],
+    sag: f64,
+) -> Option<Mesh> {
     let (outer, holes) = rings.split_first()?;
     let (parameters, triangles) = triangulate(outer, holes);
     if triangles.is_empty() {
@@ -174,6 +196,61 @@ pub fn face(body: &Body, face: FaceKey, sag: f64, tolerance: f64) -> Option<Mesh
         }
     }
     Some(mesh)
+}
+
+/// The whole of a closed surface, as a ring in `(u, v)`, when that is what a
+/// face covers.
+///
+/// A face covers all of its surface when every edge bounding it is used
+/// twice by that same face and by nothing else — which is to say the only
+/// things bounding it are its own seams, and a seam is where a surface was
+/// cut open to have a boundary rather than a border with anything.
+///
+/// `None` for a surface with no closed extent to fill: a plane and the
+/// unbounded run of a cylinder or a cone go on forever, so a face on one is
+/// always bounded by real edges.
+fn whole_surface(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+) -> Option<Vec<[f64; 2]>> {
+    use super::geometry::Surface;
+    let span = match surface {
+        Surface::Sphere(_) => [[0.0, TAU], [-FRAC_PI_2, FRAC_PI_2]],
+        Surface::Torus(_) => [[0.0, TAU], [0.0, TAU]],
+        _ => return None,
+    };
+    let coedges = body.face_coedges(face);
+    if coedges.is_empty() {
+        return None;
+    }
+    let edges: Vec<_> = coedges
+        .iter()
+        .filter_map(|coedge| Some(body.coedges.get(*coedge)?.edge))
+        .collect();
+    if edges.len() != coedges.len() {
+        return None;
+    }
+    // Each edge used twice, and by nothing but this face. Counted by walking
+    // rather than sorting, since a generational key has no order of its own —
+    // and giving it one would invite comparing keys from two arenas.
+    let seams = edges.iter().filter(|edge| {
+        let here = edges.iter().filter(|other| *other == *edge).count();
+        let anywhere = body
+            .edges
+            .get(**edge)
+            .map_or(0, |node| node.coedges.len());
+        here == 2 && anywhere == 2
+    });
+    if seams.count() != coedges.len() {
+        return None;
+    }
+    Some(vec![
+        [span[0][0], span[1][0]],
+        [span[0][1], span[1][0]],
+        [span[0][1], span[1][1]],
+        [span[0][0], span[1][1]],
+    ])
 }
 
 /// Splits a triangle until its middle lies close enough to the surface.

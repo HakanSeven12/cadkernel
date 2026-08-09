@@ -1002,7 +1002,7 @@ mod tests {
         //
         // A volume notices both faults at once: a missing face reads far too
         // small, and an inside-out one reads negative.
-        let cases: [(Body, f64); 5] = [
+        let cases: [(Body, f64); 7] = [
             (cuboid([0.0; 3], [4.0; 3]).unwrap(), 64.0),
             (wedge([0.0; 3], 4.0, 3.0, 5.0).unwrap(), 0.5 * 4.0 * 5.0 * 3.0),
             (
@@ -1016,6 +1016,16 @@ mod tests {
             (
                 torus([0.0; 3], 10.0, 2.0).unwrap(),
                 2.0 * std::f64::consts::PI.powi(2) * 10.0 * 4.0,
+            ),
+            (
+                sphere([0.0; 3], 5.0).unwrap(),
+                4.0 / 3.0 * std::f64::consts::PI * 125.0,
+            ),
+            (
+                pyramid([0.0; 3], 4.0, 9.0, 6).unwrap(),
+                // A regular hexagon of circumradius four: six equilateral
+                // triangles, each with area r²√3/4 at side r.
+                6.0 * (16.0 * 3.0_f64.sqrt() / 4.0) * 9.0 / 3.0,
             ),
         ];
         for (solid, expected) in cases {
@@ -1078,17 +1088,19 @@ mod tests {
     }
 
     #[test]
-    fn a_sphere_cannot_be_meshed_until_coedges_carry_their_own_pcurves() {
-        // Stated rather than left to be discovered. A sphere's seam ends at
-        // the poles, where longitude has no single value — every meridian
-        // passes through them — so where the seam sits in (u, v) cannot be
-        // worked out from the geometry at all. What says is the pcurve ACIS
-        // stores on each coedge.
-        //
-        // A torus has closed seams and the same question about where a loop
-        // starts, but no singular point, so the ring joining up answers it —
-        // which is why that one meshes and this one does not.
-        assert!(crate::brep::mesh::body(&sphere([0.0; 3], 5.0).unwrap(), 0.05, 1e-9).is_empty());
+    fn a_sphere_meshes_from_what_bounds_it_rather_than_where() {
+        // Its seam ends at the poles, where longitude has no single value —
+        // every meridian passes through them — so where that seam sits in
+        // (u, v) cannot be worked out from the geometry at all. What can be
+        // worked out is that the seam is the *only* thing bounding the face,
+        // and a face bounded by nothing but its own seams covers the whole
+        // of its surface. That is enough, and it needs no pcurve.
+        let solid = sphere([0.0; 3], 5.0).unwrap();
+        let volume = meshed_volume(&solid);
+        let expected = 4.0 / 3.0 * std::f64::consts::PI * 125.0;
+        assert!(volume > 0.0, "wound inwards: {volume}");
+        assert!(volume < expected, "a tessellation cannot read over: {volume}");
+        assert!(volume > 0.98 * expected, "{volume} vs {expected}");
     }
 
     #[test]
