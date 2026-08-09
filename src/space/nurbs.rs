@@ -136,29 +136,53 @@ impl NurbsCurve3 {
         self.point_at_knot(from + (to - from) * t.clamp(0.0, 1.0))
     }
 
-    /// The tangent at `t`, by a central difference on the knot parameter.
+    /// The tangent at a knot parameter, by a central difference.
     ///
     /// Differenced rather than differentiated: the derivative of a rational
-    /// curve is a quotient rule over two B-splines, and for the one thing
-    /// this is wanted for — which way the curve is heading — a difference at
-    /// a thousandth of the domain is indistinguishable and cannot be
-    /// subtly wrong.
-    pub fn tangent_at(&self, t: f64) -> [f64; 3] {
+    /// curve is a quotient rule over two B-splines, and for what this is
+    /// wanted for — which way the curve is heading, and how hard it turns —
+    /// a difference at a ten-thousandth of the domain is indistinguishable
+    /// and cannot be subtly wrong.
+    pub fn tangent_at_knot(&self, u: f64) -> [f64; 3] {
+        let Some((here, step)) = self.sampling_at(u) else {
+            return [0.0; 3];
+        };
+        let behind = Vec3::from(self.point_at_knot(here - step));
+        let ahead = Vec3::from(self.point_at_knot(here + step));
+        ((ahead - behind) / (2.0 * step)).to_array()
+    }
+
+    /// The second derivative at a knot parameter, by a central second
+    /// difference. What a curvature is worked out from.
+    pub fn acceleration_at_knot(&self, u: f64) -> [f64; 3] {
+        let Some((here, step)) = self.sampling_at(u) else {
+            return [0.0; 3];
+        };
+        let behind = Vec3::from(self.point_at_knot(here - step));
+        let middle = Vec3::from(self.point_at_knot(here));
+        let ahead = Vec3::from(self.point_at_knot(here + step));
+        ((ahead - middle * 2.0 + behind) / (step * step)).to_array()
+    }
+
+    /// Where to centre a difference at `u`, and how wide to make it.
+    ///
+    /// Held far enough inside the domain that both samples land on the curve.
+    /// At an end a difference reaching past it would sample a clamped
+    /// repetition of the last point and read the slope as half what it is.
+    fn sampling_at(&self, u: f64) -> Option<(f64, f64)> {
         let (from, to) = self.domain();
         let span = to - from;
         if span <= 0.0 {
-            return [0.0; 3];
+            return None;
         }
         let step = span * 1e-4;
-        let here = from + span * t.clamp(0.0, 1.0);
-        let behind = self.point_at_knot((here - step).max(from));
-        let ahead = self.point_at_knot((here + step).min(to));
-        let scale = 1.0 / (2.0 * step);
-        [
-            (ahead[0] - behind[0]) * scale,
-            (ahead[1] - behind[1]) * scale,
-            (ahead[2] - behind[2]) * scale,
-        ]
+        Some((u.clamp(from + step, to - step), step))
+    }
+
+    /// The tangent at `t` in `0..=1`.
+    pub fn tangent_at(&self, t: f64) -> [f64; 3] {
+        let (from, to) = self.domain();
+        self.tangent_at_knot(from + (to - from) * t.clamp(0.0, 1.0))
     }
 
     /// Whether the curve returns to where it started.
@@ -434,6 +458,59 @@ mod tests {
             let along = Vec3::from(curve.tangent_at(t));
             let ahead = Vec3::from(curve.point_at(t + 0.05)) - Vec3::from(curve.point_at(t));
             assert!(along.dot(ahead) > 0.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn a_second_derivative_reads_the_way_the_curve_bends() {
+        // A parabola through three points: its second derivative is constant
+        // and points at the inside of the bend, whatever the parameter.
+        let curve = NurbsCurve3::new(
+            2,
+            vec![[0.0, 0.0, 0.0], [1.0, 2.0, 0.0], [2.0, 0.0, 0.0]],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let (from, to) = curve.domain();
+        for step in 0..=6 {
+            let u = from + (to - from) * step as f64 / 6.0;
+            let bend = Vec3::from(curve.acceleration_at_knot(u));
+            assert!(bend.y < 0.0, "u={u}: {bend:?}");
+            assert!(bend.x.abs() < 1e-3, "u={u}: {bend:?}");
+        }
+        // And a straight run does not bend at all.
+        let straight = NurbsCurve3::new(
+            1,
+            vec![[0.0; 3], [5.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert!(Vec3::from(straight.acceleration_at_knot(0.5)).length() < 1e-3);
+    }
+
+    #[test]
+    fn a_tangent_at_the_very_end_is_not_halved() {
+        // A difference reaching past the domain samples the clamped end
+        // twice and reads the slope as half what it is, which is the shape a
+        // blend leaves a visible kink at.
+        let curve = NurbsCurve3::new(
+            3,
+            vec![[0.0; 3], [1.0, 3.0, 0.0], [4.0, 3.0, 0.0], [5.0, 0.0, 0.0]],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let (from, to) = curve.domain();
+        for end in [from, to] {
+            let at_end = Vec3::from(curve.tangent_at_knot(end)).length();
+            let just_inside =
+                Vec3::from(curve.tangent_at_knot(from + (to - from) * 0.02)).length();
+            assert!(
+                (at_end - just_inside).abs() < 0.35 * just_inside,
+                "{at_end} vs {just_inside}"
+            );
         }
     }
 
