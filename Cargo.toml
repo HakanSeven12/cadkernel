@@ -24,11 +24,6 @@ offset = ["geom2d", "dep:cavalier_contours"]
 # Owned, mutable B-rep topology plus the operations that act on it.
 brep = ["geom2d"]
 
-# Lifting a `SatDocument` into `brep` topology and lowering it back, so an
-# ACIS body can be edited and re-emitted. Keeps every file-format concern in
-# one feature; the kernel core stays format-agnostic.
-acis = ["brep"]
-
 [dependencies]
 # Offsetting only. Pinned to match the version already resolved elsewhere in
 # this stack, since the offset path reaches into the crate's internals.

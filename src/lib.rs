@@ -4,8 +4,6 @@
 //! # Layering
 //!
 //! ```text
-//! acis    lift a SatDocument into `brep`, lower it back      [feature = "acis"]
-//!   │
 //! brep    owned mutable topology, SSI, boolean, blends       [feature = "brep"]
 //!   │
 //! geom2d  curves, intersection, offset, containment          [feature = "geom2d"]
@@ -23,6 +21,14 @@
 //! Every entry point lifts its input into a local frame before doing any
 //! math, and shifts results back to world coordinates on the way out. See
 //! [`geom2d::frame`] for why this is an invariant rather than a convenience.
+//!
+//! # No file formats
+//!
+//! Nothing here knows what a DWG or a SAT record is, and nothing here depends
+//! on a codec. Lifting an ACIS document into [`brep`] and lowering it back
+//! lives in the crate that already knows both — otherwise there would be two
+//! paths to the codec, and the first time one was bumped and the other was
+//! not, Cargo would build two copies whose types do not unify.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -36,5 +42,3 @@ pub mod geom2d;
 #[cfg(feature = "brep")]
 pub mod brep;
 
-#[cfg(feature = "acis")]
-pub mod acis;
