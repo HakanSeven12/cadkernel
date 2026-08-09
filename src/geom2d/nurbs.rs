@@ -15,6 +15,7 @@
 //! off. Weights are carried here and applied in homogeneous coordinates.
 
 use super::vec::Vec2;
+use crate::space::spline::{clamped_uniform_knots, de_boor};
 
 /// A non-uniform rational B-spline curve in the plane.
 #[derive(Debug, Clone, PartialEq)]
@@ -683,68 +684,6 @@ impl NurbsCurve {
     }
 }
 
-/// de Boor's algorithm over an arbitrary degree, knot vector and set of
-/// homogeneous control points.
-///
-/// Free of `NurbsCurve` so that a curve's derivative — which has its own
-/// degree, knots and control points — can be evaluated by the same code that
-/// evaluates the curve.
-fn de_boor(degree: usize, knots: &[f64], points: &[[f64; 3]], u: f64) -> [f64; 3] {
-    if points.is_empty() {
-        return [0.0, 0.0, 0.0];
-    }
-    if degree == 0 {
-        // A step function: the value is whichever control point's span `u`
-        // falls in.
-        let index = knots
-            .iter()
-            .rposition(|knot| *knot <= u)
-            .unwrap_or(0)
-            .min(points.len() - 1);
-        return points[index];
-    }
-    let last = points.len() - 1;
-    let span = if u >= knots[last + 1] {
-        last
-    } else {
-        let mut low = degree;
-        let mut high = last + 1;
-        while high - low > 1 {
-            let middle = (low + high) / 2;
-            if u < knots[middle] {
-                high = middle;
-            } else {
-                low = middle;
-            }
-        }
-        low
-    };
-
-    let mut working: Vec<[f64; 3]> = (0..=degree)
-        .map(|j| points[span + j - degree])
-        .collect();
-    for round in 1..=degree {
-        for j in (round..=degree).rev() {
-            let index = span + j - degree;
-            let lower = knots[index];
-            let upper = knots[index + degree + 1 - round];
-            let alpha = if (upper - lower).abs() < 1e-15 {
-                0.0
-            } else {
-                (u - lower) / (upper - lower)
-            };
-            let (previous, current) = (working[j - 1], working[j]);
-            for (slot, (before, after)) in working[j]
-                .iter_mut()
-                .zip(previous.iter().zip(current.iter()))
-            {
-                *slot = (1.0 - alpha) * before + alpha * after;
-            }
-        }
-    }
-    working[degree]
-}
-
 /// How fit points are spaced along the parameter when interpolating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parameterization {
@@ -775,22 +714,6 @@ fn solve_tridiagonal(a: &[f64], b: &[f64], c: &[f64], d: &mut [f64]) {
     }
 }
 
-/// A clamped uniform knot vector: `degree + 1` zeros, evenly spaced interior
-/// values, then `degree + 1` ones.
-///
-/// Clamped so the curve starts at its first control point and ends at its
-/// last, which is what a drawing expects to see. Public because rebuilding a
-/// spline after its control polygon changed needs the same vector, and it is
-/// better shared than guessed at twice.
-pub fn clamped_uniform_knots(degree: usize, control_point_count: usize) -> Vec<f64> {
-    let interior = control_point_count.saturating_sub(degree + 1);
-    let mut knots = vec![0.0; degree + 1];
-    for i in 1..=interior {
-        knots.push(i as f64 / (interior + 1) as f64);
-    }
-    knots.extend(std::iter::repeat_n(1.0, degree + 1));
-    knots
-}
 
 #[cfg(test)]
 mod tests {

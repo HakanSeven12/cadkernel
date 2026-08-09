@@ -12,14 +12,18 @@
 //! planar B-rep face.
 
 pub mod curve;
+pub mod nurbs;
 pub mod plane;
 pub mod polygon;
+pub mod spline;
 pub mod vec;
 
 #[cfg(feature = "geom2d")]
 pub mod planar;
 
+pub use nurbs::{NurbsCurve3, NurbsSurface3};
 pub use plane::Plane;
+pub use spline::{clamped_uniform_knots, de_boor};
 pub use vec::Vec3;
 
 #[cfg(feature = "geom2d")]
