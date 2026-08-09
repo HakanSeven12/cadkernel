@@ -270,10 +270,16 @@ impl Surface {
             }
             Self::Cone(cone) => {
                 let (along, across) = axial_distance(&cone.base, point);
-                // Distance to the generator line in the (across, along) half
-                // plane, which is the cone's own profile.
-                let (sin, cos) = cone.half_angle.sin_cos();
-                (across - cone.radius) * cos + along * sin
+                // In the (across, along) half plane the cone's profile is not
+                // one line but two, meeting at the apex — the record covers
+                // both nappes, so past the apex the radius grows again on the
+                // mirrored half. Taking the magnitude is what folds the
+                // second one in; reading the first line's own extension
+                // instead put every point on the far nappe several units off
+                // a surface it lies exactly on, and a seam running up to the
+                // apex was refused as not being on its own cone.
+                let cos = cone.half_angle.cos();
+                (across - (cone.radius - along * cone.half_angle.tan()).abs()) * cos
             }
             Self::Sphere(sphere) => {
                 Vec3::from(point).distance(Vec3::from(sphere.frame.origin)) - sphere.radius
@@ -511,6 +517,35 @@ mod tests {
         for v in [0.0, 3.0, 9.0] {
             assert!(surface.contains(surface.point_at(1.2, v), 1e-9), "v={v}");
         }
+    }
+
+    #[test]
+    fn a_cone_holds_the_nappe_past_its_own_apex() {
+        // One record, both halves — which `ray_hits` has always said, since a
+        // ray up one side meets the other. The distance has to agree: past
+        // the apex the radius grows again on the mirrored half, and reading
+        // the first half's generator extended instead reports a point lying
+        // exactly on the cone as units away from it.
+        //
+        // What that cost was a cone's whole wall. A seam runs from the rim to
+        // the apex, the check that a curve lies on its surface samples past
+        // both ends, and the sample beyond the apex was refused — so the
+        // face's boundary could not be projected and nothing of it was drawn.
+        let surface = Surface::Cone(Cone {
+            base: xy(),
+            radius: 10.0,
+            half_angle: FRAC_PI_4,
+        });
+        // The apex is ten up; twice that is ten out again on the far nappe.
+        for (height, radius) in [(0.0, 10.0), (6.0, 4.0), (10.0, 0.0), (16.0, 6.0), (20.0, 10.0)] {
+            let on = [radius, 0.0, height];
+            assert!(surface.distance_to(on).abs() < 1e-12, "{on:?}");
+        }
+        // And it still reads positive outside and negative in, both halves.
+        assert!(surface.distance_to([14.0, 0.0, 20.0]) > 0.0);
+        assert!(surface.distance_to([6.0, 0.0, 20.0]) < 0.0);
+        assert!(surface.distance_to([14.0, 0.0, 0.0]) > 0.0);
+        assert!(surface.distance_to([6.0, 0.0, 0.0]) < 0.0);
     }
 
     #[test]

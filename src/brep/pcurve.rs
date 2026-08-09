@@ -28,7 +28,7 @@
 //! can refuse, a caller told something wrong cannot.
 
 use super::geometry::{Curve3, Surface};
-use crate::geom2d::{Circle, Curve, Ellipse, EllipseArc, Line, XLine};
+use crate::geom2d::{Arc, Circle, Curve, Ellipse, EllipseArc, Line, XLine};
 use crate::space::Vec3;
 use std::f64::consts::TAU;
 
@@ -137,7 +137,38 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
             _ => None,
         },
 
-        Surface::Sphere(_) | Surface::Torus(_) => None,
+        // A torus closes both ways, so both families of circles on it are
+        // straight in `(u, v)`: the parallels, which run round the ring at
+        // one place on the tube, and the meridians, which run round the tube
+        // at one place on the ring. Between them they are every edge a
+        // revolution puts on one. Anything else — a circle cutting across
+        // both — is a quartic's section and has no closed form here.
+        Surface::Torus(torus) => match curve {
+            Curve3::Circle(circle) => {
+                let axis = Vec3::from(torus.frame.normal()?);
+                let plane_normal = Vec3::from(circle.plane.normal()?);
+                let offset = Vec3::from(circle.plane.origin) - Vec3::from(torus.frame.origin);
+                if plane_normal.is_parallel_to(axis, tolerance) {
+                    // A parallel. Where it sits round the tube is fixed by
+                    // how far out and how high it is.
+                    Some(band_at(
+                        offset.dot(axis).atan2(circle.radius - torus.major_radius),
+                    ))
+                } else if plane_normal.dot(axis).abs() <= tolerance {
+                    Some(meridian_at(angle_about(&torus.frame, circle.plane.origin)?))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+
+        // A sphere is closed too, but its `u` has no value at the poles —
+        // every meridian passes through them — so a seam ending at one
+        // cannot be placed in `(u, v)` from the geometry at all. What says
+        // where it goes is the pcurve ACIS stores on the coedge, which this
+        // kernel does not keep yet.
+        Surface::Sphere(_) => None,
     }
 }
 
@@ -146,7 +177,10 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
 ///
 /// The trimming is the part that matters for containment. A straight edge
 /// projects to an infinite line, and a boundary made of infinite lines
-/// encloses nothing and reports every point as lying on it.
+/// encloses nothing and reports every point as lying on it. A *circular*
+/// edge is the same problem wearing a bounded shape: half an arc on a plane
+/// projects to the whole circle it lies on, and a face bounded by whole
+/// circles where it meant arcs covers a region nobody asked for.
 ///
 /// The orientation matters for anything walking the ring. An edge has one
 /// direction and its two coedges disagree about it, so a boundary built from
@@ -165,36 +199,214 @@ pub fn face_boundary(
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
     let mut out = Vec::new();
-    for coedge in body.face_coedges(face) {
-        let edge_key = body.coedges.get(coedge)?.edge;
-        let edge = body.edges.get(edge_key)?;
-        let curve = body.curves.get(edge.curve)?;
-        let flat = project(surface, curve, tolerance)?;
-        let (start, end) = body.edge_endpoints(edge_key)?;
-        // The loop's own direction, not the edge's.
-        let (start, end) = if body.coedges.get(coedge)?.forward {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        let (from, to) = (
-            surface.parameters_at(start)?,
-            surface.parameters_at(end)?,
-        );
-        out.push(trim_to(flat, [from.0, from.1], [to.0, to.1]));
+    for ring in &node.loops {
+        let mut pieces = Vec::new();
+        for coedge in &body.loops.get(*ring)?.coedges {
+            let edge_key = body.coedges.get(*coedge)?.edge;
+            let edge = body.edges.get(edge_key)?;
+            let curve = body.curves.get(edge.curve)?;
+            let flat = project(surface, curve, tolerance)?;
+            // The loop's own direction, not the edge's.
+            let forward = body.coedges.get(*coedge)?.forward;
+            let span = if forward {
+                (edge.start_parameter, edge.end_parameter)
+            } else {
+                (edge.end_parameter, edge.start_parameter)
+            };
+            pieces.push(trim_to(surface, curve, span, flat)?);
+        }
+        chain_round(&mut pieces, periodic(surface));
+        out.extend(pieces);
     }
     Some(out)
 }
 
-/// The part of a projected boundary curve between two parameter-space points.
-fn trim_to(curve: Curve, from: [f64; 2], to: [f64; 2]) -> Curve {
-    match curve {
+/// Slides each piece of a loop by whole turns so the ring joins up.
+///
+/// On a surface closed in `u`, a point does not have one parameter — it has
+/// one every turn. A seam is the case that matters: the face runs the whole
+/// way round and meets itself there, so its two coedges are the *same* edge
+/// and project to the same `u`, when what bounds the face is that edge at
+/// zero and again at a full turn. Read literally, the ring collapses to a
+/// line and the face cannot be filled at all — which is why a cylinder's
+/// wall silently produced no triangles before this.
+///
+/// ACIS keeps a pcurve on every coedge and so has the answer stored. Until
+/// this kernel does too, the ring itself says which turn each piece belongs
+/// on: the one that continues from where the last piece ended.
+fn chain_round(pieces: &mut [Curve], wraps: [bool; 2]) {
+    if wraps == [false, false] || pieces.len() < 2 {
+        return;
+    }
+    let mut head = pieces[0].point_at(1.0);
+    let mut behind = [pieces[0].point_at(0.0), head];
+    for piece in pieces.iter_mut().skip(1) {
+        let (start, end) = (piece.point_at(0.0), piece.point_at(1.0));
+        let mut best = (f64::INFINITY, [0.0, 0.0]);
+        for across in turns(wraps[0]) {
+            for along in turns(wraps[1]) {
+                let shift = [TAU * across, TAU * along];
+                // A seam is one edge used twice by the same loop, and its two
+                // uses are a whole turn apart — that is what makes the face a
+                // rectangle in `(u, v)` rather than a slit. Placing the second
+                // on top of the first is the nearest fit and always the wrong
+                // one: it retraces the piece before it and the ring encloses
+                // nothing, which is how a cone's wall came to be missing from
+                // every mesh.
+                let moved = [
+                    [start[0] + shift[0], start[1] + shift[1]],
+                    [end[0] + shift[0], end[1] + shift[1]],
+                ];
+                if near(moved[0], behind[1]) && near(moved[1], behind[0]) {
+                    continue;
+                }
+                let gap = (moved[0][0] - head[0]).hypot(moved[0][1] - head[1]);
+                if gap < best.0 {
+                    best = (gap, shift);
+                }
+            }
+        }
+        if best.1 != [0.0, 0.0] {
+            slide(piece, best.1);
+        }
+        behind = [piece.point_at(0.0), piece.point_at(1.0)];
+        head = behind[1];
+    }
+}
+
+/// Whether two parameter-space points are the same place, at the scale
+/// whole turns are compared on.
+fn near(a: [f64; 2], b: [f64; 2]) -> bool {
+    (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-9
+}
+
+/// The whole turns worth trying on one axis: none at all when it does not
+/// wrap, and a turn either way when it does.
+fn turns(wraps: bool) -> impl Iterator<Item = f64> {
+    let span = if wraps { 2 } else { 0 };
+    (-span..=span).map(f64::from)
+}
+
+/// Moves a projected piece by whole turns. Only the straight kinds ever need
+/// it: a circle or an ellipse in parameter space comes from a plane, and a
+/// plane does not wrap.
+fn slide(piece: &mut Curve, shift: [f64; 2]) {
+    if let Curve::Line(line) = piece {
+        for axis in 0..2 {
+            line.start[axis] += shift[axis];
+            line.end[axis] += shift[axis];
+        }
+    }
+}
+
+/// How many places along an edge are looked at to find where its projection
+/// begins and ends. Three would do for the shapes here; more costs nothing
+/// and keeps the unwrapping below honest when an edge covers most of a turn.
+const WALK: usize = 8;
+
+/// The part of a projected boundary curve the edge actually covers.
+///
+/// Worked out by walking the space curve over the edge's own parameter range
+/// and projecting as it goes, rather than from the two endpoints alone. The
+/// endpoints do not say enough: an arc covering three quarters of a turn has
+/// the same pair of ends as the quarter left over, and on a closed surface
+/// they do not even say which way round the edge went.
+fn trim_to(
+    surface: &Surface,
+    curve: &Curve3,
+    span: (f64, f64),
+    flat: Curve,
+) -> Option<Curve> {
+    // A parameter that wraps reads a walk across the seam as a jump
+    // backwards unless it is unwound. One that does not wrap must be left
+    // alone: unwinding a plane's coordinates would move the curve.
+    let wraps = periodic(surface);
+    let mut walk: Vec<[f64; 2]> = Vec::with_capacity(WALK + 1);
+    let mut last: Option<[f64; 2]> = None;
+    for step in 0..=WALK {
+        let t = span.0 + (span.1 - span.0) * step as f64 / WALK as f64;
+        let (u, v) = surface.parameters_at(curve.point_at(t))?;
+        let mut here = [u, v];
+        if let Some(previous) = last {
+            for axis in 0..2 {
+                if wraps[axis] {
+                    here[axis] = unwound(here[axis], previous[axis]);
+                }
+            }
+        }
+        last = Some(here);
+        walk.push(here);
+    }
+    let (first, final_point) = (walk[0], walk[WALK]);
+
+    Some(match flat {
         // The kinds that run past their edge become the segment between the
         // two ends. A straight edge's projection is straight, so nothing is
-        // lost by saying so.
-        Curve::XLine(_) | Curve::Ray(_) => Curve::Line(Line { start: from, end: to }),
+        // lost by saying so — and a band round a cylinder is straight in
+        // `(u, v)` too.
+        Curve::XLine(_) | Curve::Ray(_) | Curve::Line(_) => Curve::Line(Line {
+            start: first,
+            end: final_point,
+        }),
+        Curve::Circle(circle) => {
+            let angles = swept(&walk, circle.centre, |point, centre| {
+                (point[1] - centre[1]).atan2(point[0] - centre[0])
+            });
+            match angles {
+                // The edge really does go the whole way round.
+                None => Curve::Circle(circle),
+                Some((from, to)) => Curve::Arc(Arc {
+                    centre: circle.centre,
+                    radius: circle.radius,
+                    // An arc runs counter-clockwise from its start, so one
+                    // walked the other way is written with its ends swapped.
+                    start_angle: from.min(to),
+                    end_angle: from.max(to),
+                }),
+            }
+        }
+        Curve::Ellipse(whole) => {
+            let angles = swept(&walk, [0.0, 0.0], |point, _| {
+                Curve::Ellipse(whole).parameter_at(*point) * TAU
+            });
+            match angles {
+                None => Curve::Ellipse(whole),
+                Some((from, to)) => Curve::Ellipse(EllipseArc {
+                    ellipse: whole.ellipse,
+                    start_parameter: from.min(to),
+                    end_parameter: from.max(to),
+                }),
+            }
+        }
+        // A spline's projection already spans exactly its own edge.
         other => other,
+    })
+}
+
+/// Where a walk round a closed curve begins and ends, unwound so the two
+/// bound the part actually covered. `None` when it covers all of it.
+fn swept(
+    walk: &[[f64; 2]],
+    centre: [f64; 2],
+    angle_of: impl Fn(&[f64; 2], [f64; 2]) -> f64,
+) -> Option<(f64, f64)> {
+    let mut angles = Vec::with_capacity(walk.len());
+    let mut last: Option<f64> = None;
+    for point in walk {
+        let mut angle = angle_of(point, centre);
+        if let Some(previous) = last {
+            angle = unwound(angle, previous);
+        }
+        last = Some(angle);
+        angles.push(angle);
     }
+    let (from, to) = (angles[0], angles[angles.len() - 1]);
+    ((to - from).abs() < TAU - 1e-9).then_some((from, to))
+}
+
+/// `angle` moved by whole turns to sit within half a turn of `previous`.
+fn unwound(angle: f64, previous: f64) -> f64 {
+    angle + TAU * ((previous - angle) / TAU).round()
 }
 
 /// A line of constant `v`, spanning one full turn of `u`.
@@ -207,6 +419,28 @@ fn band_at(height: f64) -> Curve {
         start: [0.0, height],
         end: [TAU, height],
     })
+}
+
+/// The same the other way: constant `u`, a full turn of `v`. Only a torus
+/// has one, since it is the only surface here that closes both ways.
+fn meridian_at(angle: f64) -> Curve {
+    Curve::Line(Line {
+        start: [angle, 0.0],
+        end: [angle, TAU],
+    })
+}
+
+/// Which of a surface's parameters wrap.
+///
+/// `u` runs round every closed surface here; `v` only runs round a torus. A
+/// plane's do not wrap at all, and unwinding one there would move the curve
+/// rather than place it.
+fn periodic(surface: &Surface) -> [bool; 2] {
+    match surface {
+        Surface::Plane(_) => [false, false],
+        Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_) => [true, false],
+        Surface::Torus(_) => [true, true],
+    }
 }
 
 /// A line of constant `u`, unbounded in `v` — a generator, which the face's
