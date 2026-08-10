@@ -1178,9 +1178,10 @@ fn scheduled_band(
             let mut points = parameterize_samples(surface, &samples, coedge.pcurve.as_ref())?;
             unwrap_boundary(&mut points, surface_periods);
             let varying = (0..2)
-                .filter_map(|axis| {
-                    let period = surface_periods[axis]?;
-                    (parameter_range(&points, axis) >= period * 0.5).then_some(axis)
+                .filter(|axis| surface_periods[*axis].is_some())
+                .filter(|axis| {
+                    points.len() > 2
+                        && is_isoparametric_rim(surface, &points, *axis, tolerance)
                 })
                 .max_by(|a, b| {
                     parameter_range(&points, *a).total_cmp(&parameter_range(&points, *b))
@@ -1339,6 +1340,24 @@ fn parameter_range(points: &[BoundaryPoint], axis: usize) -> f64 {
 
 fn average_parameter(points: &[BoundaryPoint], axis: usize) -> f64 {
     points.iter().map(|point| point.parameters[axis]).sum::<f64>() / points.len() as f64
+}
+
+fn is_isoparametric_rim(
+    surface: &super::geometry::Surface,
+    points: &[BoundaryPoint],
+    varying: usize,
+    tolerance: f64,
+) -> bool {
+    let fixed = 1 - varying;
+    let value = average_parameter(points, fixed);
+    points.iter().all(|point| {
+        let mut parameters = point.parameters;
+        parameters[fixed] = value;
+        distance3(
+            point.position,
+            surface.point_at(parameters[0], parameters[1]),
+        ) <= tolerance
+    })
 }
 
 fn surface_domain(surface: &super::geometry::Surface) -> Option<[[f64; 2]; 2]> {
@@ -1814,12 +1833,18 @@ fn emit_scheduled(
     else {
         return;
     };
-    let normal = if node.forward { normal } else { -normal };
+    let normals = corners.map(|parameters| {
+        let normal = surface
+            .normal_at(parameters[0], parameters[1])
+            .and_then(|normal| Vec3::from(normal).normalize())
+            .unwrap_or(normal);
+        if node.forward { normal } else { -normal }
+    });
     let base = mesh.positions.len();
     let order = if node.forward { [0, 1, 2] } else { [0, 2, 1] };
     for step in order {
         mesh.positions.push(points[step].to_array());
-        mesh.normals.push(normal.to_array());
+        mesh.normals.push(normals[step].to_array());
     }
     mesh.triangles.push([base, base + 1, base + 2]);
 }
