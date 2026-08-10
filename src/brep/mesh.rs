@@ -877,6 +877,8 @@ fn scheduled_face(
     }
     if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance)
         .or_else(|| scheduled_periodic_band(body, face, surface, schedules, tolerance))
+        .or_else(|| scheduled_winding_band(body, face, surface, schedules, tolerance))
+        .or_else(|| scheduled_singular_band(body, face, surface, schedules, tolerance))
     {
         if !band.strip
             && band.holes.is_empty()
@@ -887,7 +889,10 @@ fn scheduled_face(
         {
             return fill_scheduled_singular_cap(body, face, &band, max_angle, tolerance);
         }
-        if band.structured && band.strip && band.holes.is_empty() {
+        if band.strip
+            && band.holes.is_empty()
+            && (band.structured || periods(surface)[1 - band.varying].is_none())
+        {
             return fill_scheduled_band(body, face, &band, max_angle, tolerance);
         }
         let mut rings = vec![band.ring_with_seams(surface, max_angle)?];
@@ -908,6 +913,8 @@ fn face_rings(
 ) -> Option<Vec<Vec<BoundaryPoint>>> {
     if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance)
         .or_else(|| scheduled_periodic_band(body, face, surface, schedules, tolerance))
+        .or_else(|| scheduled_winding_band(body, face, surface, schedules, tolerance))
+        .or_else(|| scheduled_singular_band(body, face, surface, schedules, tolerance))
     {
         let mut rings = vec![band.ring()];
         rings.extend(band.holes);
@@ -1617,6 +1624,246 @@ fn scheduled_periodic_band(
     None
 }
 
+fn scheduled_singular_band(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+    schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+    tolerance: f64,
+) -> Option<BoundaryBand> {
+    let super::geometry::Surface::Cone(cone) = surface else {
+        return None;
+    };
+    let node = body.faces.get(face)?;
+    let mut singular_loops = 0;
+    let mut boundary_loop = None;
+    for loop_key in &node.loops {
+        if body.loops.get(*loop_key)?.coedges.is_empty() {
+            singular_loops += 1;
+        } else if boundary_loop.replace(*loop_key).is_some() {
+            return None;
+        }
+    }
+    if singular_loops != 1 {
+        return None;
+    }
+    let varying = 0;
+    let fixed = 1;
+    let period = periods(surface)[varying]?;
+    let mut rim = scheduled_loop(body, boundary_loop?, surface, schedules, tolerance)?;
+    let traversal = rim.last()?.parameters[varying] - rim.first()?.parameters[varying];
+    if traversal.abs() < period * (1.0 - 1e-9)
+        || traversal.abs() > period * (1.0 + 1e-9)
+    {
+        return None;
+    }
+    let increasing = traversal > 0.0;
+    let varying_scale = rim
+        .iter()
+        .map(|point| point.parameters[varying].abs())
+        .fold(period.max(1.0), f64::max);
+    let varying_epsilon = f64::EPSILON * 128.0 * varying_scale;
+    if rim.windows(2).any(|pair| {
+        let delta = pair[1].parameters[varying] - pair[0].parameters[varying];
+        if increasing {
+            delta < -varying_epsilon
+        } else {
+            delta > varying_epsilon
+        }
+    }) {
+        return None;
+    }
+    rim.sort_by(|a, b| a.parameters[varying].total_cmp(&b.parameters[varying]));
+    let base = rim.first()?.parameters[varying];
+    let apex = cone.radius / cone.half_angle.tan();
+    if !apex.is_finite()
+        || !boundary_collapsed(surface, varying, base, period, fixed, apex, tolerance)
+    {
+        return None;
+    }
+    let parameter_scale = rim
+        .iter()
+        .map(|point| point.parameters[fixed].abs())
+        .fold(apex.abs().max(1.0), f64::max);
+    let epsilon = f64::EPSILON * 128.0 * parameter_scale;
+    let crosses_apex = rim
+        .iter()
+        .map(|point| point.parameters[fixed] - apex)
+        .fold((false, false), |(below, above), delta| {
+            (below || delta < -epsilon, above || delta > epsilon)
+        });
+    if crosses_apex == (true, true) {
+        return None;
+    }
+    let position = surface.point_at(base, apex);
+    let singular = vec![
+        BoundaryPoint {
+            parameters: [base, apex],
+            position,
+        },
+        BoundaryPoint {
+            parameters: [base + period, apex],
+            position,
+        },
+    ];
+    let rim_fixed = average_parameter(&rim, fixed);
+    let (low, high) = if rim_fixed < apex {
+        (rim, singular)
+    } else {
+        (singular, rim)
+    };
+    Some(BoundaryBand {
+        low,
+        high,
+        holes: Vec::new(),
+        varying,
+        strip: false,
+        structured: false,
+    })
+}
+
+fn scheduled_winding_band(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+    schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+    tolerance: f64,
+) -> Option<BoundaryBand> {
+    let node = body.faces.get(face)?;
+    if node.loops.len() != 2 {
+        return None;
+    }
+    let rings: Vec<Vec<BoundaryPoint>> = node
+        .loops
+        .iter()
+        .map(|loop_key| {
+            (!body.loops.get(*loop_key)?.coedges.is_empty())
+                .then(|| scheduled_loop(body, *loop_key, surface, schedules, tolerance))?
+        })
+        .collect::<Option<_>>()?;
+    let surface_periods = periods(surface);
+    for varying in 0..2 {
+        let Some(period) = surface_periods[varying] else {
+            continue;
+        };
+        if surface_periods[1 - varying].is_some()
+            || rings
+                .iter()
+                .any(|ring| !is_monotonic_periodic_rim(ring, varying, period))
+        {
+            continue;
+        }
+        let traversals = [0, 1].map(|index| {
+            rings[index].last().unwrap().parameters[varying]
+                - rings[index].first().unwrap().parameters[varying]
+        });
+        if traversals[0].is_sign_positive() == traversals[1].is_sign_positive() {
+            continue;
+        }
+        let mut rims = rings.clone();
+        fit_periodic_band(&mut rims, &mut [], varying, period)?;
+        let first_is_low = separated_rim_order(&rims[0], &rims[1], varying)?;
+        let (low, high) = if first_is_low {
+            (rims.remove(0), rims.remove(0))
+        } else {
+            (rims.remove(1), rims.remove(0))
+        };
+        return Some(BoundaryBand {
+            low,
+            high,
+            holes: Vec::new(),
+            varying,
+            strip: true,
+            structured: false,
+        });
+    }
+    None
+}
+
+fn is_monotonic_periodic_rim(rim: &[BoundaryPoint], varying: usize, period: f64) -> bool {
+    let Some((first, last)) = rim.first().zip(rim.last()) else {
+        return false;
+    };
+    let traversal = last.parameters[varying] - first.parameters[varying];
+    if traversal.abs() < period * (1.0 - 1e-9)
+        || traversal.abs() > period * (1.0 + 1e-9)
+    {
+        return false;
+    }
+    let increasing = traversal > 0.0;
+    let scale = rim
+        .iter()
+        .map(|point| point.parameters[varying].abs())
+        .fold(period.max(1.0), f64::max);
+    let epsilon = f64::EPSILON * 128.0 * scale;
+    rim.windows(2).all(|pair| {
+        let delta = pair[1].parameters[varying] - pair[0].parameters[varying];
+        if increasing {
+            delta >= -epsilon
+        } else {
+            delta <= epsilon
+        }
+    })
+}
+
+fn separated_rim_order(
+    first: &[BoundaryPoint],
+    second: &[BoundaryPoint],
+    varying: usize,
+) -> Option<bool> {
+    let fixed = 1 - varying;
+    let mut values: Vec<f64> = first
+        .iter()
+        .chain(second)
+        .map(|point| point.parameters[varying])
+        .collect();
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|a, b| parameter_value_near(*a, *b));
+    let scale = first
+        .iter()
+        .chain(second)
+        .map(|point| point.parameters[fixed].abs())
+        .fold(1.0, f64::max);
+    let epsilon = f64::EPSILON * 128.0 * scale;
+    let mut order = None;
+    for value in values {
+        let delta = rim_fixed_at(second, varying, value)?
+            - rim_fixed_at(first, varying, value)?;
+        if delta.abs() <= epsilon {
+            return None;
+        }
+        let current = delta > 0.0;
+        if order.is_some_and(|order| order != current) {
+            return None;
+        }
+        order = Some(current);
+    }
+    order
+}
+
+fn rim_fixed_at(rim: &[BoundaryPoint], varying: usize, value: f64) -> Option<f64> {
+    let fixed = 1 - varying;
+    for pair in rim.windows(2) {
+        let from = pair[0].parameters[varying];
+        let to = pair[1].parameters[varying];
+        if value < from && !parameter_value_near(value, from)
+            || value > to && !parameter_value_near(value, to)
+        {
+            continue;
+        }
+        let span = to - from;
+        if parameter_value_near(span, 0.0) {
+            return Some(0.5 * (pair[0].parameters[fixed] + pair[1].parameters[fixed]));
+        }
+        let unit = ((value - from) / span).clamp(0.0, 1.0);
+        return Some(
+            pair[0].parameters[fixed]
+                + (pair[1].parameters[fixed] - pair[0].parameters[fixed]) * unit,
+        );
+    }
+    None
+}
+
 fn parameter_seam(
     surface: &super::geometry::Surface,
     fixed_axis: usize,
@@ -1981,31 +2228,35 @@ fn fill_scheduled_band(
     let mut upper = 0;
     let mut triangles = Vec::new();
     let fixed_axis = 1 - band.varying;
-    let fixed_from = band.low.first()?.parameters[fixed_axis];
-    let fixed_to = band.high.first()?.parameters[fixed_axis];
-    let mut varying_values: Vec<f64> = band
-        .low
-        .iter()
-        .chain(&band.high)
-        .map(|point| point.parameters[band.varying])
-        .collect();
-    varying_values.sort_by(f64::total_cmp);
-    varying_values.dedup_by(|a, b| parameter_value_near(*a, *b));
-    let mut probes = varying_values.clone();
-    probes.extend(varying_values.windows(2).map(|pair| 0.5 * (pair[0] + pair[1])));
     let surface = body.surfaces.get(body.faces.get(face)?.surface)?;
-    let fixed_depth = probes.into_iter().try_fold(0, |depth, varying| {
-        Some(depth.max(surface_span_depth(
-            surface,
-            fixed_axis,
-            varying,
-            fixed_from,
-            fixed_to,
-            max_angle,
-            0,
-        )?))
-    })?;
-    let fixed_steps = 1usize.checked_shl(fixed_depth)?;
+    let fixed_steps = if band.structured {
+        let fixed_from = band.low.first()?.parameters[fixed_axis];
+        let fixed_to = band.high.first()?.parameters[fixed_axis];
+        let mut varying_values: Vec<f64> = band
+            .low
+            .iter()
+            .chain(&band.high)
+            .map(|point| point.parameters[band.varying])
+            .collect();
+        varying_values.sort_by(f64::total_cmp);
+        varying_values.dedup_by(|a, b| parameter_value_near(*a, *b));
+        let mut probes = varying_values.clone();
+        probes.extend(varying_values.windows(2).map(|pair| 0.5 * (pair[0] + pair[1])));
+        let fixed_depth = probes.into_iter().try_fold(0, |depth, varying| {
+            Some(depth.max(surface_span_depth(
+                surface,
+                fixed_axis,
+                varying,
+                fixed_from,
+                fixed_to,
+                max_angle,
+                0,
+            )?))
+        })?;
+        1usize.checked_shl(fixed_depth)?
+    } else {
+        1
+    };
     let base_triangles = band.low.len().saturating_add(band.high.len()).saturating_sub(2);
     if fixed_steps
         .saturating_mul(base_triangles)
@@ -2039,7 +2290,11 @@ fn fill_scheduled_band(
         if band.varying == 1 {
             corners.swap(1, 2);
         }
-        triangles.extend(subdivide_band_triangle(corners, fixed_axis, fixed_steps)?);
+        if band.structured {
+            triangles.extend(subdivide_band_triangle(corners, fixed_axis, fixed_steps)?);
+        } else {
+            triangles.push(corners);
+        }
     }
     let mut mesh = Mesh::default();
     for corners in triangles {
@@ -2174,14 +2429,13 @@ fn fill_scheduled_singular_cap(
         .into_iter()
         .filter_map(|coedge| Some(body.coedges.get(coedge)?.edge))
         .collect();
-    let rim_fixed = average_parameter(rim, fixed);
     let mut radial_depth = rim.iter().try_fold(0, |depth, point| {
         Some(depth.max(surface_span_depth(
             surface,
             fixed,
             point.parameters[band.varying],
             apex.parameters[fixed],
-            rim_fixed,
+            point.parameters[fixed],
             max_angle * 0.5,
             0,
         )?))
@@ -2247,11 +2501,12 @@ fn singular_cap_triangles(
         for step in 1..=steps {
             let unit = step as f64 / steps as f64;
             let mut current = [pair[0].parameters, pair[1].parameters];
-            for point in &mut current {
+            for (index, point) in current.iter_mut().enumerate() {
                 point[fixed] = apex.parameters[fixed]
-                    + (pair[0].parameters[fixed] - apex.parameters[fixed]) * unit;
+                    + (pair[index].parameters[fixed] - apex.parameters[fixed]) * unit;
             }
-            if apex.parameters[fixed] < pair[0].parameters[fixed] {
+            let rim_fixed = 0.5 * (pair[0].parameters[fixed] + pair[1].parameters[fixed]);
+            if apex.parameters[fixed] < rim_fixed {
                 triangles.push([current[1], current[0], previous[0]]);
                 if step > 1 {
                     triangles.push([current[1], previous[0], previous[1]]);
