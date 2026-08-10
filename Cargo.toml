@@ -22,11 +22,12 @@ geom2d = []
 offset = ["geom2d", "dep:cavalier_contours"]
 
 # Owned, mutable B-rep topology plus the operations that act on it.
-brep = ["geom2d"]
+brep = ["geom2d", "dep:spade"]
 
 [dependencies]
 # Offsetting only. Pinned to match the version already resolved elsewhere in
 # this stack, since the offset path reaches into the crate's internals.
 cavalier_contours = { version = "=0.7.0", optional = true }
+spade = { version = "=2.15.1", optional = true }
 
 [dev-dependencies]

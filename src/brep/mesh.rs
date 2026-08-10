@@ -6,12 +6,10 @@
 //!
 //! # In parameter space, then lifted
 //!
-//! Each face is triangulated where it is flat: its own `(u, v)`. The boundary
-//! becomes a ring of parameter points, ear clipping fills it, and every
-//! vertex is then mapped through the surface. On a plane that is exact. On a
-//! cylinder it is not — the surface bulges between two parameter points — so
-//! curved faces have their triangles subdivided until the middle of each sits
-//! within tolerance of the surface.
+//! Each face is triangulated in its own `(u, v)`. Topological boundaries and
+//! holes are constrained edges, then every vertex is mapped through the
+//! surface. Curved faces are refined until their normal change is within the
+//! requested angle.
 //!
 //! Doing it the other way round, triangulating in space, would mean deciding
 //! what "inside the boundary" means on a curved patch, which is the question
@@ -25,7 +23,7 @@
 //! afterwards recovers it.
 
 use super::topology::{Body, EdgeKey, FaceKey};
-use crate::geom2d::triangulate;
+use crate::geom2d::{constrained::ConstrainedMesh, triangulate};
 use crate::space::Vec3;
 use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, TAU};
@@ -771,28 +769,28 @@ fn refine_edge(
         else {
             continue;
         };
-        let at = |parameter: f64| {
-            let mut unit = (parameter - edge.start_parameter)
-                / (edge.end_parameter - edge.start_parameter);
-            if reversed {
-                unit = 1.0 - unit;
-            }
-            let uv = pcurve.point_at(unit);
-            surface.point_at(uv[0], uv[1])
-        };
         let mut normals = Vec::with_capacity(9);
         for unit in [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0] {
             let parameter = from + (to - from) * unit;
-            let on_surface = Vec3::from(at(parameter));
-            if on_surface.distance(Vec3::from(curve.point_at(parameter))) > tolerance {
+            let on_curve = curve.point_at(parameter);
+            let (uv, exact) = if let Some(pcurve) = pcurve {
+                let mut along = (parameter - edge.start_parameter)
+                    / (edge.end_parameter - edge.start_parameter);
+                if reversed {
+                    along = 1.0 - along;
+                }
+                (pcurve.point_at(along), true)
+            } else {
+                let (u, v) = surface.parameters_at(on_curve)?;
+                ([u, v], false)
+            };
+            if exact
+                && Vec3::from(surface.point_at(uv[0], uv[1]))
+                .distance(Vec3::from(on_curve))
+                > tolerance
+            {
                 return None;
             }
-            let mut along = (parameter - edge.start_parameter)
-                / (edge.end_parameter - edge.start_parameter);
-            if reversed {
-                along = 1.0 - along;
-            }
-            let uv = pcurve.point_at(along);
             normals.push(surface.normal_at(uv[0], uv[1])?);
         }
         split |= crate::tessellation::max_direction_angle(&normals) > max_angle;
@@ -834,14 +832,13 @@ fn coedge_geometry<'a>(
     coedge_key: super::topology::CoedgeKey,
 ) -> Option<(
     &'a super::geometry::Surface,
-    &'a crate::geom2d::Curve,
+    Option<&'a crate::geom2d::Curve>,
     bool,
 )> {
     let coedge = body.coedges.get(coedge_key)?;
-    let pcurve = coedge.pcurve.as_ref()?;
     let face = body.faces.get(body.loops.get(coedge.owner)?.owner)?;
     let surface = body.surfaces.get(face.surface)?;
-    Some((surface, pcurve, !coedge.forward))
+    Some((surface, coedge.pcurve.as_ref(), !coedge.forward))
 }
 
 #[derive(Clone)]
@@ -860,9 +857,13 @@ fn scheduled_face(
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
     if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance) {
-        if band.strip {
+        if band.strip && band.holes.is_empty() {
             return fill_scheduled_band(body, face, &band, max_angle, tolerance);
         }
+        let mut rings = vec![band.ring()];
+        rings.extend(band.holes);
+        let rings = align_rings(rings, periods(surface));
+        return fill_scheduled(body, face, surface, &rings, max_angle, tolerance);
     }
     let rings = face_rings(body, face, surface, schedules, tolerance)?;
     fill_scheduled(body, face, surface, &rings, max_angle, tolerance)
@@ -876,7 +877,9 @@ fn face_rings(
     tolerance: f64,
 ) -> Option<Vec<Vec<BoundaryPoint>>> {
     if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance) {
-        return Some(vec![band.ring()]);
+        let mut rings = vec![band.ring()];
+        rings.extend(band.holes);
+        return Some(align_rings(rings, periods(surface)));
     }
     if let Some(rings) = scheduled_rings(body, face, surface, schedules, tolerance) {
         if rings.iter().any(|ring| boundary_area(ring)) {
@@ -896,24 +899,34 @@ fn scheduled_rings(
     let node = body.faces.get(face)?;
     let mut rings = Vec::with_capacity(node.loops.len());
     for loop_key in &node.loops {
-        let ring = body.loops.get(*loop_key)?;
-        let mut pieces = Vec::with_capacity(ring.coedges.len());
-        for coedge_key in &ring.coedges {
-            let coedge = body.coedges.get(*coedge_key)?;
-            let mut samples = schedules.get(&coedge.edge)?.clone();
-            if !coedge.forward {
-                samples.reverse();
-            }
-            if samples.len() >= 2 {
-                pieces.push((samples, coedge.pcurve.as_ref()));
-            }
-        }
-        let points = chain_samples(surface, pieces, tolerance)?;
+        let points = scheduled_loop(body, *loop_key, surface, schedules, tolerance)?;
         if points.len() >= 3 {
             rings.push(points);
         }
     }
     (!rings.is_empty()).then_some(rings)
+}
+
+fn scheduled_loop(
+    body: &Body,
+    loop_key: super::topology::LoopKey,
+    surface: &super::geometry::Surface,
+    schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+    tolerance: f64,
+) -> Option<Vec<BoundaryPoint>> {
+    let ring = body.loops.get(loop_key)?;
+    let mut pieces = Vec::with_capacity(ring.coedges.len());
+    for coedge_key in &ring.coedges {
+        let coedge = body.coedges.get(*coedge_key)?;
+        let mut samples = schedules.get(&coedge.edge)?.clone();
+        if !coedge.forward {
+            samples.reverse();
+        }
+        if samples.len() >= 2 {
+            pieces.push((samples, coedge.pcurve.as_ref()));
+        }
+    }
+    chain_samples(surface, pieces, tolerance)
 }
 
 fn chain_samples(
@@ -1144,6 +1157,7 @@ fn parameter_near(a: [f64; 2], b: [f64; 2]) -> bool {
 struct BoundaryBand {
     low: Vec<BoundaryPoint>,
     high: Vec<BoundaryPoint>,
+    holes: Vec<Vec<BoundaryPoint>>,
     varying: usize,
     strip: bool,
 }
@@ -1167,8 +1181,11 @@ fn scheduled_band(
     let surface_periods = periods(surface);
     let mut candidates = Vec::new();
     let mut refined_side = false;
+    let mut candidate_loops = Vec::new();
     for loop_key in &node.loops {
         let ring = body.loops.get(*loop_key)?;
+        let mut loop_has_candidate = false;
+        let mut loop_has_refined_side = false;
         for coedge_key in &ring.coedges {
             let coedge = body.coedges.get(*coedge_key)?;
             let mut samples = schedules.get(&coedge.edge)?.clone();
@@ -1188,9 +1205,14 @@ fn scheduled_band(
                 });
             if let Some(varying) = varying {
                 candidates.push((varying, points));
+                loop_has_candidate = true;
             } else {
-                refined_side |= samples.len() > 2;
+                loop_has_refined_side |= samples.len() > 2;
             }
+        }
+        if loop_has_candidate {
+            candidate_loops.push(*loop_key);
+            refined_side |= loop_has_refined_side;
         }
     }
     if !(1..=2).contains(&candidates.len()) || refined_side {
@@ -1203,6 +1225,16 @@ fn scheduled_band(
     let mut rims: Vec<_> = candidates.into_iter().map(|(_, rim)| rim).collect();
     let period = surface_periods[varying]?;
     let fixed = 1 - varying;
+    let mut holes = Vec::new();
+    for loop_key in &node.loops {
+        if candidate_loops.contains(loop_key) {
+            continue;
+        }
+        let ring = scheduled_loop(body, *loop_key, surface, schedules, tolerance)?;
+        if ring.len() >= 3 {
+            holes.push(ring);
+        }
+    }
     let traversal: Vec<f64> = rims
         .iter()
         .map(|rim| rim.last().unwrap().parameters[varying] - rim[0].parameters[varying])
@@ -1216,6 +1248,12 @@ fn scheduled_band(
         for point in rim {
             point.parameters[varying] += shift;
         }
+    }
+    if rims.len() == 2
+        && !holes.is_empty()
+        && parameter_range(&rims[0], varying) >= period * (1.0 - 1e-9)
+    {
+        fit_periodic_band(&mut rims, &mut holes, varying, period)?;
     }
     let mut bounds: Vec<f64> = rims
         .iter()
@@ -1307,6 +1345,7 @@ fn scheduled_band(
     Some(BoundaryBand {
         low,
         high,
+        holes,
         varying,
         strip,
     })
@@ -1340,6 +1379,74 @@ fn parameter_range(points: &[BoundaryPoint], axis: usize) -> f64 {
 
 fn average_parameter(points: &[BoundaryPoint], axis: usize) -> f64 {
     points.iter().map(|point| point.parameters[axis]).sum::<f64>() / points.len() as f64
+}
+
+fn fit_periodic_band(
+    rims: &mut [Vec<BoundaryPoint>],
+    holes: &mut [Vec<BoundaryPoint>],
+    varying: usize,
+    period: f64,
+) -> Option<()> {
+    let first = rims.first()?;
+    let choice = first.iter().find_map(|point| {
+        let seam = point.parameters[varying];
+        let centre = seam + period * 0.5;
+        let shifts: Vec<f64> = holes
+            .iter()
+            .map(|hole| {
+                let middle = average_parameter(hole, varying);
+                period * ((centre - middle) / period).round()
+            })
+            .collect();
+        let fits = holes.iter().zip(&shifts).all(|(hole, shift)| {
+            let low = hole
+                .iter()
+                .map(|point| point.parameters[varying] + shift)
+                .fold(f64::INFINITY, f64::min);
+            let high = hole
+                .iter()
+                .map(|point| point.parameters[varying] + shift)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let scale = seam.abs().max((seam + period).abs()).max(1.0);
+            let epsilon = f64::EPSILON * 128.0 * scale;
+            low >= seam - epsilon && high <= seam + period + epsilon
+        });
+        fits.then_some((seam, shifts))
+    })?;
+    for (hole, shift) in holes.iter_mut().zip(choice.1) {
+        for point in hole {
+            point.parameters[varying] += shift;
+        }
+    }
+    for rim in rims {
+        rotate_periodic_rim(rim, varying, choice.0, period)?;
+    }
+    Some(())
+}
+
+fn rotate_periodic_rim(
+    rim: &mut Vec<BoundaryPoint>,
+    varying: usize,
+    seam: f64,
+    period: f64,
+) -> Option<()> {
+    for point in rim.iter_mut() {
+        point.parameters[varying] =
+            seam + (point.parameters[varying] - seam).rem_euclid(period);
+    }
+    rim.sort_by(|a, b| a.parameters[varying].total_cmp(&b.parameters[varying]));
+    rim.dedup_by(|a, b| {
+        let scale = a.parameters[varying]
+            .abs()
+            .max(b.parameters[varying].abs())
+            .max(1.0);
+        (a.parameters[varying] - b.parameters[varying]).abs()
+            <= f64::EPSILON * 128.0 * scale
+    });
+    let mut closing = rim.first()?.clone();
+    closing.parameters[varying] += period;
+    rim.push(closing);
+    Some(())
 }
 
 fn is_isoparametric_rim(
@@ -1459,7 +1566,10 @@ fn parameter_in_span(
 }
 
 /// Recursion guard; tolerance normally stops first.
-const MAX_DEPTH: u32 = 16;
+const MAX_DEPTH: u32 = 32;
+const MAX_FACE_DEPTH: u32 = 128;
+const MAX_FACE_PASSES: usize = 128;
+const MAX_FACE_ADDITIONS: usize = 262_144;
 
 /// Triangulates a whole body.
 ///
@@ -1551,6 +1661,7 @@ fn fill_scheduled_band(
             &boundary_segments,
             &edges,
             tolerance,
+            Some(band.varying),
         ) {
             return None;
         }
@@ -1558,13 +1669,7 @@ fn fill_scheduled_band(
     (!mesh.triangles.is_empty()).then_some(mesh)
 }
 
-/// Triangulates a face over the rings its boundary makes in `(u, v)`.
-///
-/// Which ring bounds the face and which cut holes in it is decided by area,
-/// not by the order they arrive in. Nothing guarantees that order: a face
-/// lifted from a file lists its loops however the file did, and taking the
-/// first one on trust draws a plate with its bolt hole filled in and the
-/// metal around it missing — a picture that looks deliberate.
+/// Triangulates a face while preserving all boundary rings as constraints.
 fn fill_scheduled(
     body: &Body,
     face: FaceKey,
@@ -1573,82 +1678,121 @@ fn fill_scheduled(
     max_angle: f64,
     tolerance: f64,
 ) -> Option<Mesh> {
-    let widest = rings
+    let parameters: Vec<Vec<[f64; 2]>> = rings
         .iter()
-        .enumerate()
-        .max_by(|a, b| {
-            crate::geom2d::signed_area(
-                &a.1.iter().map(|point| point.parameters).collect::<Vec<_>>(),
-            )
-            .abs()
-            .total_cmp(
-                &crate::geom2d::signed_area(
-                    &b.1.iter().map(|point| point.parameters).collect::<Vec<_>>(),
-                )
-                .abs(),
-            )
-        })
-        .map(|(index, _)| index)?;
-    let outer: Vec<[f64; 2]> = rings[widest]
-        .iter()
-        .map(|point| point.parameters)
+        .map(|ring| ring.iter().map(|point| point.parameters).collect())
         .collect();
-    let holes: Vec<Vec<[f64; 2]>> = rings
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != widest)
-        .map(|(_, ring)| ring.iter().map(|point| point.parameters).collect())
-        .collect();
+    let mut domain = ConstrainedMesh::new(&parameters)?;
     let pins: Vec<BoundaryPoint> = rings.iter().flatten().cloned().collect();
-    let boundary_segments: Vec<[[f64; 2]; 2]> = rings
-        .iter()
-        .flat_map(|ring| {
-            (0..ring.len()).map(|index| {
-                [
-                    ring[index].parameters,
-                    ring[(index + 1) % ring.len()].parameters,
-                ]
-            })
-        })
-        .collect();
     let edges: Vec<EdgeKey> = body
         .face_coedges(face)
         .into_iter()
         .filter_map(|coedge| Some(body.coedges.get(coedge)?.edge))
         .collect();
-    let (parameters, triangles) = triangulate(&outer, &holes);
-    if triangles.is_empty() {
-        return None;
-    }
-
-    let mut mesh = Mesh::default();
     let flat = matches!(surface, super::geometry::Surface::Plane(_));
-    for triangle in triangles {
-        let corners = [
-            parameters[triangle[0]],
-            parameters[triangle[1]],
-            parameters[triangle[2]],
-        ];
+    let mut additions = 0;
+    let mut complete = None;
+    for _ in 0..MAX_FACE_PASSES {
+        let triangles = domain.triangles();
+        if triangles.is_empty() {
+            return None;
+        }
         if flat {
-            emit_scheduled(&mut mesh, body, face, corners, &pins, &edges, tolerance);
-        } else {
-            if !refine_scheduled(
-                &mut mesh,
-                body,
-                face,
-                corners,
-                max_angle,
-                0,
-                &pins,
-                &boundary_segments,
-                &edges,
-                tolerance,
-            ) {
-                return None;
+            complete = Some(triangles);
+            break;
+        }
+        let mut candidates = Vec::new();
+        for triangle in &triangles {
+            match triangle_refinement(surface, triangle, max_angle)? {
+                TriangleRefinement::Complete => {}
+                TriangleRefinement::Boundary => return None,
+                TriangleRefinement::Interior(parameters) => candidates.push(parameters),
             }
         }
+        if candidates.is_empty() {
+            complete = Some(triangles);
+            break;
+        }
+        let mut inserted = 0;
+        for parameters in candidates {
+            if additions >= MAX_FACE_ADDITIONS {
+                return None;
+            }
+            match domain.insert(parameters) {
+                Some(true) => {
+                    additions += 1;
+                    inserted += 1;
+                }
+                Some(false) => {}
+                None => return None,
+            }
+        }
+        if inserted == 0 {
+            return None;
+        }
     }
-    Some(mesh)
+    let triangles = complete?;
+
+    let mut mesh = Mesh::default();
+    for triangle in triangles {
+        emit_scheduled(
+            &mut mesh,
+            body,
+            face,
+            triangle.parameters,
+            &pins,
+            &edges,
+            tolerance,
+        );
+    }
+    (!mesh.triangles.is_empty()).then_some(mesh)
+}
+
+enum TriangleRefinement {
+    Complete,
+    Boundary,
+    Interior([f64; 2]),
+}
+
+fn triangle_refinement(
+    surface: &super::geometry::Surface,
+    triangle: &crate::geom2d::constrained::ConstrainedTriangle,
+    max_angle: f64,
+) -> Option<TriangleRefinement> {
+    let corners = triangle.parameters;
+    let edge_vertices = [[0, 1], [1, 2], [2, 0]];
+    let mut edge_angles = [0.0; 3];
+    for (index, [from, to]) in edge_vertices.into_iter().enumerate() {
+        let parameters = [0.0, 0.25, 0.5, 0.75, 1.0].map(|unit| {
+            [
+                corners[from][0] + (corners[to][0] - corners[from][0]) * unit,
+                corners[from][1] + (corners[to][1] - corners[from][1]) * unit,
+            ]
+        });
+        edge_angles[index] = surface_normal_angle(surface, &parameters)?;
+    }
+    if (0..3).any(|index| edge_angles[index] > max_angle && triangle.constraints[index]) {
+        return Some(TriangleRefinement::Boundary);
+    }
+    if let Some((_, [from, to])) = edge_vertices
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| edge_angles[*index] > max_angle)
+        .max_by(|(a, _), (b, _)| edge_angles[*a].total_cmp(&edge_angles[*b]))
+    {
+        return Some(TriangleRefinement::Interior([
+            0.5 * (corners[from][0] + corners[to][0]),
+            0.5 * (corners[from][1] + corners[to][1]),
+        ]));
+    }
+    match surface_triangle_angle(surface, corners) {
+        Some(angle) if angle <= max_angle => Some(TriangleRefinement::Complete),
+        Some(_) => Some(TriangleRefinement::Interior([
+            (corners[0][0] + corners[1][0] + corners[2][0]) / 3.0,
+            (corners[0][1] + corners[1][1] + corners[2][1]) / 3.0,
+        ])),
+        None => None,
+    }
 }
 
 fn refine_scheduled(
@@ -1662,6 +1806,7 @@ fn refine_scheduled(
     boundary_segments: &[[[f64; 2]; 2]],
     edges: &[EdgeKey],
     tolerance: f64,
+    split_axis: Option<usize>,
 ) -> bool {
     let Some(node) = body.faces.get(face) else {
         return false;
@@ -1669,6 +1814,24 @@ fn refine_scheduled(
     let Some(surface) = body.surfaces.get(node.surface) else {
         return false;
     };
+    let ab = [
+        corners[1][0] - corners[0][0],
+        corners[1][1] - corners[0][1],
+    ];
+    let ac = [
+        corners[2][0] - corners[0][0],
+        corners[2][1] - corners[0][1],
+    ];
+    let parameter_scale = ab
+        .into_iter()
+        .chain(ac)
+        .map(f64::abs)
+        .fold(0.0, f64::max);
+    if (ab[0] * ac[1] - ab[1] * ac[0]).abs()
+        <= f64::EPSILON * 64.0 * parameter_scale * parameter_scale
+    {
+        return true;
+    }
     let edge_vertices = [[0, 1], [1, 2], [2, 0]];
     let edge_angles = edge_vertices.map(|[from, to]| {
         let parameters = [0.0, 0.25, 0.5, 0.75, 1.0].map(|unit| {
@@ -1691,13 +1854,28 @@ fn refine_scheduled(
         })
         .max_by(|(a, _), (b, _)| edge_angles[*a].total_cmp(&edge_angles[*b]));
     if let Some((_, [from, to])) = split_edge {
-        if depth >= MAX_DEPTH {
+        if depth >= MAX_FACE_DEPTH {
             return false;
         }
         let opposite = 3 - from - to;
+        let unit = if let Some(axis) = split_axis {
+            let delta = corners[to][axis] - corners[from][axis];
+            if delta != 0.0 {
+                let projected = (corners[opposite][axis] - corners[from][axis]) / delta;
+                if projected > 1e-9 && projected < 1.0 - 1e-9 {
+                    projected
+                } else {
+                    0.5
+                }
+            } else {
+                0.5
+            }
+        } else {
+            0.5
+        };
         let middle = [
-            0.5 * (corners[from][0] + corners[to][0]),
-            0.5 * (corners[from][1] + corners[to][1]),
+            corners[from][0] + (corners[to][0] - corners[from][0]) * unit,
+            corners[from][1] + (corners[to][1] - corners[from][1]) * unit,
         ];
         return [
             [corners[from], middle, corners[opposite]],
@@ -1716,6 +1894,7 @@ fn refine_scheduled(
                 boundary_segments,
                 edges,
                 tolerance,
+                split_axis,
             )
         });
     }
@@ -1726,7 +1905,7 @@ fn refine_scheduled(
         .map(|angle| angle > max_angle)
         .unwrap_or(true);
     if split {
-        if depth >= MAX_DEPTH {
+        if depth >= MAX_FACE_DEPTH {
             return false;
         }
         let middle = [
@@ -1749,6 +1928,7 @@ fn refine_scheduled(
                 boundary_segments,
                 edges,
                 tolerance,
+                split_axis,
             ) {
                 return false;
             }

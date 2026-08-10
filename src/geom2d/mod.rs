@@ -14,6 +14,8 @@ pub mod area;
 pub mod arrangement;
 pub mod clip;
 pub mod containment;
+#[cfg(feature = "brep")]
+pub(crate) mod constrained;
 pub mod cross;
 pub mod curve;
 pub mod deviation;

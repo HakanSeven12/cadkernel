@@ -215,13 +215,24 @@ fn clip_ears(points: &[Vec2], mut ring: Vec<usize>) -> Vec<[usize; 3]> {
             return Vec::new();
         }
         let count = ring.len();
-        let mut cut = None;
-        for at in 0..count {
-            if is_ear(points, &ring, at) {
-                cut = Some(at);
-                break;
-            }
-        }
+        let bounds = ring.iter().fold(
+            [[f64::INFINITY, f64::NEG_INFINITY]; 2],
+            |mut bounds, index| {
+                let point = points[*index];
+                bounds[0][0] = bounds[0][0].min(point.x);
+                bounds[0][1] = bounds[0][1].max(point.x);
+                bounds[1][0] = bounds[1][0].min(point.y);
+                bounds[1][1] = bounds[1][1].max(point.y);
+                bounds
+            },
+        );
+        let scale = [
+            (bounds[0][1] - bounds[0][0]).max(f64::MIN_POSITIVE),
+            (bounds[1][1] - bounds[1][0]).max(f64::MIN_POSITIVE),
+        ];
+        let cut = (0..count).filter(|at| is_ear(points, &ring, *at)).min_by(|a, b| {
+            ear_score(points, &ring, *a, scale).total_cmp(&ear_score(points, &ring, *b, scale))
+        });
         match cut {
             Some(at) => {
                 let count = ring.len();
@@ -240,6 +251,23 @@ fn clip_ears(points: &[Vec2], mut ring: Vec<usize>) -> Vec<[usize; 3]> {
         out.push([ring[0], ring[1], ring[2]]);
     }
     out
+}
+
+fn ear_score(points: &[Vec2], ring: &[usize], at: usize, scale: [f64; 2]) -> f64 {
+    let count = ring.len();
+    let corners = [
+        points[ring[(at + count - 1) % count]],
+        points[ring[at]],
+        points[ring[(at + 1) % count]],
+    ];
+    (0..3)
+        .map(|index| {
+            let next = (index + 1) % 3;
+            let dx = (corners[next].x - corners[index].x) / scale[0];
+            let dy = (corners[next].y - corners[index].y) / scale[1];
+            dx * dx + dy * dy
+        })
+        .fold(0.0, f64::max)
 }
 
 /// Whether the corner at `at` can be cut off.
