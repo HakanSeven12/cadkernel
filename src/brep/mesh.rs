@@ -74,10 +74,17 @@ const DEFAULT_SAG: f64 = 0.01;
 
 /// How deep the subdivision will go.
 ///
-/// Each level quadruples the triangle count, so this is a ceiling of 4^5 per
-/// original triangle — far past what any tolerance a drawing uses reaches,
-/// and a backstop against a surface that never converges.
-const MAX_DEPTH: u32 = 5;
+/// A backstop against a surface that never converges, not a quality setting:
+/// refinement stops as soon as the sag is met, so the depth only costs where
+/// it is actually reached.
+///
+/// It has to be deep enough for the widest triangle any face starts from, and
+/// that is a whole turn — a tube bounded by two rims begins as one rectangle
+/// spanning all of `u`. Each level halves the step, so five got 32 segments to
+/// a full circle whatever tolerance was asked for, and a cylinder wall stayed
+/// visibly coarser than the rim drawn around it. Seven reaches 128, past what
+/// the edge sampling asks for.
+const MAX_DEPTH: u32 = 7;
 
 /// Triangulates a whole body.
 ///
@@ -470,6 +477,41 @@ mod tests {
                 "a triangle faced inwards at {corner:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_wall_is_sampled_as_finely_as_the_tolerance_asks() {
+        // The subdivision cap used to decide this instead of the tolerance. A
+        // tube starts as one rectangle spanning a whole turn, so five levels
+        // of halving reached 32 segments and stopped — however fine a sag was
+        // asked for. The wall then stayed visibly coarser than the rim drawn
+        // around it, which is a mismatch no shading hides.
+        let solid = crate::brep::make::cylinder([0.0; 3], 5.0, 10.0).unwrap();
+        let wall = solid
+            .faces
+            .iter()
+            .find(|(_, face)| {
+                matches!(
+                    solid.surfaces.get(face.surface),
+                    Some(crate::brep::geometry::Surface::Cylinder(_))
+                )
+            })
+            .map(|(key, _)| key)
+            .unwrap();
+
+        // A fiftieth of a per cent of the radius: about fifty sides, which is
+        // what the edge sampling in a drawing asks for.
+        let mesh = face(&solid, wall, 5.0 * 0.002, 1e-9).expect("a drawn wall");
+        // Read the count back off the mesh: how many distinct angles the
+        // triangle corners land on around the axis.
+        let mut angles: Vec<i64> = mesh
+            .positions
+            .iter()
+            .map(|p| (p[1].atan2(p[0]) * 1e6) as i64)
+            .collect();
+        angles.sort_unstable();
+        angles.dedup();
+        assert!(angles.len() >= 48, "only {} sides", angles.len());
     }
 
     #[test]
