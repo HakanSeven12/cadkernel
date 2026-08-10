@@ -74,6 +74,7 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
             // Already a plane curve; it only has to be re-expressed in this
             // plane's coordinates rather than its own.
             Curve3::PlanarSpline { curve, .. } => Some(Curve::Nurbs(curve.clone())),
+            Curve3::Nurbs(_) => None,
         },
 
         // On a cylinder `u` runs round and `v` along the axis, so the two
@@ -165,10 +166,10 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
 
         // A sphere is closed too, but its `u` has no value at the poles —
         // every meridian passes through them — so a seam ending at one
-        // cannot be placed in `(u, v)` from the geometry at all. What says
-        // where it goes is the pcurve ACIS stores on the coedge, which this
-        // kernel does not keep yet.
+        // cannot be placed in `(u, v)` from the geometry alone. Stored
+        // coedge pcurves are handled before this projection path.
         Surface::Sphere(_) => None,
+        Surface::Nurbs(_) => None,
     }
 }
 
@@ -202,12 +203,17 @@ pub fn face_boundary(
     for ring in &node.loops {
         let mut pieces = Vec::new();
         for coedge in &body.loops.get(*ring)?.coedges {
-            let edge_key = body.coedges.get(*coedge)?.edge;
+            let coedge_node = body.coedges.get(*coedge)?;
+            if let Some(curve) = &coedge_node.pcurve {
+                pieces.push(curve.clone());
+                continue;
+            }
+            let edge_key = coedge_node.edge;
             let edge = body.edges.get(edge_key)?;
             let curve = body.curves.get(edge.curve)?;
             let flat = project(surface, curve, tolerance)?;
             // The loop's own direction, not the edge's.
-            let forward = body.coedges.get(*coedge)?.forward;
+            let forward = coedge_node.forward;
             let span = if forward {
                 (edge.start_parameter, edge.end_parameter)
             } else {
@@ -215,7 +221,7 @@ pub fn face_boundary(
             };
             pieces.push(trim_to(surface, curve, span, flat)?);
         }
-        chain_round(&mut pieces, periodic(surface));
+        chain_round(&mut pieces, periods(surface));
         out.extend(pieces);
     }
     Some(out)
@@ -234,8 +240,8 @@ pub fn face_boundary(
 /// ACIS keeps a pcurve on every coedge and so has the answer stored. Until
 /// this kernel does too, the ring itself says which turn each piece belongs
 /// on: the one that continues from where the last piece ended.
-fn chain_round(pieces: &mut [Curve], wraps: [bool; 2]) {
-    if wraps == [false, false] || pieces.len() < 2 {
+fn chain_round(pieces: &mut [Curve], periods: [Option<f64>; 2]) {
+    if periods == [None, None] || pieces.len() < 2 {
         return;
     }
     let mut head = pieces[0].point_at(1.0);
@@ -243,9 +249,9 @@ fn chain_round(pieces: &mut [Curve], wraps: [bool; 2]) {
     for piece in pieces.iter_mut().skip(1) {
         let (start, end) = (piece.point_at(0.0), piece.point_at(1.0));
         let mut best = (f64::INFINITY, [0.0, 0.0]);
-        for across in turns(wraps[0]) {
-            for along in turns(wraps[1]) {
-                let shift = [TAU * across, TAU * along];
+        for across in turns(periods[0]) {
+            for along in turns(periods[1]) {
+                let shift = [across, along];
                 // A seam is one edge used twice by the same loop, and its two
                 // uses are a whole turn apart — that is what makes the face a
                 // rectangle in `(u, v)` rather than a slit. Placing the second
@@ -282,9 +288,10 @@ fn near(a: [f64; 2], b: [f64; 2]) -> bool {
 
 /// The whole turns worth trying on one axis: none at all when it does not
 /// wrap, and a turn either way when it does.
-fn turns(wraps: bool) -> impl Iterator<Item = f64> {
-    let span = if wraps { 2 } else { 0 };
-    (-span..=span).map(f64::from)
+fn turns(period: Option<f64>) -> impl Iterator<Item = f64> {
+    let period = period.filter(|period| period.is_finite() && *period > 0.0);
+    let span = if period.is_some() { 2 } else { 0 };
+    (-span..=span).map(move |turn| period.unwrap_or(0.0) * f64::from(turn))
 }
 
 /// Moves a projected piece by whole turns. Only the straight kinds ever need
@@ -320,7 +327,7 @@ fn trim_to(
     // A parameter that wraps reads a walk across the seam as a jump
     // backwards unless it is unwound. One that does not wrap must be left
     // alone: unwinding a plane's coordinates would move the curve.
-    let wraps = periodic(surface);
+    let periods = periods(surface);
     let mut walk: Vec<[f64; 2]> = Vec::with_capacity(WALK + 1);
     let mut last: Option<[f64; 2]> = None;
     for step in 0..=WALK {
@@ -329,8 +336,8 @@ fn trim_to(
         let mut here = [u, v];
         if let Some(previous) = last {
             for axis in 0..2 {
-                if wraps[axis] {
-                    here[axis] = unwound(here[axis], previous[axis]);
+                if let Some(period) = periods[axis] {
+                    here[axis] = unwound(here[axis], previous[axis], period);
                 }
             }
         }
@@ -395,7 +402,7 @@ fn swept(
     for point in walk {
         let mut angle = angle_of(point, centre);
         if let Some(previous) = last {
-            angle = unwound(angle, previous);
+            angle = unwound(angle, previous, TAU);
         }
         last = Some(angle);
         angles.push(angle);
@@ -405,8 +412,8 @@ fn swept(
 }
 
 /// `angle` moved by whole turns to sit within half a turn of `previous`.
-fn unwound(angle: f64, previous: f64) -> f64 {
-    angle + TAU * ((previous - angle) / TAU).round()
+fn unwound(value: f64, previous: f64, period: f64) -> f64 {
+    value + period * ((previous - value) / period).round()
 }
 
 /// A line of constant `v`, spanning one full turn of `u`.
@@ -435,11 +442,19 @@ fn meridian_at(angle: f64) -> Curve {
 /// `u` runs round every closed surface here; `v` only runs round a torus. A
 /// plane's do not wrap at all, and unwinding one there would move the curve
 /// rather than place it.
-fn periodic(surface: &Surface) -> [bool; 2] {
+fn periods(surface: &Surface) -> [Option<f64>; 2] {
     match surface {
-        Surface::Plane(_) => [false, false],
-        Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_) => [true, false],
-        Surface::Torus(_) => [true, true],
+        Surface::Plane(_) => [None, None],
+        Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_) => [Some(TAU), None],
+        Surface::Torus(_) => [Some(TAU), Some(TAU)],
+        Surface::Nurbs(surface) => {
+            let ((u0, u1), (v0, v1)) = surface.domain();
+            let periodic = surface.periodicity();
+            [
+                periodic[0].then_some(u1 - u0),
+                periodic[1].then_some(v1 - v0),
+            ]
+        }
     }
 }
 

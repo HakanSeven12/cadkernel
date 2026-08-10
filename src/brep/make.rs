@@ -135,6 +135,7 @@ pub fn cuboid(origin: [f64; 3], size: [f64; 3]) -> Option<Body> {
             let coedge = body.coedges.insert(Coedge {
                 edge,
                 forward,
+                pcurve: None,
                 owner: boundary,
                 provenance: Provenance::Synthesized,
             });
@@ -266,6 +267,7 @@ pub fn cylinder(base: [f64; 3], radius: f64, height: f64) -> Option<Body> {
         let coedge = body.coedges.insert(Coedge {
             edge,
             forward,
+            pcurve: None,
             owner: ring,
             provenance: Provenance::Synthesized,
         });
@@ -311,6 +313,7 @@ fn disc(
         // wall takes the opposite of each: that is what makes a rim one
         // shared edge instead of two coincident ones.
         forward,
+        pcurve: None,
         owner: ring,
         provenance: Provenance::Synthesized,
     });
@@ -629,6 +632,7 @@ fn close_shell(
         let coedge = body.coedges.insert(Coedge {
             edge: *edge,
             forward: *sense,
+            pcurve: None,
             owner: ring,
             provenance: Provenance::Synthesized,
         });

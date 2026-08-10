@@ -67,6 +67,33 @@ impl NurbsCurve {
         })
     }
 
+    /// Builds a curve without replacing malformed source data.
+    pub fn new_strict(
+        degree: usize,
+        control_points: Vec<[f64; 2]>,
+        knots: Vec<f64>,
+        weights: Vec<f64>,
+    ) -> Option<Self> {
+        if degree == 0
+            || control_points.len() <= degree
+            || knots.len() != control_points.len() + degree + 1
+            || weights.len() != control_points.len()
+            || !knots.iter().all(|value| value.is_finite())
+            || !knots.windows(2).all(|pair| pair[0] <= pair[1])
+            || knots.first() >= knots.last()
+            || !control_points.iter().flatten().all(|value| value.is_finite())
+            || !weights.iter().all(|weight| weight.is_finite() && *weight > 0.0)
+        {
+            return None;
+        }
+        Some(Self {
+            degree,
+            knots,
+            control_points,
+            weights,
+        })
+    }
+
     /// The degree.
     pub fn degree(&self) -> usize {
         self.degree

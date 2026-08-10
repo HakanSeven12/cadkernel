@@ -17,19 +17,12 @@
 //! What is allowed is a rotation, a translation, a uniform scale and a
 //! reflection.
 //!
-//! # A reflection turns the loops round, not the faces
-//!
-//! Each surface's normal is carried across rather than recomputed from its
-//! moved axes, so a mirrored face still looks the way the original did —
-//! nothing about its sense changes. What does change is handedness: a loop
-//! that ran counter-clockwise about that normal now runs the other way, so
-//! every loop is reversed. Flipping the faces as well would put the solid
-//! back exactly where it started, inside out, and it would validate and mesh
-//! and light black all the same.
+//! Reflections preserve curve parameters. Analytic surface pcurves are mapped
+//! with their frames; reflected spline surfaces also reverse face sense.
 
 use super::geometry::{Curve3, Surface};
 use super::topology::{Body, EdgeKey};
-use crate::space::{Plane, Vec3};
+use crate::space::{NurbsCurve3, NurbsSurface3, Plane, Vec3};
 
 /// Where a body is put: three axes and an origin.
 ///
@@ -133,6 +126,16 @@ impl Placement {
             self.vector(normal.to_array()),
         )
     }
+
+    fn curve_frame(&self, plane: &Plane) -> Option<Plane> {
+        let x = Vec3::from(self.vector(plane.x_axis)).normalize()?;
+        let y = Vec3::from(self.vector(plane.y_axis)).normalize()?;
+        Some(Plane::from_axes(
+            self.point(plane.origin),
+            x.to_array(),
+            y.to_array(),
+        ))
+    }
 }
 
 /// Moves a whole body.
@@ -154,21 +157,46 @@ pub fn transform(body: &Body, place: &Placement) -> Option<Body> {
         *surface = move_surface(surface, place, scale)?;
     }
 
+    let rings: Vec<_> = out.loops.keys().collect();
+    for ring in rings {
+        let coedges = out.loops.get(ring)?.coedges.clone();
+        for coedge in &coedges {
+            let surface = {
+                let node = out.coedges.get(*coedge)?;
+                let face = out.faces.get(out.loops.get(node.owner)?.owner)?;
+                out.surfaces.get(face.surface)?.clone()
+            };
+            let node = out.coedges.get_mut(*coedge)?;
+            node.pcurve = node
+                .pcurve
+                .take()
+                .and_then(|curve| moved_pcurve(curve, &surface, scale, place.reflects()));
+        }
+    }
     if place.reflects() {
-        // Handedness is gone, so every loop runs the wrong way about a normal
-        // that did not move. Reversing them puts that right, and keeps every
-        // edge shared by two coedges of opposite sense while doing it.
-        let rings: Vec<_> = out.loops.keys().collect();
-        for ring in rings {
-            let coedges = out.loops.get(ring)?.coedges.clone();
-            for coedge in &coedges {
-                let node = out.coedges.get_mut(*coedge)?;
-                node.forward = !node.forward;
+        for face in out.faces.values_mut() {
+            if matches!(out.surfaces.get(face.surface), Some(Surface::Nurbs(_))) {
+                face.forward = !face.forward;
             }
-            out.loops.get_mut(ring)?.coedges = coedges.into_iter().rev().collect();
         }
     }
     out.validate().is_empty().then_some(out)
+}
+
+fn moved_pcurve(
+    curve: crate::geom2d::Curve,
+    surface: &Surface,
+    scale: f64,
+    reflects: bool,
+) -> Option<crate::geom2d::Curve> {
+    let handed = if reflects { -1.0 } else { 1.0 };
+    let factors = match surface {
+        Surface::Plane(_) => [scale, handed * scale],
+        Surface::Cylinder(_) | Surface::Cone(_) => [handed, scale],
+        Surface::Sphere(_) | Surface::Torus(_) => [handed, 1.0],
+        Surface::Nurbs(_) => [1.0, 1.0],
+    };
+    curve.transformed(&crate::geom2d::Transform::scale(factors[0], factors[1]))
 }
 
 fn move_curve(curve: &Curve3, place: &Placement, scale: f64) -> Option<Curve3> {
@@ -178,11 +206,11 @@ fn move_curve(curve: &Curve3, place: &Placement, scale: f64) -> Option<Curve3> {
             direction: place.vector(line.direction),
         }),
         Curve3::Circle(circle) => Curve3::Circle(super::geometry::Circle3 {
-            plane: place.frame(&circle.plane)?,
+            plane: place.curve_frame(&circle.plane)?,
             radius: circle.radius * scale,
         }),
         Curve3::Ellipse(ellipse) => Curve3::Ellipse(super::geometry::Ellipse3 {
-            plane: place.frame(&ellipse.plane)?,
+            plane: place.curve_frame(&ellipse.plane)?,
             major_radius: ellipse.major_radius * scale,
             minor_radius: ellipse.minor_radius * scale,
         }),
@@ -196,10 +224,11 @@ fn move_curve(curve: &Curve3, place: &Placement, scale: f64) -> Option<Curve3> {
                 return None;
             };
             Curve3::PlanarSpline {
-                plane: place.frame(plane)?,
+                plane: place.curve_frame(plane)?,
                 curve: grown,
             }
         }
+        Curve3::Nurbs(curve) => Curve3::Nurbs(move_nurbs_curve(curve, place)?),
     })
 }
 
@@ -225,7 +254,47 @@ fn move_surface(surface: &Surface, place: &Placement, scale: f64) -> Option<Surf
             major_radius: torus.major_radius * scale,
             minor_radius: torus.minor_radius * scale,
         }),
+        Surface::Nurbs(surface) => Surface::Nurbs(move_nurbs_surface(surface, place)?),
     })
+}
+
+fn move_nurbs_curve(curve: &NurbsCurve3, place: &Placement) -> Option<NurbsCurve3> {
+    Some(NurbsCurve3::new(
+        curve.degree(),
+        curve
+            .control_points()
+            .iter()
+            .map(|point| place.point(*point))
+            .collect(),
+        curve.knots().to_vec(),
+        Some(curve.weights().to_vec()),
+    )?
+    .with_periodicity(curve.periodicity()))
+}
+
+fn move_nurbs_surface(surface: &NurbsSurface3, place: &Placement) -> Option<NurbsSurface3> {
+    let (u_degree, v_degree) = surface.degrees();
+    let (u_knots, v_knots) = surface.knots();
+    Some(NurbsSurface3::new(
+        u_degree,
+        v_degree,
+        surface
+            .control_points()
+            .iter()
+            .map(|row| row.iter().map(|point| place.point(*point)).collect())
+            .collect(),
+        u_knots.to_vec(),
+        v_knots.to_vec(),
+        Some(surface.weights().to_vec()),
+    )?
+    .with_periodicity(surface.periodicity()[0], surface.periodicity()[1])
+    .with_v_reversed(surface.v_reversed()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeSample {
+    pub parameter: f64,
+    pub position: [f64; 3],
 }
 
 /// The points along one edge, close enough to its curve to draw.
@@ -238,6 +307,15 @@ fn move_surface(surface: &Surface, place: &Placement, scale: f64) -> Option<Surf
 /// `None` when the edge or its curve is missing, which is a body that failed
 /// to validate rather than a shape with nothing to draw.
 pub fn edge_points(body: &Body, edge: EdgeKey, sag: f64) -> Option<Vec<[f64; 3]>> {
+    Some(
+        edge_samples(body, edge, sag)?
+            .into_iter()
+            .map(|sample| sample.position)
+            .collect(),
+    )
+}
+
+pub fn edge_samples(body: &Body, edge: EdgeKey, sag: f64) -> Option<Vec<EdgeSample>> {
     let node = body.edges.get(edge)?;
     let curve = body.curves.get(node.curve)?;
     let (from, to) = (node.start_parameter, node.end_parameter);
@@ -245,15 +323,52 @@ pub fn edge_points(body: &Body, edge: EdgeKey, sag: f64) -> Option<Vec<[f64; 3]>
         Curve3::Line(_) => 1,
         Curve3::Circle(circle) => turns(circle.radius, to - from, sag),
         Curve3::Ellipse(ellipse) => turns(ellipse.major_radius, to - from, sag),
-        // A spline's parameter is its own; sampling it evenly is what its
-        // own tessellation does, and this keeps the two agreeing.
-        Curve3::PlanarSpline { .. } => 32,
+        Curve3::PlanarSpline { .. } | Curve3::Nurbs(_) => {
+            let mut points = vec![EdgeSample {
+                parameter: from,
+                position: curve.point_at(from),
+            }];
+            sample_curve(curve, from, to, sag, 0, &mut points);
+            points.push(EdgeSample {
+                parameter: to,
+                position: curve.point_at(to),
+            });
+            return Some(points);
+        }
     };
     Some(
         (0..=steps)
-            .map(|step| curve.point_at(from + (to - from) * step as f64 / steps as f64))
+            .map(|step| {
+                let parameter = from + (to - from) * step as f64 / steps as f64;
+                EdgeSample {
+                    parameter,
+                    position: curve.point_at(parameter),
+                }
+            })
             .collect(),
     )
+}
+
+fn sample_curve(
+    curve: &Curve3,
+    from: f64,
+    to: f64,
+    sag: f64,
+    depth: u32,
+    points: &mut Vec<EdgeSample>,
+) {
+    let middle = 0.5 * (from + to);
+    let start = Vec3::from(curve.point_at(from));
+    let end = Vec3::from(curve.point_at(to));
+    let curved = Vec3::from(curve.point_at(middle));
+    if depth < 16 && start.lerp(end, 0.5).distance(curved) > sag.max(1e-12) {
+        sample_curve(curve, from, middle, sag, depth + 1, points);
+        points.push(EdgeSample {
+            parameter: middle,
+            position: curved.to_array(),
+        });
+        sample_curve(curve, middle, to, sag, depth + 1, points);
+    }
 }
 
 /// How many chords a circular sweep needs to stay within `sag` of the curve.

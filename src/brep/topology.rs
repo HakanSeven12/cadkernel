@@ -98,6 +98,8 @@ pub struct Coedge {
     pub edge: EdgeKey,
     /// Whether the loop runs along the edge in the curve's own direction.
     pub forward: bool,
+    /// This use of the edge in its face's parameter space.
+    pub pcurve: Option<crate::geom2d::Curve>,
     /// The loop it belongs to.
     pub owner: LoopKey,
     /// Where it came from.

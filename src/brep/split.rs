@@ -77,9 +77,22 @@ pub fn split_edge(body: &mut Body, edge: EdgeKey, parameter: f64) -> Option<(Edg
 
     for coedge in &original.coedges {
         let existing = body.coedges.get(*coedge)?.clone();
+        let (near_pcurve, far_pcurve) = match existing.pcurve.as_ref() {
+            Some(curve) => {
+                let at = if existing.forward { across } else { 1.0 - across };
+                let (first, second) = split_pcurve(curve, at)?;
+                if existing.forward {
+                    (Some(first), Some(second))
+                } else {
+                    (Some(second), Some(first))
+                }
+            }
+            None => (None, None),
+        };
         let twin = body.coedges.insert(Coedge {
             edge: far,
             forward: existing.forward,
+            pcurve: far_pcurve,
             owner: existing.owner,
             provenance: Provenance::Synthesized,
         });
@@ -98,11 +111,36 @@ pub fn split_edge(body: &mut Body, edge: EdgeKey, parameter: f64) -> Option<(Edg
             face.provenance.soil();
         }
         if let Some(coedge) = body.coedges.get_mut(*coedge) {
+            coedge.pcurve = near_pcurve;
             coedge.provenance.soil();
         }
     }
 
     Some((edge, far))
+}
+
+fn split_pcurve(
+    curve: &crate::geom2d::Curve,
+    at: f64,
+) -> Option<(crate::geom2d::Curve, crate::geom2d::Curve)> {
+    use crate::geom2d::{Curve, Line};
+    Some(match curve {
+        Curve::Line(line) => {
+            let middle = [
+                line.start[0] + (line.end[0] - line.start[0]) * at,
+                line.start[1] + (line.end[1] - line.start[1]) * at,
+            ];
+            (
+                Curve::Line(Line { start: line.start, end: middle }),
+                Curve::Line(Line { start: middle, end: line.end }),
+            )
+        }
+        Curve::Nurbs(curve) => {
+            let (first, second) = curve.split_at(at)?;
+            (Curve::Nurbs(first), Curve::Nurbs(second))
+        }
+        _ => return None,
+    })
 }
 
 /// Splits an edge at the point on it nearest `point`.
@@ -285,6 +323,7 @@ pub fn split_face(
     let near_closer = body.coedges.insert(Coedge {
         edge: cut,
         forward: sense(second),
+        pcurve: None,
         owner: ring_key,
         provenance: Provenance::Synthesized,
     });
@@ -317,6 +356,7 @@ pub fn split_face(
     let far_closer = body.coedges.insert(Coedge {
         edge: cut,
         forward: sense(first),
+        pcurve: None,
         owner: other_ring,
         provenance: Provenance::Synthesized,
     });

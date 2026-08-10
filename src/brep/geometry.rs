@@ -21,7 +21,7 @@
 //! [`Provenance`](super::Provenance).
 
 use crate::geom2d::NurbsCurve;
-use crate::space::{Plane, Vec3};
+use crate::space::{NurbsCurve3, NurbsSurface3, Plane, Vec3};
 
 /// A surface a face lies on.
 ///
@@ -42,6 +42,8 @@ pub enum Surface {
     Sphere(Sphere),
     /// A torus. `u` runs the major circle, `v` the minor.
     Torus(Torus),
+    /// A tensor-product spline surface in its knot parameters.
+    Nurbs(NurbsSurface3),
 }
 
 /// A right circular cylinder.
@@ -125,20 +127,22 @@ impl Surface {
                 let around = torus.frame.point_at([ring * u.cos(), ring * u.sin()]);
                 offset_along_normal(&torus.frame, around, torus.minor_radius * v.sin())
             }
+            Self::Nurbs(surface) => surface.point_at_knot(u, v),
         }
     }
 
     /// The frame a surface's parameters are measured in, for the kinds that
     /// have one. Every variant here does; the accessor exists so a caller can
     /// move a surface without matching on its kind.
-    pub fn frame(&self) -> &Plane {
-        match self {
+    pub fn frame(&self) -> Option<&Plane> {
+        Some(match self {
             Self::Plane(plane) => plane,
             Self::Cylinder(cylinder) => &cylinder.base,
             Self::Cone(cone) => &cone.base,
             Self::Sphere(sphere) => &sphere.frame,
             Self::Torus(torus) => &torus.frame,
-        }
+            Self::Nurbs(_) => return None,
+        })
     }
 
     /// The `(u, v)` of a point on the surface — the inverse of
@@ -184,6 +188,7 @@ impl Surface {
                     height.atan2(ring - torus.major_radius),
                 ))
             }
+            Self::Nurbs(_) => None,
         }
     }
 
@@ -246,7 +251,7 @@ impl Surface {
                     across_offset.length_squared() - at_start * at_start,
                 ))
             }
-            Self::Torus(_) => None,
+            Self::Torus(_) | Self::Nurbs(_) => None,
         }
     }
 
@@ -289,6 +294,7 @@ impl Surface {
                 let from_tube = (across - torus.major_radius).hypot(along);
                 from_tube - torus.minor_radius
             }
+            Self::Nurbs(_) => f64::INFINITY,
         }
     }
 }
@@ -370,15 +376,15 @@ pub enum Curve3 {
     /// exactly; approximating it with a circle or a spline would put the
     /// seam of every such cut slightly off.
     Ellipse(Ellipse3),
-    /// A spline curve lying in a plane. The planar case is what a drawing and
-    /// a planar face's boundary produce; a spline that genuinely wanders in
-    /// space is not modelled yet and stays with its source record.
+    /// A spline curve lying in a plane.
     PlanarSpline {
         /// The plane it lies in.
         plane: Plane,
         /// The curve, in that plane's coordinates.
         curve: NurbsCurve,
     },
+    /// A spline curve in space, evaluated in its knot parameter.
+    Nurbs(NurbsCurve3),
 }
 
 /// A straight line in space.
@@ -425,6 +431,7 @@ impl Curve3 {
                 ellipse.minor_radius * t.sin(),
             ]),
             Self::PlanarSpline { plane, curve } => plane.point_at(curve.point_at(t)),
+            Self::Nurbs(curve) => curve.point_at_knot(t),
         }
     }
 
@@ -459,6 +466,7 @@ impl Curve3 {
                 Some(local) => curve.parameter_at(local),
                 None => 0.0,
             },
+            Self::Nurbs(curve) => curve.parameter_at(point),
         }
     }
 }

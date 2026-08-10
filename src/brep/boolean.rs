@@ -129,13 +129,16 @@ fn same_surface(one: &Surface, other: &Surface, tolerance: f64) -> bool {
     // Compared by what each says about the other's frame origin and by their
     // normals, which is enough for the planar case a shared wall is and does
     // not depend on either having picked the same u direction.
-    let (Some(first), Some(second)) = (one.frame().normal(), other.frame().normal()) else {
+    let (Some(one_frame), Some(other_frame)) = (one.frame(), other.frame()) else {
+        return false;
+    };
+    let (Some(first), Some(second)) = (one_frame.normal(), other_frame.normal()) else {
         return false;
     };
     let parallel = Vec3::from(first).is_parallel_to(Vec3::from(second), tolerance);
     parallel
-        && one.distance_to(other.frame().origin).abs() <= tolerance
-        && other.distance_to(one.frame().origin).abs() <= tolerance
+        && one.distance_to(other_frame.origin).abs() <= tolerance
+        && other.distance_to(one_frame.origin).abs() <= tolerance
 }
 
 /// Whether this side's copy of a shared wall survives.
@@ -162,7 +165,7 @@ fn keeps_shared_wall(
 ) -> bool {
     let outward = |body: &Body, face: FaceKey, flipped: bool| -> Option<Vec3> {
         let node = body.faces.get(face)?;
-        let normal = Vec3::from(body.surfaces.get(node.surface)?.frame().normal()?);
+        let normal = Vec3::from(body.surfaces.get(node.surface)?.frame()?.normal()?);
         Some(if node.forward != flipped { normal } else { -normal })
     };
     // Each face is flipped only if it belongs to the second solid and the
@@ -311,6 +314,12 @@ fn copy_face(
                 .edges
                 .get(edge)
                 .is_some_and(|node| node.start != start);
+            let reverse_pcurve = flip != reversed;
+            let pcurve = match (&source_coedge.pcurve, reverse_pcurve) {
+                (Some(curve), true) => Some(reversed_pcurve(curve).ok_or(Snag::CutRefused)?),
+                (Some(curve), false) => Some(curve.clone()),
+                (None, _) => None,
+            };
             let new_coedge = result.coedges.insert(super::topology::Coedge {
                 edge,
                 // Flipping a face reverses the way its boundary runs, or the
@@ -318,6 +327,7 @@ fn copy_face(
                 // A reused edge may also run the other way than the one this
                 // coedge came from, which the sense has to absorb.
                 forward: (source_coedge.forward != flip) != reversed,
+                pcurve,
                 owner: new_ring,
                 provenance: Provenance::Synthesized,
             });
@@ -352,6 +362,18 @@ fn copy_face(
         .faces
         .push(new_face);
     Ok(())
+}
+
+fn reversed_pcurve(curve: &crate::geom2d::Curve) -> Option<crate::geom2d::Curve> {
+    use crate::geom2d::{Curve, Line};
+    Some(match curve {
+        Curve::Line(line) => Curve::Line(Line {
+            start: line.end,
+            end: line.start,
+        }),
+        Curve::Nurbs(curve) => Curve::Nurbs(curve.reversed()),
+        _ => return None,
+    })
 }
 
 /// An edge already joining the two vertices along the same path, if there is

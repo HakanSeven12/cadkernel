@@ -24,6 +24,21 @@
 use super::spline::{clamped_uniform_knots, de_boor};
 use super::Vec3;
 
+fn valid_knots(knots: &[f64]) -> bool {
+    knots.iter().all(|value| value.is_finite())
+        && knots.windows(2).all(|pair| pair[0] <= pair[1])
+        && knots.first() < knots.last()
+}
+
+fn wrap_parameter(value: f64, start: f64, end: f64, periodic: bool) -> f64 {
+    let span = end - start;
+    if periodic && span.is_finite() && span > 0.0 && value != end {
+        start + (value - start).rem_euclid(span)
+    } else {
+        value.clamp(start, end)
+    }
+}
+
 /// A NURBS curve in space.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NurbsCurve3 {
@@ -31,6 +46,7 @@ pub struct NurbsCurve3 {
     knots: Vec<f64>,
     control_points: Vec<[f64; 3]>,
     weights: Vec<f64>,
+    closed: bool,
 }
 
 impl NurbsCurve3 {
@@ -67,7 +83,43 @@ impl NurbsCurve3 {
             knots,
             control_points,
             weights,
+            closed: false,
         })
+    }
+
+    /// Builds a curve only when every supplied value is valid.
+    pub fn new_strict(
+        degree: usize,
+        control_points: Vec<[f64; 3]>,
+        knots: Vec<f64>,
+        weights: Vec<f64>,
+    ) -> Option<Self> {
+        if degree == 0
+            || control_points.len() <= degree
+            || knots.len() != control_points.len() + degree + 1
+            || weights.len() != control_points.len()
+            || !valid_knots(&knots)
+            || !control_points.iter().flatten().all(|value| value.is_finite())
+            || !weights.iter().all(|weight| weight.is_finite() && *weight > 0.0)
+        {
+            return None;
+        }
+        Some(Self {
+            degree,
+            knots,
+            control_points,
+            weights,
+            closed: false,
+        })
+    }
+
+    pub fn with_periodicity(mut self, closed: bool) -> Self {
+        self.closed = closed;
+        self
+    }
+
+    pub fn periodicity(&self) -> bool {
+        self.closed
     }
 
     /// The degree of the curve.
@@ -107,6 +159,8 @@ impl NurbsCurve3 {
 
     /// The point at a knot parameter.
     pub fn point_at_knot(&self, u: f64) -> [f64; 3] {
+        let (from, to) = self.domain();
+        let u = wrap_parameter(u, from, to, self.closed);
         let homogeneous: Vec<[f64; 4]> = self
             .control_points
             .iter()
@@ -134,6 +188,41 @@ impl NurbsCurve3 {
     pub fn point_at(&self, t: f64) -> [f64; 3] {
         let (from, to) = self.domain();
         self.point_at_knot(from + (to - from) * t.clamp(0.0, 1.0))
+    }
+
+    /// The knot parameter nearest `point`.
+    pub fn parameter_at(&self, point: [f64; 3]) -> f64 {
+        let (from, to) = self.domain();
+        let target = Vec3::from(point);
+        let distance = |parameter: f64| {
+            Vec3::from(self.point_at_knot(parameter))
+                .distance(target)
+                .powi(2)
+        };
+        let steps = 64usize;
+        let mut best = 0usize;
+        let mut best_distance = f64::INFINITY;
+        for step in 0..=steps {
+            let parameter = from + (to - from) * step as f64 / steps as f64;
+            let here = distance(parameter);
+            if here < best_distance {
+                best = step;
+                best_distance = here;
+            }
+        }
+        let mut low = from + (to - from) * best.saturating_sub(1) as f64 / steps as f64;
+        let mut high = from + (to - from) * (best + 1).min(steps) as f64 / steps as f64;
+        for _ in 0..24 {
+            let third = (high - low) / 3.0;
+            let one = low + third;
+            let two = high - third;
+            if distance(one) <= distance(two) {
+                high = two;
+            } else {
+                low = one;
+            }
+        }
+        0.5 * (low + high)
     }
 
     /// The tangent at a knot parameter, by a central difference.
@@ -187,6 +276,9 @@ impl NurbsCurve3 {
 
     /// Whether the curve returns to where it started.
     pub fn is_closed(&self) -> bool {
+        if self.closed {
+            return true;
+        }
         let (from, to) = self.domain();
         Vec3::from(self.point_at_knot(from)).distance(Vec3::from(self.point_at_knot(to))) < 1e-9
     }
@@ -239,6 +331,9 @@ pub struct NurbsSurface3 {
     v_knots: Vec<f64>,
     control_points: Vec<Vec<[f64; 3]>>,
     weights: Vec<Vec<f64>>,
+    u_closed: bool,
+    v_closed: bool,
+    v_reversed: bool,
 }
 
 impl NurbsSurface3 {
@@ -288,7 +383,76 @@ impl NurbsSurface3 {
             v_knots,
             control_points,
             weights,
+            u_closed: false,
+            v_closed: false,
+            v_reversed: false,
         })
+    }
+
+    /// Builds a surface only when every supplied value is valid.
+    pub fn new_strict(
+        u_degree: usize,
+        v_degree: usize,
+        control_points: Vec<Vec<[f64; 3]>>,
+        u_knots: Vec<f64>,
+        v_knots: Vec<f64>,
+        weights: Vec<Vec<f64>>,
+    ) -> Option<Self> {
+        let rows = control_points.len();
+        let columns = control_points.first()?.len();
+        if u_degree == 0
+            || v_degree == 0
+            || rows <= u_degree
+            || columns <= v_degree
+            || control_points.iter().any(|row| row.len() != columns)
+            || weights.len() != rows
+            || weights.iter().any(|row| row.len() != columns)
+            || u_knots.len() != rows + u_degree + 1
+            || v_knots.len() != columns + v_degree + 1
+            || !valid_knots(&u_knots)
+            || !valid_knots(&v_knots)
+            || !control_points
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|value| value.is_finite())
+            || !weights
+                .iter()
+                .flatten()
+                .all(|weight| weight.is_finite() && *weight > 0.0)
+        {
+            return None;
+        }
+        Some(Self {
+            u_degree,
+            v_degree,
+            u_knots,
+            v_knots,
+            control_points,
+            weights,
+            u_closed: false,
+            v_closed: false,
+            v_reversed: false,
+        })
+    }
+
+    pub fn with_periodicity(mut self, u_closed: bool, v_closed: bool) -> Self {
+        self.u_closed = u_closed;
+        self.v_closed = v_closed;
+        self
+    }
+
+    pub fn with_v_reversed(mut self, reversed: bool) -> Self {
+        self.v_reversed = reversed;
+        self
+    }
+
+    pub fn v_reversed(&self) -> bool {
+        self.v_reversed
+    }
+
+    pub fn periodicity(&self) -> [bool; 2] {
+        [self.u_closed, self.v_closed]
     }
 
     /// The knot ranges the surface is defined over, `u` then `v`.
@@ -302,12 +466,32 @@ impl NurbsSurface3 {
         )
     }
 
+    pub fn degrees(&self) -> (usize, usize) {
+        (self.u_degree, self.v_degree)
+    }
+
+    pub fn knots(&self) -> (&[f64], &[f64]) {
+        (&self.u_knots, &self.v_knots)
+    }
+
+    pub fn control_points(&self) -> &[Vec<[f64; 3]>] {
+        &self.control_points
+    }
+
+    pub fn weights(&self) -> &[Vec<f64>] {
+        &self.weights
+    }
+
     /// The point at knot parameters `(u, v)`.
     ///
     /// Two passes of the same algorithm: along `v` through each row of the
     /// net, then along `u` through what those gave. Homogeneous the whole
     /// way, so the weights come out right.
     pub fn point_at_knot(&self, u: f64, v: f64) -> [f64; 3] {
+        let ((u0, u1), (v0, v1)) = self.domain();
+        let u = wrap_parameter(u, u0, u1, self.u_closed);
+        let v = wrap_parameter(v, v0, v1, self.v_closed);
+        let v = if self.v_reversed { v0 + v1 - v } else { v };
         let along_rows: Vec<[f64; 4]> = self
             .control_points
             .iter()

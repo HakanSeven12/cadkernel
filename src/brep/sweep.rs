@@ -464,6 +464,7 @@ fn add_coedge(
     let coedge = body.coedges.insert(Coedge {
         edge,
         forward,
+        pcurve: None,
         owner: ring,
         provenance: Provenance::Synthesized,
     });
