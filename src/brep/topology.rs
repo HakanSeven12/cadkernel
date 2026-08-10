@@ -384,6 +384,13 @@ impl Body {
                     .is_some_and(|surface| {
                         matches!(surface, Surface::Sphere(_))
                             || matches!(surface, Surface::Cone(cone) if cone.half_angle.tan().abs() > 1e-15)
+                            || matches!(
+                                surface,
+                                Surface::Torus(torus)
+                                    if torus.minor_radius.abs() > f64::EPSILON
+                                        && torus.major_radius.abs()
+                                            <= torus.minor_radius.abs()
+                            )
                     });
             if !singular
                 && (ring.coedges.is_empty()
@@ -428,9 +435,39 @@ impl Body {
             if !self.vertices.contains(edge.start) || !self.vertices.contains(edge.end) {
                 flaws.push(Flaw::DanglingKey("edge names a vertex that is gone"));
             }
-            match edge.coedges.len() {
-                0 => flaws.push(Flaw::UnusedEdge(key)),
-                1 | 2 => {}
+            let mut seam = vec![false; edge.coedges.len()];
+            for first in 0..edge.coedges.len() {
+                if seam[first] {
+                    continue;
+                }
+                let Some(first_coedge) = self.coedges.get(edge.coedges[first]) else {
+                    continue;
+                };
+                for second in first + 1..edge.coedges.len() {
+                    if seam[second] {
+                        continue;
+                    }
+                    let Some(second_coedge) = self.coedges.get(edge.coedges[second]) else {
+                        continue;
+                    };
+                    if first_coedge.owner == second_coedge.owner
+                        && first_coedge.forward != second_coedge.forward
+                    {
+                        seam[first] = true;
+                        seam[second] = true;
+                        break;
+                    }
+                }
+            }
+            let effective: Vec<_> = edge
+                .coedges
+                .iter()
+                .enumerate()
+                .filter_map(|(index, key)| (!seam[index]).then_some(*key))
+                .collect();
+            match effective.len() {
+                0 if edge.coedges.is_empty() => flaws.push(Flaw::UnusedEdge(key)),
+                0..=2 => {}
                 _ => flaws.push(Flaw::NonManifoldEdge(key)),
             }
             for coedge in &edge.coedges {
@@ -445,7 +482,7 @@ impl Body {
             // Two coedges on one edge must run it opposite ways, or the two
             // faces they belong to face the same direction along their shared
             // border and the solid is inside out.
-            if let [first, second] = edge.coedges.as_slice() {
+            if let [first, second] = effective.as_slice() {
                 if let (Some(first), Some(second)) =
                     (self.coedges.get(*first), self.coedges.get(*second))
                 {

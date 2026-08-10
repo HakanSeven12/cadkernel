@@ -680,7 +680,7 @@ fn sample_isoline(
                 .map(|tangents| if fixed_axis == 0 { tangents.1 } else { tangents.0 })
                 .unwrap_or([0.0; 3])
         });
-    let split = crate::tessellation::max_direction_angle(&directions) > max_angle;
+    let split = angle_exceeds(crate::tessellation::max_direction_angle(&directions), max_angle);
     if split {
         if depth >= MAX_DEPTH {
             return false;
@@ -719,6 +719,13 @@ fn finite_positive(value: f64, fallback: f64) -> f64 {
     } else {
         fallback
     }
+}
+
+fn angle_exceeds(value: f64, limit: f64) -> bool {
+    !value.is_finite()
+        || value
+            > limit
+                + f64::EPSILON * 64.0 * value.abs().max(limit.abs()).max(1.0)
 }
 
 fn shared_edge_samples(
@@ -766,7 +773,10 @@ fn refine_edge(
     let curved = Vec3::from(curve.point_at(middle));
     let directions = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
         .map(|unit| curve.tangent_at(from + (to - from) * unit));
-    let mut split = crate::tessellation::max_direction_angle(&directions) > max_angle;
+    let mut split = angle_exceeds(
+        crate::tessellation::max_direction_angle(&directions),
+        max_angle,
+    );
     for coedge_key in &edge.coedges {
         let Some((surface, pcurve, reversed)) = coedge_geometry(body, *coedge_key)
         else {
@@ -796,7 +806,10 @@ fn refine_edge(
             }
             normals.push(surface.normal_at(uv[0], uv[1])?);
         }
-        split |= crate::tessellation::max_direction_angle(&normals) > max_angle;
+        split |= angle_exceeds(
+            crate::tessellation::max_direction_angle(&normals),
+            max_angle,
+        );
     }
     if split {
         if depth >= MAX_DEPTH {
@@ -867,9 +880,12 @@ fn scheduled_face(
     {
         if !band.strip
             && band.holes.is_empty()
-            && matches!(surface, super::geometry::Surface::Cone(_))
+            && matches!(
+                surface,
+                super::geometry::Surface::Cone(_) | super::geometry::Surface::Torus(_)
+            )
         {
-            return fill_scheduled_cone_cap(body, face, &band, max_angle, tolerance);
+            return fill_scheduled_singular_cap(body, face, &band, max_angle, tolerance);
         }
         if band.structured && band.strip && band.holes.is_empty() {
             return fill_scheduled_band(body, face, &band, max_angle, tolerance);
@@ -950,19 +966,20 @@ fn chain_samples(
     pieces: Vec<(Vec<super::place::EdgeSample>, Option<&crate::geom2d::Curve>)>,
     tolerance: f64,
 ) -> Option<Vec<BoundaryPoint>> {
+    let surface_periods = periods(surface);
     let mut pieces = pieces.into_iter();
     let (first, pcurve) = pieces.next()?;
     let mut points = parameterize_samples(surface, &first, pcurve)?;
-    unwrap_boundary(&mut points, periods(surface));
+    unwrap_boundary(&mut points, surface_periods);
     let mut pieces = pieces.peekable();
     while let Some((samples, pcurve)) = pieces.next() {
         let head = points.last()?.position;
         let mut next = parameterize_samples(surface, &samples, pcurve)?;
-        unwrap_boundary(&mut next, periods(surface));
+        unwrap_boundary(&mut next, surface_periods);
         align_parameters(
             &mut next,
             &points,
-            periods(surface),
+            surface_periods,
             pieces.peek().is_none(),
         );
         if distance3(head, next[0].position) > tolerance {
@@ -974,7 +991,14 @@ fn chain_samples(
     if distance3(points.first()?.position, points.last()?.position) > tolerance {
         return None;
     }
-    if parameter_near(points.first()?.parameters, points.last()?.parameters) {
+    let first = points.first()?.parameters;
+    let last = points.last()?.parameters;
+    let winds_period = (0..2).any(|axis| {
+        surface_periods[axis].is_some_and(|period| {
+            (last[axis] - first[axis]).abs() >= period * (1.0 - 1e-9)
+        })
+    });
+    if !winds_period {
         points.pop();
     }
     Some(points)
@@ -1125,7 +1149,6 @@ fn align_parameters(
         return;
     };
     let previous = chain.last().map(|point| point.parameters).unwrap_or(first.parameters);
-    let behind = (chain.len() >= 2).then(|| [chain[chain.len() - 2].parameters, previous]);
     let last = points.last().map(|point| point.parameters).unwrap_or(first.parameters);
     let mut best = (f64::INFINITY, [0.0; 2]);
     for across in period_shifts(periods[0]) {
@@ -1133,13 +1156,11 @@ fn align_parameters(
             let shift = [across, along];
             let moved_first = [first.parameters[0] + across, first.parameters[1] + along];
             let moved_last = [last[0] + across, last[1] + along];
-            if behind.is_some_and(|pair| {
-                parameter_near(moved_first, pair[1]) && parameter_near(moved_last, pair[0])
-            }) || (!closes_ring
+            if !closes_ring
                 && parameter_near(moved_first, previous)
                 && chain
                     .first()
-                    .is_some_and(|first| parameter_near(moved_last, first.parameters)))
+                    .is_some_and(|first| parameter_near(moved_last, first.parameters))
             {
                 continue;
             }
@@ -1231,6 +1252,9 @@ fn scheduled_band(
     let mut candidate_loops = Vec::new();
     for loop_key in &node.loops {
         let ring = body.loops.get(*loop_key)?;
+        if ring.coedges.is_empty() {
+            continue;
+        }
         let mut loop_has_candidate = false;
         let mut loop_has_refined_side = false;
         for coedge_key in &ring.coedges {
@@ -1262,6 +1286,29 @@ fn scheduled_band(
                 loop_has_refined_side |= samples.len() > 2;
             }
         }
+        if !loop_has_candidate {
+            let points = scheduled_loop(body, *loop_key, surface, schedules, tolerance)?;
+            let varying = (0..2)
+                .filter_map(|axis| surface_periods[axis].map(|period| (axis, period)))
+                .filter(|(axis, period)| {
+                    points
+                        .first()
+                        .zip(points.last())
+                        .is_some_and(|(first, last)| {
+                            (last.parameters[*axis] - first.parameters[*axis]).abs()
+                                >= *period * (1.0 - 1e-9)
+                        }) && is_isoparametric_rim(surface, &points, *axis, tolerance)
+                })
+                .map(|(axis, _)| axis)
+                .max_by(|a, b| {
+                    parameter_range(&points, *a).total_cmp(&parameter_range(&points, *b))
+                });
+            if let Some(varying) = varying {
+                candidates.push((varying, points));
+                candidate_loops.push(*loop_key);
+                continue;
+            }
+        }
         if loop_has_candidate {
             candidate_loops.push(*loop_key);
             refined_side |= loop_has_refined_side;
@@ -1278,6 +1325,7 @@ fn scheduled_band(
     let period = surface_periods[varying]?;
     let fixed = 1 - varying;
     let mut holes = Vec::new();
+    let mut winding_rim = None;
     let mut singular_loops = 0;
     for loop_key in &node.loops {
         if candidate_loops.contains(loop_key) {
@@ -1292,8 +1340,20 @@ fn scheduled_band(
         }
         let ring = scheduled_loop(body, *loop_key, surface, schedules, tolerance)?;
         if ring.len() >= 3 {
-            holes.push(ring);
+            let traversal = ring.last()?.parameters[varying] - ring.first()?.parameters[varying];
+            if rims.len() == 1
+                && winding_rim.is_none()
+                && traversal.abs() >= period * (1.0 - 1e-9)
+            {
+                winding_rim = Some(ring);
+            } else {
+                holes.push(ring);
+            }
         }
+    }
+    let structured = winding_rim.is_none();
+    if let Some(rim) = winding_rim {
+        rims.push(rim);
     }
     let traversal: Vec<f64> = rims
         .iter()
@@ -1310,7 +1370,7 @@ fn scheduled_band(
         }
     }
     if rims.len() == 2
-        && !holes.is_empty()
+        && (!holes.is_empty() || !structured)
         && parameter_range(&rims[0], varying) >= period * (1.0 - 1e-9)
     {
         fit_periodic_band(&mut rims, &mut holes, varying, period)?;
@@ -1319,16 +1379,18 @@ fn scheduled_band(
         .iter()
         .map(|rim| average_parameter(rim, fixed))
         .collect();
-    for (rim, value) in rims.iter().zip(&bounds) {
-        if rim.iter().any(|point| {
-            let mut parameters = point.parameters;
-            parameters[fixed] = *value;
-            distance3(
-                point.position,
-                surface.point_at(parameters[0], parameters[1]),
-            ) > tolerance
-        }) {
-            return None;
+    if structured {
+        for (rim, value) in rims.iter().zip(&bounds) {
+            if rim.iter().any(|point| {
+                let mut parameters = point.parameters;
+                parameters[fixed] = *value;
+                distance3(
+                    point.position,
+                    surface.point_at(parameters[0], parameters[1]),
+                ) > tolerance
+            }) {
+                return None;
+            }
         }
     }
     if rims.len() == 2 {
@@ -1355,6 +1417,30 @@ fn scheduled_band(
             let apex = cone.radius / cone.half_angle.tan();
             boundary_collapsed(surface, varying, base, period, fixed, apex, tolerance)
                 .then_some(apex)?
+        } else if let super::geometry::Surface::Torus(torus) = surface {
+            if varying != 0 || torus.minor_radius.abs() <= f64::EPSILON {
+                return None;
+            }
+            let ratio = -torus.major_radius / torus.minor_radius;
+            if !ratio.is_finite() || ratio.abs() > 1.0 {
+                return None;
+            }
+            let near = bounds[0];
+            [ratio.acos(), -ratio.acos()]
+                .map(|value| unwound(value, near, TAU))
+                .into_iter()
+                .filter(|value| {
+                    boundary_collapsed(
+                        surface,
+                        varying,
+                        base,
+                        period,
+                        fixed,
+                        *value,
+                        tolerance,
+                    )
+                })
+                .min_by(|a, b| (a - near).abs().total_cmp(&(b - near).abs()))?
         } else {
             let domain = surface_domain(surface)?;
             let candidates = [domain[fixed][0], domain[fixed][1]];
@@ -1402,11 +1488,13 @@ fn scheduled_band(
     let mut high = rims.remove(if high_index > low_index { high_index - 1 } else { high_index });
     let low_fixed = bounds[low_index];
     let high_fixed = bounds[high_index];
-    for point in &mut low {
-        point.parameters[fixed] = low_fixed;
-    }
-    for point in &mut high {
-        point.parameters[fixed] = high_fixed;
+    if structured {
+        for point in &mut low {
+            point.parameters[fixed] = low_fixed;
+        }
+        for point in &mut high {
+            point.parameters[fixed] = high_fixed;
+        }
     }
     Some(BoundaryBand {
         low,
@@ -1414,7 +1502,7 @@ fn scheduled_band(
         holes,
         varying,
         strip,
-        structured: true,
+        structured,
     })
 }
 
@@ -1578,8 +1666,8 @@ fn sample_parameter_seam(
             parameters[1 - fixed_axis] = from + (to - from) * unit;
             parameters
         });
-    if surface_normal_angle(surface, &parameters)
-        .map(|angle| angle > max_angle)
+    if surface_path_angle(surface, &parameters)
+        .map(|angle| angle_exceeds(angle, max_angle))
         .unwrap_or(true)
     {
         if depth >= MAX_DEPTH {
@@ -1666,8 +1754,12 @@ fn rotate_periodic_rim(
     period: f64,
 ) -> Option<()> {
     for point in rim.iter_mut() {
-        point.parameters[varying] =
-            seam + (point.parameters[varying] - seam).rem_euclid(period);
+        let mut value = seam + (point.parameters[varying] - seam).rem_euclid(period);
+        let scale = seam.abs().max((seam + period).abs()).max(1.0);
+        if (value - seam - period).abs() <= f64::EPSILON * 128.0 * scale {
+            value = seam;
+        }
+        point.parameters[varying] = value;
     }
     rim.sort_by(|a, b| a.parameters[varying].total_cmp(&b.parameters[varying]));
     rim.dedup_by(|a, b| {
@@ -1888,6 +1980,40 @@ fn fill_scheduled_band(
     let mut lower = 0;
     let mut upper = 0;
     let mut triangles = Vec::new();
+    let fixed_axis = 1 - band.varying;
+    let fixed_from = band.low.first()?.parameters[fixed_axis];
+    let fixed_to = band.high.first()?.parameters[fixed_axis];
+    let mut varying_values: Vec<f64> = band
+        .low
+        .iter()
+        .chain(&band.high)
+        .map(|point| point.parameters[band.varying])
+        .collect();
+    varying_values.sort_by(f64::total_cmp);
+    varying_values.dedup_by(|a, b| parameter_value_near(*a, *b));
+    let mut probes = varying_values.clone();
+    probes.extend(varying_values.windows(2).map(|pair| 0.5 * (pair[0] + pair[1])));
+    let surface = body.surfaces.get(body.faces.get(face)?.surface)?;
+    let fixed_depth = probes.into_iter().try_fold(0, |depth, varying| {
+        Some(depth.max(surface_span_depth(
+            surface,
+            fixed_axis,
+            varying,
+            fixed_from,
+            fixed_to,
+            max_angle,
+            0,
+        )?))
+    })?;
+    let fixed_steps = 1usize.checked_shl(fixed_depth)?;
+    let base_triangles = band.low.len().saturating_add(band.high.len()).saturating_sub(2);
+    if fixed_steps
+        .saturating_mul(base_triangles)
+        .saturating_mul(2)
+        > MAX_FACE_ADDITIONS
+    {
+        return None;
+    }
     while lower + 1 < band.low.len() || upper + 1 < band.high.len() {
         let take_lower = upper + 1 >= band.high.len()
             || (lower + 1 < band.low.len()
@@ -1913,7 +2039,7 @@ fn fill_scheduled_band(
         if band.varying == 1 {
             corners.swap(1, 2);
         }
-        triangles.push(corners);
+        triangles.extend(subdivide_band_triangle(corners, fixed_axis, fixed_steps)?);
     }
     let mut mesh = Mesh::default();
     for corners in triangles {
@@ -1928,7 +2054,7 @@ fn fill_scheduled_band(
             &boundary_segments,
             &edges,
             tolerance,
-            Some(band.varying),
+            None,
         ) {
             return None;
         }
@@ -1936,7 +2062,99 @@ fn fill_scheduled_band(
     (!mesh.triangles.is_empty()).then_some(mesh)
 }
 
-fn fill_scheduled_cone_cap(
+fn surface_span_depth(
+    surface: &super::geometry::Surface,
+    fixed_axis: usize,
+    varying: f64,
+    from: f64,
+    to: f64,
+    max_angle: f64,
+    depth: u32,
+) -> Option<u32> {
+    let parameters = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
+        .map(|unit| {
+            let mut parameters = [0.0; 2];
+            parameters[fixed_axis] = from + (to - from) * unit;
+            parameters[1 - fixed_axis] = varying;
+            parameters
+        });
+    if !angle_exceeds(surface_path_angle(surface, &parameters)?, max_angle) {
+        return Some(depth);
+    }
+    if depth >= MAX_FACE_DEPTH {
+        return None;
+    }
+    let middle = 0.5 * (from + to);
+    Some(
+        surface_span_depth(
+            surface,
+            fixed_axis,
+            varying,
+            from,
+            middle,
+            max_angle,
+            depth + 1,
+        )?
+        .max(surface_span_depth(
+            surface,
+            fixed_axis,
+            varying,
+            middle,
+            to,
+            max_angle,
+            depth + 1,
+        )?),
+    )
+}
+
+fn subdivide_band_triangle(
+    corners: [[f64; 2]; 3],
+    fixed_axis: usize,
+    steps: usize,
+) -> Option<Vec<[[f64; 2]; 3]>> {
+    if steps <= 1 {
+        return Some(vec![corners]);
+    }
+    let lone = if parameter_value_near(corners[1][fixed_axis], corners[2][fixed_axis]) {
+        0
+    } else if parameter_value_near(corners[2][fixed_axis], corners[0][fixed_axis]) {
+        1
+    } else if parameter_value_near(corners[0][fixed_axis], corners[1][fixed_axis]) {
+        2
+    } else {
+        return None;
+    };
+    let corners = [corners[lone], corners[(lone + 1) % 3], corners[(lone + 2) % 3]];
+    let at = |to: [f64; 2], step: usize| {
+        let unit = step as f64 / steps as f64;
+        [
+            corners[0][0] + (to[0] - corners[0][0]) * unit,
+            corners[0][1] + (to[1] - corners[0][1]) * unit,
+        ]
+    };
+    let mut triangles = Vec::with_capacity(steps.saturating_mul(2).saturating_sub(1));
+    let mut left = corners[0];
+    let mut right = corners[0];
+    for step in 1..=steps {
+        let next_left = at(corners[1], step);
+        let next_right = at(corners[2], step);
+        if step == 1 {
+            triangles.push([corners[0], next_left, next_right]);
+        } else {
+            triangles.push([left, next_left, next_right]);
+            triangles.push([left, next_right, right]);
+        }
+        left = next_left;
+        right = next_right;
+    }
+    Some(triangles)
+}
+
+fn parameter_value_near(a: f64, b: f64) -> bool {
+    (a - b).abs() <= f64::EPSILON * 128.0 * a.abs().max(b.abs()).max(1.0)
+}
+
+fn fill_scheduled_singular_cap(
     body: &Body,
     face: FaceKey,
     band: &BoundaryBand,
@@ -1950,41 +2168,140 @@ fn fill_scheduled_cone_cap(
     };
     let apex = singular.first()?;
     let fixed = 1 - band.varying;
+    let surface = body.surfaces.get(body.faces.get(face)?.surface)?;
     let edges: Vec<EdgeKey> = body
         .face_coedges(face)
         .into_iter()
         .filter_map(|coedge| Some(body.coedges.get(coedge)?.edge))
         .collect();
-    let boundary_segments: Vec<[[f64; 2]; 2]> = rim
-        .windows(2)
-        .map(|pair| [pair[0].parameters, pair[1].parameters])
-        .collect();
-    let mut mesh = Mesh::default();
-    for pair in rim.windows(2) {
-        let mut tip = apex.parameters;
-        tip[band.varying] =
-            0.5 * (pair[0].parameters[band.varying] + pair[1].parameters[band.varying]);
-        let mut corners = [pair[0].parameters, pair[1].parameters, tip];
-        if tip[fixed] < pair[0].parameters[fixed] {
-            corners.swap(0, 1);
-        }
-        if !refine_scheduled(
-            &mut mesh,
-            body,
-            face,
-            corners,
-            max_angle,
+    let rim_fixed = average_parameter(rim, fixed);
+    let mut radial_depth = rim.iter().try_fold(0, |depth, point| {
+        Some(depth.max(surface_span_depth(
+            surface,
+            fixed,
+            point.parameters[band.varying],
+            apex.parameters[fixed],
+            rim_fixed,
+            max_angle * 0.5,
             0,
-            rim,
-            &boundary_segments,
-            &edges,
-            tolerance,
-            None,
-        ) {
+        )?))
+    })?;
+    let triangles = loop {
+        let steps = 1usize.checked_shl(radial_depth)?;
+        if steps
+            .saturating_mul(rim.len().saturating_sub(1))
+            .saturating_mul(2)
+            > MAX_FACE_ADDITIONS
+        {
             return None;
         }
+        let triangles = singular_cap_triangles(rim, apex, band.varying, steps);
+        if triangles
+            .iter()
+            .all(|corners| {
+                triangle_within_angle(
+                    surface,
+                    *corners,
+                    max_angle,
+                    fixed,
+                    apex.parameters[fixed],
+                )
+            })
+        {
+            break triangles;
+        }
+        if radial_depth >= MAX_FACE_DEPTH {
+            return None;
+        }
+        radial_depth += 1;
+    };
+    let mut pins = rim.clone();
+    pins.extend(rim.iter().map(|point| {
+        let mut singular = apex.clone();
+        singular.parameters[band.varying] = point.parameters[band.varying];
+        singular
+    }));
+    let mut mesh = Mesh::default();
+    for corners in triangles {
+        emit_scheduled(&mut mesh, body, face, corners, &pins, &edges, tolerance);
     }
     (!mesh.triangles.is_empty()).then_some(mesh)
+}
+
+fn singular_cap_triangles(
+    rim: &[BoundaryPoint],
+    apex: &BoundaryPoint,
+    varying: usize,
+    steps: usize,
+) -> Vec<[[f64; 2]; 3]> {
+    let fixed = 1 - varying;
+    let mut triangles = Vec::with_capacity(
+        rim.len()
+            .saturating_sub(1)
+            .saturating_mul(steps.saturating_mul(2).saturating_sub(1)),
+    );
+    for pair in rim.windows(2) {
+        let mut previous = [apex.parameters; 2];
+        previous[0][varying] = pair[0].parameters[varying];
+        previous[1][varying] = pair[1].parameters[varying];
+        for step in 1..=steps {
+            let unit = step as f64 / steps as f64;
+            let mut current = [pair[0].parameters, pair[1].parameters];
+            for point in &mut current {
+                point[fixed] = apex.parameters[fixed]
+                    + (pair[0].parameters[fixed] - apex.parameters[fixed]) * unit;
+            }
+            if apex.parameters[fixed] < pair[0].parameters[fixed] {
+                triangles.push([current[1], current[0], previous[0]]);
+                if step > 1 {
+                    triangles.push([current[1], previous[0], previous[1]]);
+                }
+            } else {
+                triangles.push([current[0], current[1], previous[1]]);
+                if step > 1 {
+                    triangles.push([current[0], previous[1], previous[0]]);
+                }
+            }
+            previous = current;
+        }
+    }
+    triangles
+}
+
+fn triangle_within_angle(
+    surface: &super::geometry::Surface,
+    corners: [[f64; 2]; 3],
+    max_angle: f64,
+    singular_axis: usize,
+    singular_value: f64,
+) -> bool {
+    if surface_triangle_angle(surface, corners)
+        .is_none_or(|angle| angle_exceeds(angle, max_angle))
+    {
+        return false;
+    }
+    [[0, 1], [1, 2], [2, 0]].into_iter().all(|[from, to]| {
+        let parameters = [0.0, 0.25, 0.5, 0.75, 1.0].map(|unit| {
+            [
+                corners[from][0] + (corners[to][0] - corners[from][0]) * unit,
+                corners[from][1] + (corners[to][1] - corners[from][1]) * unit,
+            ]
+        });
+        let touches_singular = parameter_value_near(
+            corners[from][singular_axis],
+            singular_value,
+        ) || parameter_value_near(corners[to][singular_axis], singular_value);
+        let is_isoparametric = (0..2).any(|axis| {
+            parameter_value_near(corners[from][axis], corners[to][axis])
+        });
+        let angle = if is_isoparametric && !touches_singular {
+            surface_path_angle(surface, &parameters)
+        } else {
+            surface_normal_angle(surface, &parameters)
+        };
+        angle
+            .is_some_and(|angle| !angle_exceeds(angle, max_angle))
+    })
 }
 
 fn fill_whole_surface(
@@ -2134,15 +2451,17 @@ fn triangle_refinement(
                 corners[from][1] + (corners[to][1] - corners[from][1]) * unit,
             ]
         });
-        edge_angles[index] = surface_normal_angle(surface, &parameters)?;
+        edge_angles[index] = surface_path_angle(surface, &parameters)?;
     }
-    if (0..3).any(|index| edge_angles[index] > max_angle && triangle.constraints[index]) {
+    if (0..3).any(|index| {
+        angle_exceeds(edge_angles[index], max_angle) && triangle.constraints[index]
+    }) {
         return Some(TriangleRefinement::Boundary);
     }
     if let Some((_, [from, to])) = edge_vertices
         .into_iter()
         .enumerate()
-        .filter(|(index, _)| edge_angles[*index] > max_angle)
+        .filter(|(index, _)| angle_exceeds(edge_angles[*index], max_angle))
         .max_by(|(a, _), (b, _)| edge_angles[*a].total_cmp(&edge_angles[*b]))
     {
         return Some(TriangleRefinement::Interior([
@@ -2151,7 +2470,7 @@ fn triangle_refinement(
         ]));
     }
     match surface_triangle_angle(surface, corners) {
-        Some(angle) if angle <= max_angle => Some(TriangleRefinement::Complete),
+        Some(angle) if !angle_exceeds(angle, max_angle) => Some(TriangleRefinement::Complete),
         Some(_) => Some(TriangleRefinement::Interior([
             (corners[0][0] + corners[1][0] + corners[2][0]) / 3.0,
             (corners[0][1] + corners[1][1] + corners[2][1]) / 3.0,
@@ -2205,13 +2524,13 @@ fn refine_scheduled(
                 corners[from][1] + (corners[to][1] - corners[from][1]) * unit,
             ]
         });
-        surface_normal_angle(surface, &parameters).unwrap_or(std::f64::consts::PI)
+        surface_path_angle(surface, &parameters).unwrap_or(std::f64::consts::PI)
     });
     let split_edge = edge_vertices
         .into_iter()
         .enumerate()
         .filter(|(index, [from, to])| {
-            edge_angles[*index] > max_angle
+            angle_exceeds(edge_angles[*index], max_angle)
                 && !boundary_segments.iter().any(|segment| {
                     (segment[0] == corners[*from] && segment[1] == corners[*to])
                         || (segment[1] == corners[*from] && segment[0] == corners[*to])
@@ -2263,11 +2582,14 @@ fn refine_scheduled(
             )
         });
     }
-    if edge_angles.into_iter().any(|angle| angle > max_angle) {
+    if edge_angles
+        .into_iter()
+        .any(|angle| angle_exceeds(angle, max_angle))
+    {
         return false;
     }
     let split = surface_triangle_angle(surface, corners)
-        .map(|angle| angle > max_angle)
+        .map(|angle| angle_exceeds(angle, max_angle))
         .unwrap_or(true);
     if split {
         if depth >= MAX_FACE_DEPTH {
@@ -2342,6 +2664,60 @@ fn surface_normal_angle(
         .map(|uv| surface.normal_at(uv[0], uv[1]))
         .collect::<Option<Vec<_>>>()?;
     Some(crate::tessellation::max_direction_angle(&normals))
+}
+
+fn surface_path_angle(
+    surface: &super::geometry::Surface,
+    parameters: &[[f64; 2]],
+) -> Option<f64> {
+    let positions: Vec<_> = parameters
+        .iter()
+        .map(|uv| surface.point_at(uv[0], uv[1]))
+        .collect();
+    let position_scale = positions
+        .iter()
+        .flatten()
+        .map(|value| value.abs())
+        .fold(1.0, f64::max);
+    let path_span = positions
+        .iter()
+        .map(|point| distance3(positions[0], *point))
+        .fold(0.0, f64::max);
+    if path_span <= f64::EPSILON * 1024.0 * position_scale {
+        return Some(0.0);
+    }
+    let mut largest = surface_normal_angle(surface, parameters)?;
+    let (first, last) = parameters.first().zip(parameters.last())?;
+    let delta = [last[0] - first[0], last[1] - first[1]];
+    let length = delta[0].hypot(delta[1]);
+    if length <= f64::MIN_POSITIVE {
+        return Some(largest);
+    }
+    let direction = [delta[0] / length, delta[1] / length];
+    let frames = parameters
+        .iter()
+        .map(|uv| surface.tangents_at(uv[0], uv[1]))
+        .collect::<Option<Vec<_>>>()?;
+    let tangent_scale = frames
+        .iter()
+        .flat_map(|frame| [frame.0, frame.1])
+        .map(|tangent| tangent.iter().map(|value| value * value).sum::<f64>())
+        .fold(0.0, f64::max);
+    let tangent_cutoff = tangent_scale * 1e-28;
+    let directions: Vec<_> = frames
+        .into_iter()
+        .map(|tangents| {
+            (Vec3::from(tangents.0) * direction[0]
+                + Vec3::from(tangents.1) * direction[1])
+                .to_array()
+        })
+        .filter(|tangent| {
+            tangent.iter().all(|value| value.is_finite())
+                && tangent.iter().map(|value| value * value).sum::<f64>() > tangent_cutoff
+        })
+        .collect();
+    largest = largest.max(crate::tessellation::max_direction_angle(&directions));
+    Some(largest)
 }
 
 fn emit_scheduled(

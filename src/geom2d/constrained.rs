@@ -113,11 +113,13 @@ impl ConstrainedMesh {
     }
 
     fn vertex(&self, parameters: [f64; 2]) -> ParameterVertex {
+        let step = f64::EPSILON * 256.0;
+        let normalized = [0, 1].map(|axis| {
+            let value = (parameters[axis] - self.origin[axis]) / self.scale[axis];
+            (value / step).round() * step
+        });
         ParameterVertex {
-            position: Point2::new(
-                (parameters[0] - self.origin[0]) / self.scale[0],
-                (parameters[1] - self.origin[1]) / self.scale[1],
-            ),
+            position: Point2::new(normalized[0], normalized[1]),
             parameters,
         }
     }
