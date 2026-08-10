@@ -345,7 +345,14 @@ impl Body {
             if !self.surfaces.contains(face.surface) {
                 flaws.push(Flaw::DanglingKey("face names a surface that is gone"));
             }
-            if face.loops.is_empty() {
+            let closed_surface = self.surfaces.get(face.surface).is_some_and(|surface| {
+                match surface {
+                    Surface::Sphere(_) | Surface::Torus(_) => true,
+                    Surface::Nurbs(surface) => surface.periodicity() == [true, true],
+                    _ => false,
+                }
+            });
+            if face.loops.is_empty() && !closed_surface {
                 flaws.push(Flaw::UnboundedFace(key));
             }
             for ring in &face.loops {
@@ -369,7 +376,19 @@ impl Body {
                     .get(ring.coedges[0])
                     .and_then(|coedge| self.edges.get(coedge.edge))
                     .is_some_and(|edge| edge.start == edge.end);
-            if ring.coedges.is_empty() || (ring.coedges.len() < 2 && !closed_alone) {
+            let singular = ring.coedges.is_empty()
+                && self
+                    .faces
+                    .get(ring.owner)
+                    .and_then(|face| self.surfaces.get(face.surface))
+                    .is_some_and(|surface| {
+                        matches!(surface, Surface::Sphere(_))
+                            || matches!(surface, Surface::Cone(cone) if cone.half_angle.tan().abs() > 1e-15)
+                    });
+            if !singular
+                && (ring.coedges.is_empty()
+                    || (ring.coedges.len() < 2 && !closed_alone))
+            {
                 flaws.push(Flaw::DegenerateLoop(key));
                 continue;
             }

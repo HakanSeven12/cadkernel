@@ -560,11 +560,14 @@ fn face_isolines(
     if matches!(surface, super::geometry::Surface::Plane(_)) {
         return Some(Vec::new());
     }
-    let rings = face_rings(body, face, surface, schedules, tolerance)?;
-    let parameters: Vec<Vec<[f64; 2]>> = rings
-        .iter()
-        .map(|ring| ring.iter().map(|point| point.parameters).collect())
-        .collect();
+    let parameters = if let Some(domain) = whole_surface_domain(body, face, surface) {
+        vec![domain_ring(domain)]
+    } else {
+        face_rings(body, face, surface, schedules, tolerance)?
+            .iter()
+            .map(|ring| ring.iter().map(|point| point.parameters).collect())
+            .collect()
+    };
     let Some(bounds) = parameter_bounds(&parameters) else {
         return None;
     };
@@ -856,11 +859,22 @@ fn scheduled_face(
 ) -> Option<Mesh> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
-    if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance) {
-        if band.strip && band.holes.is_empty() {
+    if let Some(domain) = whole_surface_domain(body, face, surface) {
+        return fill_whole_surface(body, face, surface, domain, max_angle, tolerance);
+    }
+    if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance)
+        .or_else(|| scheduled_periodic_band(body, face, surface, schedules, tolerance))
+    {
+        if !band.strip
+            && band.holes.is_empty()
+            && matches!(surface, super::geometry::Surface::Cone(_))
+        {
+            return fill_scheduled_cone_cap(body, face, &band, max_angle, tolerance);
+        }
+        if band.structured && band.strip && band.holes.is_empty() {
             return fill_scheduled_band(body, face, &band, max_angle, tolerance);
         }
-        let mut rings = vec![band.ring()];
+        let mut rings = vec![band.ring_with_seams(surface, max_angle)?];
         rings.extend(band.holes);
         let rings = align_rings(rings, periods(surface));
         return fill_scheduled(body, face, surface, &rings, max_angle, tolerance);
@@ -876,7 +890,9 @@ fn face_rings(
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
     tolerance: f64,
 ) -> Option<Vec<Vec<BoundaryPoint>>> {
-    if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance) {
+    if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance)
+        .or_else(|| scheduled_periodic_band(body, face, surface, schedules, tolerance))
+    {
         let mut rings = vec![band.ring()];
         rings.extend(band.holes);
         return Some(align_rings(rings, periods(surface)));
@@ -1160,6 +1176,7 @@ struct BoundaryBand {
     holes: Vec<Vec<BoundaryPoint>>,
     varying: usize,
     strip: bool,
+    structured: bool,
 }
 
 impl BoundaryBand {
@@ -1167,6 +1184,36 @@ impl BoundaryBand {
         let mut ring = self.low.clone();
         ring.extend(self.high.iter().rev().cloned());
         ring
+    }
+
+    fn ring_with_seams(
+        &self,
+        surface: &super::geometry::Surface,
+        max_angle: f64,
+    ) -> Option<Vec<BoundaryPoint>> {
+        let mut ring = self.low.clone();
+        let end = parameter_seam(
+            surface,
+            self.varying,
+            self.low.last()?,
+            self.high.last()?,
+            max_angle,
+        )?;
+        if end.len() > 2 {
+            ring.extend_from_slice(&end[1..end.len() - 1]);
+        }
+        ring.extend(self.high.iter().rev().cloned());
+        let start = parameter_seam(
+            surface,
+            self.varying,
+            self.high.first()?,
+            self.low.first()?,
+            max_angle,
+        )?;
+        if start.len() > 2 {
+            ring.extend_from_slice(&start[1..start.len() - 1]);
+        }
+        Some(ring)
     }
 }
 
@@ -1197,7 +1244,12 @@ fn scheduled_band(
             let varying = (0..2)
                 .filter(|axis| surface_periods[*axis].is_some())
                 .filter(|axis| {
+                    let period = surface_periods[*axis].unwrap();
                     points.len() > 2
+                        && (points.last().unwrap().parameters[*axis]
+                            - points.first().unwrap().parameters[*axis])
+                            .abs()
+                            >= period * (1.0 - 1e-9)
                         && is_isoparametric_rim(surface, &points, *axis, tolerance)
                 })
                 .max_by(|a, b| {
@@ -1226,8 +1278,16 @@ fn scheduled_band(
     let period = surface_periods[varying]?;
     let fixed = 1 - varying;
     let mut holes = Vec::new();
+    let mut singular_loops = 0;
     for loop_key in &node.loops {
         if candidate_loops.contains(loop_key) {
+            continue;
+        }
+        if body.loops.get(*loop_key)?.coedges.is_empty() {
+            singular_loops += 1;
+            if rims.len() != 1 || singular_loops > 1 {
+                return None;
+            }
             continue;
         }
         let ring = scheduled_loop(body, *loop_key, surface, schedules, tolerance)?;
@@ -1291,23 +1351,29 @@ fn scheduled_band(
     }
     let strip = rims.len() == 2;
     if !strip {
-        let domain = surface_domain(surface)?;
-        let candidates = [domain[fixed][0], domain[fixed][1]];
-        let collapsed = candidates.map(|value| {
-            boundary_collapsed(surface, varying, base, period, fixed, value, tolerance)
-        });
-        let target = match collapsed {
-            [true, false] => candidates[0],
-            [false, true] => candidates[1],
-            [true, true] => {
-                let outward = if node.forward { traversal[0] } else { -traversal[0] };
-                if (varying == 0 && outward > 0.0) || (varying == 1 && outward < 0.0) {
-                    candidates[1]
-                } else {
-                    candidates[0]
+        let target = if let super::geometry::Surface::Cone(cone) = surface {
+            let apex = cone.radius / cone.half_angle.tan();
+            boundary_collapsed(surface, varying, base, period, fixed, apex, tolerance)
+                .then_some(apex)?
+        } else {
+            let domain = surface_domain(surface)?;
+            let candidates = [domain[fixed][0], domain[fixed][1]];
+            let collapsed = candidates.map(|value| {
+                boundary_collapsed(surface, varying, base, period, fixed, value, tolerance)
+            });
+            match collapsed {
+                [true, false] => candidates[0],
+                [false, true] => candidates[1],
+                [true, true] => {
+                    let outward = if node.forward { traversal[0] } else { -traversal[0] };
+                    if (varying == 0 && outward > 0.0) || (varying == 1 && outward < 0.0) {
+                        candidates[1]
+                    } else {
+                        candidates[0]
+                    }
                 }
+                _ => return None,
             }
-            _ => return None,
         };
         let position = surface.point_at(
             if varying == 0 { base } else { target },
@@ -1348,6 +1414,7 @@ fn scheduled_band(
         holes,
         varying,
         strip,
+        structured: true,
     })
 }
 
@@ -1381,6 +1448,174 @@ fn average_parameter(points: &[BoundaryPoint], axis: usize) -> f64 {
     points.iter().map(|point| point.parameters[axis]).sum::<f64>() / points.len() as f64
 }
 
+fn scheduled_periodic_band(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+    schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+    tolerance: f64,
+) -> Option<BoundaryBand> {
+    let node = body.faces.get(face)?;
+    let surface_periods = periods(surface);
+    let rings: Vec<Vec<BoundaryPoint>> = node
+        .loops
+        .iter()
+        .map(|loop_key| scheduled_loop(body, *loop_key, surface, schedules, tolerance))
+        .collect::<Option<_>>()?;
+    for varying in 0..2 {
+        let period = surface_periods[varying]?;
+        let fixed = 1 - varying;
+        let fixed_period = surface_periods[fixed]?;
+        let full: Vec<usize> = rings
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ring)| {
+                let traversal = ring.last()?.parameters[varying]
+                    - ring.first()?.parameters[varying];
+                (traversal.abs() >= period * (1.0 - 1e-9)).then_some(index)
+            })
+            .collect();
+        if full.len() != 2 {
+            continue;
+        }
+        let mut rims = vec![rings[full[0]].clone(), rings[full[1]].clone()];
+        let mut holes: Vec<Vec<BoundaryPoint>> = rings
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ring)| (!full.contains(&index)).then_some(ring.clone()))
+            .collect();
+        let traversal = rims[0].last()?.parameters[varying] - rims[0].first()?.parameters[varying];
+        let base = rims[0].first()?.parameters[varying];
+        let shift = period
+            * ((base - rims[1].first()?.parameters[varying]) / period).round();
+        for point in &mut rims[1] {
+            point.parameters[varying] += shift;
+        }
+        fit_periodic_band(&mut rims, &mut holes, varying, period)?;
+        let mut bounds = [
+            average_parameter(&rims[0], fixed),
+            average_parameter(&rims[1], fixed),
+        ];
+        let outward = if node.forward { traversal } else { -traversal };
+        let positive = (varying == 0 && outward > 0.0) || (varying == 1 && outward < 0.0);
+        let delta = if positive {
+            (bounds[1] - bounds[0]).rem_euclid(fixed_period)
+        } else {
+            -(bounds[0] - bounds[1]).rem_euclid(fixed_period)
+        };
+        let target = bounds[0] + delta;
+        let fixed_shift = target - bounds[1];
+        bounds[1] = target;
+        for point in &mut rims[1] {
+            point.parameters[fixed] += fixed_shift;
+        }
+        let low_index = usize::from(bounds[1] < bounds[0]);
+        let high_index = 1 - low_index;
+        let low = rims.remove(low_index);
+        let high = rims.remove(if high_index > low_index {
+            high_index - 1
+        } else {
+            high_index
+        });
+        return Some(BoundaryBand {
+            low,
+            high,
+            holes,
+            varying,
+            strip: true,
+            structured: false,
+        });
+    }
+    None
+}
+
+fn parameter_seam(
+    surface: &super::geometry::Surface,
+    fixed_axis: usize,
+    from: &BoundaryPoint,
+    to: &BoundaryPoint,
+    max_angle: f64,
+) -> Option<Vec<BoundaryPoint>> {
+    let fixed = 0.5 * (from.parameters[fixed_axis] + to.parameters[fixed_axis]);
+    let varying_axis = 1 - fixed_axis;
+    let mut points = Vec::new();
+    if !sample_parameter_seam(
+        surface,
+        fixed_axis,
+        fixed,
+        from.parameters[varying_axis],
+        to.parameters[varying_axis],
+        max_angle,
+        0,
+        &mut points,
+    ) {
+        return None;
+    }
+    let mut parameters = [0.0; 2];
+    parameters[fixed_axis] = fixed;
+    parameters[varying_axis] = to.parameters[varying_axis];
+    points.push(BoundaryPoint {
+        parameters,
+        position: surface.point_at(parameters[0], parameters[1]),
+    });
+    Some(points)
+}
+
+fn sample_parameter_seam(
+    surface: &super::geometry::Surface,
+    fixed_axis: usize,
+    fixed: f64,
+    from: f64,
+    to: f64,
+    max_angle: f64,
+    depth: u32,
+    points: &mut Vec<BoundaryPoint>,
+) -> bool {
+    let parameters = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
+        .map(|unit| {
+            let mut parameters = [0.0; 2];
+            parameters[fixed_axis] = fixed;
+            parameters[1 - fixed_axis] = from + (to - from) * unit;
+            parameters
+        });
+    if surface_normal_angle(surface, &parameters)
+        .map(|angle| angle > max_angle)
+        .unwrap_or(true)
+    {
+        if depth >= MAX_DEPTH {
+            return false;
+        }
+        let middle = 0.5 * (from + to);
+        return sample_parameter_seam(
+            surface,
+            fixed_axis,
+            fixed,
+            from,
+            middle,
+            max_angle,
+            depth + 1,
+            points,
+        ) && sample_parameter_seam(
+            surface,
+            fixed_axis,
+            fixed,
+            middle,
+            to,
+            max_angle,
+            depth + 1,
+            points,
+        );
+    }
+    let mut parameters = [0.0; 2];
+    parameters[fixed_axis] = fixed;
+    parameters[1 - fixed_axis] = from;
+    points.push(BoundaryPoint {
+        parameters,
+        position: surface.point_at(parameters[0], parameters[1]),
+    });
+    true
+}
+
 fn fit_periodic_band(
     rims: &mut [Vec<BoundaryPoint>],
     holes: &mut [Vec<BoundaryPoint>],
@@ -1409,7 +1644,7 @@ fn fit_periodic_band(
                 .fold(f64::NEG_INFINITY, f64::max);
             let scale = seam.abs().max((seam + period).abs()).max(1.0);
             let epsilon = f64::EPSILON * 128.0 * scale;
-            low >= seam - epsilon && high <= seam + period + epsilon
+            low > seam + epsilon && high < seam + period - epsilon
         });
         fits.then_some((seam, shifts))
     })?;
@@ -1482,6 +1717,38 @@ fn surface_domain(surface: &super::geometry::Surface) -> Option<[[f64; 2]; 2]> {
         }
         _ => None,
     }
+}
+
+fn whole_surface_domain(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+) -> Option<[[f64; 2]; 2]> {
+    if !body.faces.get(face)?.loops.is_empty() {
+        return None;
+    }
+    let closed = match surface {
+        super::geometry::Surface::Sphere(_) | super::geometry::Surface::Torus(_) => true,
+        super::geometry::Surface::Nurbs(surface) => surface.periodicity() == [true, true],
+        _ => false,
+    };
+    if !closed {
+        return None;
+    }
+    let domain = surface_domain(surface)?;
+    domain
+        .iter()
+        .all(|span| span[0].is_finite() && span[1].is_finite() && span[1] > span[0])
+        .then_some(domain)
+}
+
+fn domain_ring(domain: [[f64; 2]; 2]) -> Vec<[f64; 2]> {
+    vec![
+        [domain[0][0], domain[1][0]],
+        [domain[0][1], domain[1][0]],
+        [domain[0][1], domain[1][1]],
+        [domain[0][0], domain[1][1]],
+    ]
 }
 
 fn boundary_collapsed(
@@ -1664,6 +1931,104 @@ fn fill_scheduled_band(
             Some(band.varying),
         ) {
             return None;
+        }
+    }
+    (!mesh.triangles.is_empty()).then_some(mesh)
+}
+
+fn fill_scheduled_cone_cap(
+    body: &Body,
+    face: FaceKey,
+    band: &BoundaryBand,
+    max_angle: f64,
+    tolerance: f64,
+) -> Option<Mesh> {
+    let (rim, singular) = if band.low.len() > band.high.len() {
+        (&band.low, &band.high)
+    } else {
+        (&band.high, &band.low)
+    };
+    let apex = singular.first()?;
+    let fixed = 1 - band.varying;
+    let edges: Vec<EdgeKey> = body
+        .face_coedges(face)
+        .into_iter()
+        .filter_map(|coedge| Some(body.coedges.get(coedge)?.edge))
+        .collect();
+    let boundary_segments: Vec<[[f64; 2]; 2]> = rim
+        .windows(2)
+        .map(|pair| [pair[0].parameters, pair[1].parameters])
+        .collect();
+    let mut mesh = Mesh::default();
+    for pair in rim.windows(2) {
+        let mut tip = apex.parameters;
+        tip[band.varying] =
+            0.5 * (pair[0].parameters[band.varying] + pair[1].parameters[band.varying]);
+        let mut corners = [pair[0].parameters, pair[1].parameters, tip];
+        if tip[fixed] < pair[0].parameters[fixed] {
+            corners.swap(0, 1);
+        }
+        if !refine_scheduled(
+            &mut mesh,
+            body,
+            face,
+            corners,
+            max_angle,
+            0,
+            rim,
+            &boundary_segments,
+            &edges,
+            tolerance,
+            None,
+        ) {
+            return None;
+        }
+    }
+    (!mesh.triangles.is_empty()).then_some(mesh)
+}
+
+fn fill_whole_surface(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+    domain: [[f64; 2]; 2],
+    max_angle: f64,
+    tolerance: f64,
+) -> Option<Mesh> {
+    let sphere = matches!(surface, super::geometry::Surface::Sphere(_));
+    let u_cells = 4;
+    let v_cells = if sphere { 2 } else { 4 };
+    let mut mesh = Mesh::default();
+    for v_index in 0..v_cells {
+        let v0 = domain[1][0]
+            + (domain[1][1] - domain[1][0]) * v_index as f64 / v_cells as f64;
+        let v1 = domain[1][0]
+            + (domain[1][1] - domain[1][0]) * (v_index + 1) as f64 / v_cells as f64;
+        for u_index in 0..u_cells {
+            let u0 = domain[0][0]
+                + (domain[0][1] - domain[0][0]) * u_index as f64 / u_cells as f64;
+            let u1 = domain[0][0]
+                + (domain[0][1] - domain[0][0]) * (u_index + 1) as f64 / u_cells as f64;
+            for corners in [
+                [[u0, v0], [u1, v0], [u0, v1]],
+                [[u1, v0], [u1, v1], [u0, v1]],
+            ] {
+                if !refine_scheduled(
+                    &mut mesh,
+                    body,
+                    face,
+                    corners,
+                    max_angle,
+                    0,
+                    &[],
+                    &[],
+                    &[],
+                    tolerance,
+                    None,
+                ) {
+                    return None;
+                }
+            }
         }
     }
     (!mesh.triangles.is_empty()).then_some(mesh)
