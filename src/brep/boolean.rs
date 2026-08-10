@@ -577,7 +577,11 @@ mod tests {
     /// How much a body encloses once meshed. Positive when it is the right
     /// way out; a shared wall left in twice, or taken out twice, changes it.
     fn volume(solid: &Body) -> f64 {
-        let mesh = super::super::mesh::body(solid, 0.005, 1e-9);
+        let mesh = super::super::mesh::body(
+            solid,
+            crate::tessellation::DEFAULT_ANGLE,
+            1e-9,
+        );
         mesh.triangles
             .iter()
             .map(|triangle| {

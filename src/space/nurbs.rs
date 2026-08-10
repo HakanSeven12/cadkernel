@@ -297,6 +297,46 @@ impl NurbsCurve3 {
         points
     }
 
+    /// Samples by maximum tangent rotation, in radians.
+    pub fn tessellate_angle(&self, max_angle: f64) -> Vec<[f64; 3]> {
+        let max_angle = crate::tessellation::angle(max_angle);
+        let (from, to) = self.domain();
+        let mut boundaries = vec![from];
+        for knot in &self.knots {
+            if *knot > from && *knot < to && boundaries.last() != Some(knot) {
+                boundaries.push(*knot);
+            }
+        }
+        boundaries.push(to);
+        let mut points = vec![self.point_at_knot(from)];
+        for pair in boundaries.windows(2) {
+            self.refine_angle(pair[0], pair[1], max_angle, 0, &mut points);
+        }
+        points
+    }
+
+    fn refine_angle(
+        &self,
+        from: f64,
+        to: f64,
+        max_angle: f64,
+        depth: u32,
+        out: &mut Vec<[f64; 3]>,
+    ) {
+        const MAX_DEPTH: u32 = 16;
+        let directions = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
+            .map(|unit| self.tangent_at_knot(from + (to - from) * unit));
+        let split = depth < 2
+            || crate::tessellation::max_direction_angle(&directions) > max_angle;
+        if split && depth < MAX_DEPTH {
+            let middle = 0.5 * (from + to);
+            self.refine_angle(from, middle, max_angle, depth + 1, out);
+            self.refine_angle(middle, to, max_angle, depth + 1, out);
+        } else {
+            out.push(self.point_at_knot(to));
+        }
+    }
+
     /// Splits a span until its middle sits close enough to the chord.
     fn refine(&self, from: f64, to: f64, tolerance: f64, depth: u32, out: &mut Vec<[f64; 3]>) {
         // Sixteen levels is sixty-five thousand points on one span, which no
@@ -528,12 +568,8 @@ impl NurbsSurface3 {
         )
     }
 
-    /// The unit normal at knot parameters `(u, v)`.
-    ///
-    /// `None` at a point where the net is degenerate — a pole, or a row of
-    /// coincident control points — since there is no plane there to be
-    /// perpendicular to and any answer would be invented.
-    pub fn normal_at_knot(&self, u: f64, v: f64) -> Option<[f64; 3]> {
+    /// Surface tangents at knot parameters `(u, v)`.
+    pub fn tangents_at_knot(&self, u: f64, v: f64) -> Option<([f64; 3], [f64; 3])> {
         let ((u0, u1), (v0, v1)) = self.domain();
         let (u_span, v_span) = (u1 - u0, v1 - v0);
         if u_span <= 0.0 || v_span <= 0.0 {
@@ -544,6 +580,18 @@ impl NurbsSurface3 {
             - Vec3::from(self.point_at_knot((u - du).max(u0), v));
         let along_v = Vec3::from(self.point_at_knot(u, (v + dv).min(v1)))
             - Vec3::from(self.point_at_knot(u, (v - dv).max(v0)));
+        Some((along_u.to_array(), along_v.to_array()))
+    }
+
+    /// The unit normal at knot parameters `(u, v)`.
+    ///
+    /// `None` at a point where the net is degenerate — a pole, or a row of
+    /// coincident control points — since there is no plane there to be
+    /// perpendicular to and any answer would be invented.
+    pub fn normal_at_knot(&self, u: f64, v: f64) -> Option<[f64; 3]> {
+        let (along_u, along_v) = self.tangents_at_knot(u, v)?;
+        let along_u = Vec3::from(along_u);
+        let along_v = Vec3::from(along_v);
         along_u.cross(along_v).normalize().map(Vec3::to_array)
     }
 

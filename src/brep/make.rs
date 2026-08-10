@@ -985,7 +985,7 @@ mod tests {
     /// figure by however much the flat facets cut off — never over, since
     /// every chord lies inside the surface it approximates.
     fn meshed_volume(solid: &Body) -> f64 {
-        let mesh = crate::brep::mesh::body(solid, 0.005, 1e-9);
+        let mesh = crate::brep::mesh::body(solid, crate::tessellation::DEFAULT_ANGLE, 1e-9);
         assert!(!mesh.is_empty(), "nothing meshed");
         mesh.triangles
             .iter()
@@ -1052,7 +1052,11 @@ mod tests {
             (wedge([0.0; 3], 4.0, 3.0, 5.0).unwrap(), Vec3::new(1.0, 1.5, 1.0)),
         ];
         for (solid, inside) in solids {
-            let mesh = crate::brep::mesh::body(&solid, 0.05, 1e-9);
+            let mesh = crate::brep::mesh::body(
+                &solid,
+                crate::tessellation::DEFAULT_ANGLE,
+                1e-9,
+            );
             assert!(!mesh.is_empty(), "nothing meshed");
             for triangle in &mesh.triangles {
                 let corner = Vec3::from(mesh.positions[triangle[0]]);

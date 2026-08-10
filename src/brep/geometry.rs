@@ -131,6 +131,92 @@ impl Surface {
         }
     }
 
+    /// Tangents along the surface's `u` and `v` parameters.
+    pub fn tangents_at(&self, u: f64, v: f64) -> Option<([f64; 3], [f64; 3])> {
+        match self {
+            Self::Plane(plane) => Some((plane.x_axis, plane.y_axis)),
+            Self::Cylinder(cylinder) => Some((
+                cylinder.base.vector_at([
+                    -cylinder.radius * u.sin(),
+                    cylinder.radius * u.cos(),
+                ]),
+                cylinder.base.normal()?,
+            )),
+            Self::Cone(cone) => {
+                let radius = cone.radius - v * cone.half_angle.tan();
+                let radial = cone.base.vector_at([u.cos(), u.sin()]);
+                let along = Vec3::from(cone.base.normal()?)
+                    - Vec3::from(radial) * cone.half_angle.tan();
+                Some((
+                    cone.base
+                        .vector_at([-radius * u.sin(), radius * u.cos()]),
+                    along.to_array(),
+                ))
+            }
+            Self::Sphere(sphere) => {
+                let around = sphere.frame.vector_at([-u.sin(), u.cos()]);
+                let radial = sphere.frame.vector_at([u.cos(), u.sin()]);
+                let normal = Vec3::from(sphere.frame.normal()?);
+                Some((
+                    (Vec3::from(around) * (sphere.radius * v.cos())).to_array(),
+                    (Vec3::from(radial) * (-sphere.radius * v.sin())
+                        + normal * (sphere.radius * v.cos()))
+                        .to_array(),
+                ))
+            }
+            Self::Torus(torus) => {
+                let around = torus.frame.vector_at([-u.sin(), u.cos()]);
+                let radial = torus.frame.vector_at([u.cos(), u.sin()]);
+                let normal = Vec3::from(torus.frame.normal()?);
+                let ring = torus.major_radius + torus.minor_radius * v.cos();
+                Some((
+                    (Vec3::from(around) * ring).to_array(),
+                    (Vec3::from(radial) * (-torus.minor_radius * v.sin())
+                        + normal * (torus.minor_radius * v.cos()))
+                        .to_array(),
+                ))
+            }
+            Self::Nurbs(surface) => surface.tangents_at_knot(u, v),
+        }
+    }
+
+    /// Natural unit normal at `(u, v)`.
+    pub fn normal_at(&self, u: f64, v: f64) -> Option<[f64; 3]> {
+        match self {
+            Self::Plane(plane) => plane.normal(),
+            Self::Cylinder(cylinder) => Vec3::from(
+                cylinder.base.vector_at([u.cos(), u.sin()]),
+            )
+            .normalize()
+            .map(Vec3::to_array),
+            Self::Sphere(sphere) => (Vec3::from(self.point_at(u, v))
+                - Vec3::from(sphere.frame.origin))
+            .normalize()
+            .map(Vec3::to_array),
+            Self::Torus(torus) => {
+                let radial = Vec3::from(torus.frame.vector_at([u.cos(), u.sin()]));
+                let normal = Vec3::from(torus.frame.normal()?);
+                (radial * v.cos() + normal * v.sin())
+                    .normalize()
+                    .map(Vec3::to_array)
+            }
+            Self::Cone(cone) => {
+                let radial = Vec3::from(cone.base.vector_at([u.cos(), u.sin()]));
+                let axis = Vec3::from(cone.base.normal()?);
+                (radial + axis * cone.half_angle.tan())
+                    .normalize()
+                    .map(Vec3::to_array)
+            }
+            Self::Nurbs(_) => {
+                let (along_u, along_v) = self.tangents_at(u, v)?;
+                Vec3::from(along_u)
+                    .cross(Vec3::from(along_v))
+                    .normalize()
+                    .map(Vec3::to_array)
+            }
+        }
+    }
+
     /// The frame a surface's parameters are measured in, for the kinds that
     /// have one. Every variant here does; the accessor exists so a caller can
     /// move a surface without matching on its kind.
@@ -432,6 +518,22 @@ impl Curve3 {
             ]),
             Self::PlanarSpline { plane, curve } => plane.point_at(curve.point_at(t)),
             Self::Nurbs(curve) => curve.point_at_knot(t),
+        }
+    }
+
+    /// Direction of travel at parameter `t`.
+    pub fn tangent_at(&self, t: f64) -> [f64; 3] {
+        match self {
+            Self::Line(line) => line.direction,
+            Self::Circle(circle) => circle
+                .plane
+                .vector_at([-circle.radius * t.sin(), circle.radius * t.cos()]),
+            Self::Ellipse(ellipse) => ellipse.plane.vector_at([
+                -ellipse.major_radius * t.sin(),
+                ellipse.minor_radius * t.cos(),
+            ]),
+            Self::PlanarSpline { plane, curve } => plane.vector_at(curve.derivative_at(t)),
+            Self::Nurbs(curve) => curve.tangent_at_knot(t),
         }
     }
 

@@ -408,7 +408,7 @@ mod tests {
     /// the body's own middle first makes the arithmetic about the body's own
     /// size, which is what is being measured.
     fn volume(body: &Body) -> f64 {
-        let mesh = mesh::body(body, 0.005, 1e-9);
+        let mesh = mesh::body(body, crate::tessellation::DEFAULT_ANGLE, 1e-9);
         if mesh.is_empty() {
             return 0.0;
         }
@@ -495,7 +495,7 @@ mod tests {
         // And it really did move: centred two along x it reached five, and
         // mirrored it reaches one the other way. Read off the mesh, since a
         // sphere is one face wrapping its whole surface and has no box.
-        let mesh = mesh::body(&mirrored, 0.05, 1e-9);
+        let mesh = mesh::body(&mirrored, crate::tessellation::DEFAULT_ANGLE, 1e-9);
         let furthest = mesh
             .positions
             .iter()

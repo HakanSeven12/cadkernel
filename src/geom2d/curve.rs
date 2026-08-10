@@ -371,32 +371,12 @@ impl Curve {
     /// `segments_per_radian` sets how finely curved parts are cut; straight
     /// ones ignore it. Both endpoints are included.
     pub fn tessellate(&self, segments_per_radian: f64) -> Vec<[f64; 2]> {
-        match self {
-            Self::Line(line) => vec![line.start, line.end],
-            Self::Circle(_) | Self::Arc(_) | Self::Ellipse(_) => {
-                let sweep = match self {
-                    Self::Circle(_) => TAU,
-                    Self::Arc(arc) => arc.sweep(),
-                    Self::Ellipse(arc) => arc.sweep(),
-                    _ => unreachable!(),
-                };
-                let count = ((sweep.abs() * segments_per_radian).ceil() as usize).max(4);
-                (0..=count)
-                    .map(|i| self.point_at(i as f64 / count as f64))
-                    .collect()
-            }
-            Self::Polyline(polyline) => tessellate_polyline(polyline, segments_per_radian),
-            Self::Nurbs(curve) => {
-                // A spline has no sweep to measure, so the density is spent
-                // per knot span instead — which is where its shape changes.
-                let per_span = ((segments_per_radian / 4.0).ceil() as usize).max(2);
-                curve.tessellate(per_span)
-            }
-            // Only the stretch the parameter calls `0..=1`. An unbounded curve
-            // has no finite polyline, so clipping it to something visible is
-            // the caller's decision, not this one's.
-            Self::Ray(_) | Self::XLine(_) => vec![self.point_at(0.0), self.point_at(1.0)],
-        }
+        let max_angle = if segments_per_radian.is_finite() && segments_per_radian > 0.0 {
+            1.0 / segments_per_radian
+        } else {
+            crate::tessellation::DEFAULT_ANGLE
+        };
+        self.tessellate_angle(max_angle)
     }
 }
 
@@ -484,31 +464,6 @@ fn parameter_on_polyline(polyline: &Polyline, point: [f64; 2]) -> f64 {
         }
     }
     best.1
-}
-
-fn tessellate_polyline(polyline: &Polyline, segments_per_radian: f64) -> Vec<[f64; 2]> {
-    let count = polyline_segment_count(polyline);
-    if count == 0 {
-        return polyline.vertices.iter().map(|v| v.position).collect();
-    }
-    let vertices = polyline.vertices.len();
-    let mut out = Vec::new();
-    for index in 0..count {
-        let start = polyline.vertices[index].position;
-        match polyline.segment_arc(index) {
-            Some(arc) => {
-                let steps = ((arc.sweep.abs() * segments_per_radian).ceil() as usize).max(2);
-                for step in 0..steps {
-                    out.push(arc.sample(step as f64 / steps as f64));
-                }
-            }
-            None => out.push(start),
-        }
-    }
-    // Close the chain: the far end of the last segment.
-    let last = polyline.vertices[if polyline.closed { 0 } else { vertices - 1 }].position;
-    out.push(last);
-    out
 }
 
 #[cfg(test)]

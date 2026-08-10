@@ -1087,7 +1087,11 @@ mod tests {
     #[test]
     fn every_wall_faces_out() {
         let solid = extrude(Plane::XY, &square(10.0), [0.0, 0.0, 4.0]).unwrap();
-        let mesh = crate::brep::mesh::body(&solid, 0.01, 1e-9);
+        let mesh = crate::brep::mesh::body(
+            &solid,
+            crate::tessellation::DEFAULT_ANGLE,
+            1e-9,
+        );
         let centre = Vec3::new(5.0, 5.0, 2.0);
         for triangle in &mesh.triangles {
             let corner = Vec3::from(mesh.positions[triangle[0]]);
@@ -1111,7 +1115,7 @@ mod tests {
     /// It also says how much, so a test can check the shape as well as the
     /// direction.
     fn volume(solid: &Body) -> f64 {
-        let mesh = crate::brep::mesh::body(solid, 0.005, 1e-9);
+        let mesh = crate::brep::mesh::body(solid, crate::tessellation::DEFAULT_ANGLE, 1e-9);
         assert!(!mesh.is_empty(), "nothing meshed");
         mesh.triangles
             .iter()

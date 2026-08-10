@@ -62,6 +62,61 @@ const MAXIMUM_SEGMENTS: usize = 16_384;
 const MAX_DEPTH: u32 = 16;
 
 impl Curve {
+    /// Samples the curve so its direction changes by at most `max_angle`
+    /// radians across each segment.
+    pub fn tessellate_angle(&self, max_angle: f64) -> Vec<[f64; 2]> {
+        let max_angle = crate::tessellation::angle(max_angle);
+        match self {
+            Self::Line(line) => vec![line.start, line.end],
+            Self::Ray(_) | Self::XLine(_) => vec![self.point_at(0.0), self.point_at(1.0)],
+            Self::Circle(_) => sample_uniformly(self, angular_steps(TAU, max_angle)),
+            Self::Arc(arc) => sample_uniformly(self, angular_steps(arc.sweep(), max_angle)),
+            Self::Ellipse(_) => angular_curve(self, &[0.0, 1.0], max_angle, 0),
+            Self::Polyline(_) => self.polyline_angle(max_angle),
+            Self::Nurbs(curve) => {
+                let wrapped = Self::Nurbs(curve.clone());
+                angular_curve(&wrapped, &span_boundaries(curve), max_angle, 2)
+            }
+        }
+    }
+
+    fn polyline_angle(&self, max_angle: f64) -> Vec<[f64; 2]> {
+        let Self::Polyline(polyline) = self else {
+            return Vec::new();
+        };
+        let count = polyline.vertices.len();
+        let segments = if polyline.closed {
+            count
+        } else {
+            count.saturating_sub(1)
+        };
+        let mut out = Vec::new();
+        for index in 0..segments {
+            let next = (index + 1) % count;
+            let mut points = match polyline.segment_arc(index) {
+                Some(arc) => arc.tessellate_angle(max_angle),
+                None => vec![
+                    polyline.vertices[index].position,
+                    polyline.vertices[next].position,
+                ],
+            };
+            if let (Some(first), Some(vertex)) =
+                (points.first_mut(), polyline.vertices.get(index))
+            {
+                *first = vertex.position;
+            }
+            if let (Some(last), Some(vertex)) = (
+                points.last_mut(),
+                polyline.vertices.get(next),
+            ) {
+                *last = vertex.position;
+            }
+            let skip = usize::from(out.last() == points.first());
+            out.extend_from_slice(&points[skip..]);
+        }
+        out
+    }
+
     /// Samples the curve so that no chord departs from it by more than
     /// `tolerance`, in the curve's own units.
     ///
@@ -118,6 +173,72 @@ impl Curve {
             out.extend_from_slice(&points[skip..]);
         }
         out
+    }
+}
+
+fn angular_steps(sweep: f64, max_angle: f64) -> usize {
+    (sweep.abs() / max_angle).ceil().max(1.0) as usize
+}
+
+fn angular_curve(
+    curve: &Curve,
+    boundaries: &[f64],
+    max_angle: f64,
+    minimum_depth: u32,
+) -> Vec<[f64; 2]> {
+    let Some(first) = boundaries.first().copied() else {
+        return Vec::new();
+    };
+    let mut out = vec![curve.point_at(first)];
+    for pair in boundaries.windows(2) {
+        subdivide_angle(
+            curve,
+            pair[0],
+            pair[1],
+            max_angle,
+            minimum_depth,
+            0,
+            &mut out,
+        );
+    }
+    out
+}
+
+fn subdivide_angle(
+    curve: &Curve,
+    from: f64,
+    to: f64,
+    max_angle: f64,
+    minimum_depth: u32,
+    depth: u32,
+    out: &mut Vec<[f64; 2]>,
+) {
+    let directions = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
+        .map(|unit| curve.tangent_at(from + (to - from) * unit));
+    let split = depth < minimum_depth
+        || crate::tessellation::max_direction_angle(&directions) > max_angle;
+    if split && depth < MAX_DEPTH {
+        let middle = 0.5 * (from + to);
+        subdivide_angle(
+            curve,
+            from,
+            middle,
+            max_angle,
+            minimum_depth,
+            depth + 1,
+            out,
+        );
+        subdivide_angle(
+            curve,
+            middle,
+            to,
+            max_angle,
+            minimum_depth,
+            depth + 1,
+            out,
+        );
+    } else {
+        out.push(curve.point_at(to));
     }
 }
 

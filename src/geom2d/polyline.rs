@@ -96,6 +96,15 @@ impl BulgeArc {
             self.center[1] + self.radius * angle.sin(),
         ]
     }
+
+    /// Samples by maximum change of direction, in radians.
+    pub fn tessellate_angle(&self, max_angle: f64) -> Vec<[f64; 2]> {
+        let max_angle = crate::tessellation::angle(max_angle);
+        let segments = (self.sweep.abs() / max_angle).ceil().max(1.0) as usize;
+        (0..=segments)
+            .map(|index| self.sample(index as f64 / segments as f64))
+            .collect()
+    }
 }
 
 /// One vertex, and the shape of the segment leaving it.

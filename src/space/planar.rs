@@ -62,6 +62,15 @@ impl PlanarCurve {
         flat.into_iter().map(|uv| self.lower(uv)).collect()
     }
 
+    /// Samples by maximum change of direction, in radians.
+    pub fn tessellate_angle(&self, max_angle: f64) -> Vec<[f64; 3]> {
+        self.curve
+            .tessellate_angle(max_angle)
+            .into_iter()
+            .map(|uv| self.lower(uv))
+            .collect()
+    }
+
     /// Samples the curve into world-space points, cut so that no chord
     /// departs from it by more than `tolerance`.
     ///

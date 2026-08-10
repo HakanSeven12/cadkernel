@@ -69,27 +69,16 @@ impl Mesh {
 /// One tolerance policy for a body's faces and edges.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TessellationTolerance {
-    pub chord: f64,
+    pub angle: f64,
     pub linear: f64,
-    relative: bool,
     isolines: usize,
 }
 
 impl TessellationTolerance {
-    pub fn new(chord: f64, linear: f64) -> Self {
+    pub fn new(angle: f64, linear: f64) -> Self {
         Self {
-            chord: finite_positive(chord, DEFAULT_SAG),
+            angle: crate::tessellation::angle(angle),
             linear: finite_positive(linear, 1e-9),
-            relative: false,
-            isolines: 0,
-        }
-    }
-
-    pub fn relative(chord_fraction: f64, linear: f64) -> Self {
-        Self {
-            chord: finite_positive(chord_fraction, 0.002),
-            linear: finite_positive(linear, 1e-9),
-            relative: true,
             isolines: 0,
         }
     }
@@ -99,13 +88,6 @@ impl TessellationTolerance {
         self
     }
 
-    fn resolve(self, scale: f64) -> f64 {
-        if self.relative {
-            finite_positive(scale, 1.0) * self.chord
-        } else {
-            self.chord
-        }
-    }
 }
 
 /// Tessellation of one topological edge.
@@ -123,7 +105,7 @@ pub struct BodyMesh {
     pub triangle_faces: Vec<FaceKey>,
     pub edges: Vec<EdgeMesh>,
     pub isolines: Vec<FacePolyline>,
-    pub chord: f64,
+    pub precision: f64,
     pub missing_faces: Vec<FaceKey>,
 }
 
@@ -142,7 +124,7 @@ pub struct SurfaceMesh {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SilhouetteSource {
     sides: Vec<SilhouetteSide>,
-    chord: f64,
+    precision: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,13 +148,13 @@ impl BodyMesh {
                 })
             })
             .collect::<Vec<_>>();
-        silhouette_source(&self.mesh, &triangle_groups, self.chord)
+        silhouette_source(&self.mesh, &triangle_groups, self.precision)
     }
 }
 
 impl SurfaceMesh {
-    pub fn silhouette_source(&self, chord: f64) -> SilhouetteSource {
-        silhouette_source(&self.mesh, &vec![0; self.mesh.triangles.len()], chord)
+    pub fn silhouette_source(&self, precision: f64) -> SilhouetteSource {
+        silhouette_source(&self.mesh, &vec![0; self.mesh.triangles.len()], precision)
     }
 }
 
@@ -191,7 +173,7 @@ pub fn silhouette(source: &SilhouetteSource, view_direction: [f64; 3]) -> Vec<[f
     out
 }
 
-fn silhouette_source(mesh: &Mesh, triangle_groups: &[u64], chord: f64) -> SilhouetteSource {
+fn silhouette_source(mesh: &Mesh, triangle_groups: &[u64], precision: f64) -> SilhouetteSource {
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     struct Point([i64; 3]);
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -200,7 +182,7 @@ fn silhouette_source(mesh: &Mesh, triangle_groups: &[u64], chord: f64) -> Silhou
         a: Point,
         b: Point,
     }
-    let precision = chord.max(1e-9) * 1e-6;
+    let precision = precision.max(1e-12);
     let origin = mesh.positions.first().copied().unwrap_or([0.0; 3]);
     let point_key = |point: [f64; 3]| {
         Point([0, 1, 2].map(|axis| ((point[axis] - origin[axis]) / precision).round() as i64))
@@ -237,7 +219,7 @@ fn silhouette_source(mesh: &Mesh, triangle_groups: &[u64], chord: f64) -> Silhou
             }
         }
     }
-    SilhouetteSource { sides, chord }
+    SilhouetteSource { sides, precision }
 }
 
 pub fn transform_silhouette(
@@ -296,7 +278,7 @@ pub fn transform_silhouette_affine(
             *normal = moved.normalize()?.to_array();
         }
     }
-    out.chord *= stretch;
+    out.precision *= stretch;
     Some(out)
 }
 
@@ -309,14 +291,14 @@ impl BodyMesh {
 pub fn sweep_surface(
     profile: &crate::space::PlanarCurve,
     path: &crate::space::PlanarCurve,
-    tolerance: f64,
+    max_angle: f64,
 ) -> Option<SurfaceMesh> {
     if path.curve.is_closed() {
         return None;
     }
     let closed = profile.curve.is_closed();
-    let outline = open_samples(curve_samples(profile, tolerance)?, closed);
-    let track = open_samples(curve_samples(path, tolerance)?, false);
+    let outline = open_samples(curve_samples(profile, max_angle), closed);
+    let track = open_samples(curve_samples(path, max_angle), false);
     if outline.len() < 2 || track.len() < 2 {
         return None;
     }
@@ -336,7 +318,7 @@ pub fn sweep_surface(
 
 pub fn loft_surface(
     profiles: &[crate::space::PlanarCurve],
-    tolerance: f64,
+    max_angle: f64,
 ) -> Option<SurfaceMesh> {
     if profiles.len() < 2 {
         return None;
@@ -346,7 +328,7 @@ pub fn loft_surface(
         .iter()
         .map(|profile| {
             Some(open_samples(
-                curve_samples(profile, tolerance)?,
+                curve_samples(profile, max_angle),
                 profile.curve.is_closed(),
             ))
         })
@@ -426,35 +408,9 @@ fn open_samples(mut points: Vec<[f64; 3]>, closed: bool) -> Vec<[f64; 3]> {
 
 fn curve_samples(
     curve: &crate::space::PlanarCurve,
-    tolerance: f64,
-) -> Option<Vec<[f64; 3]>> {
-    let points = curve.tessellate_within(tolerance);
-    for pair in points.windows(2) {
-        let from = curve.parameter_at(pair[0])?;
-        let mut to = curve.parameter_at(pair[1])?;
-        if curve.curve.is_closed() && to < from {
-            to += 1.0;
-        }
-        let start = Vec3::from(pair[0]);
-        let end = Vec3::from(pair[1]);
-        let chord = end - start;
-        let square = chord.length_squared();
-        for step in 1..8 {
-            let parameter = from + (to - from) * step as f64 / 8.0;
-            let parameter = if parameter > 1.0 { parameter - 1.0 } else { parameter };
-            let point = Vec3::from(curve.point_at(parameter));
-            let unit = if square > 0.0 {
-                (point - start).dot(chord) / square
-            } else {
-                0.0
-            }
-            .clamp(0.0, 1.0);
-            if point.distance(start.lerp(end, unit)) > tolerance {
-                return None;
-            }
-        }
-    }
-    Some(points)
+    max_angle: f64,
+) -> Vec<[f64; 3]> {
+    curve.tessellate_angle(max_angle)
 }
 
 fn resample_ring(points: &[[f64; 3]], count: usize, closed: bool) -> Vec<[f64; 3]> {
@@ -534,15 +490,25 @@ fn emit_points(mesh: &mut Mesh, a: [f64; 3], b: [f64; 3], c: [f64; 3]) {
 
 /// Tessellates faces and edges from one shared sample schedule.
 pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
-    let sag = tolerance.resolve(body_span(body));
     let schedules: HashMap<EdgeKey, Vec<super::place::EdgeSample>> = body
         .edge_keys()
-        .filter_map(|edge| Some((edge, shared_edge_samples(body, edge, sag, tolerance.linear)?)))
+        .filter_map(|edge| {
+            Some((
+                edge,
+                shared_edge_samples(body, edge, tolerance.angle, tolerance.linear)?,
+            ))
+        })
         .collect();
     let mut out = BodyMesh::default();
-    out.chord = sag;
+    out.precision = tolerance.linear;
     for face_key in body.face_keys() {
-        match scheduled_face(body, face_key, sag, tolerance.linear, &schedules) {
+        match scheduled_face(
+            body,
+            face_key,
+            tolerance.angle,
+            tolerance.linear,
+            &schedules,
+        ) {
             Some(mesh) => {
                 out.triangle_faces
                     .extend(std::iter::repeat(face_key).take(mesh.triangles.len()));
@@ -551,7 +517,7 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
                     match face_isolines(
                         body,
                         face_key,
-                        sag,
+                        tolerance.angle,
                         tolerance.linear,
                         tolerance.isolines,
                         &schedules,
@@ -582,7 +548,7 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
 fn face_isolines(
     body: &Body,
     face: FaceKey,
-    sag: f64,
+    max_angle: f64,
     tolerance: f64,
     count: usize,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
@@ -622,7 +588,7 @@ fn face_isolines(
                     fixed,
                     interval[0],
                     interval[1],
-                    sag,
+                    max_angle,
                     0,
                     &mut points,
                 ) {
@@ -692,7 +658,7 @@ fn sample_isoline(
     fixed: f64,
     from: f64,
     to: f64,
-    sag: f64,
+    max_angle: f64,
     depth: u32,
     points: &mut Vec<[f64; 3]>,
 ) -> bool {
@@ -703,25 +669,45 @@ fn sample_isoline(
         surface.point_at(parameters[0], parameters[1])
     };
     let middle = 0.5 * (from + to);
-    let start = Vec3::from(at(from));
-    let end = Vec3::from(at(to));
-    let split = [0.25, 0.5, 0.75].into_iter().any(|unit| {
-        start
-            .lerp(end, unit)
-            .distance(Vec3::from(at(from + (to - from) * unit)))
-            > sag
-    });
+    let directions = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
+        .map(|unit| {
+            let mut parameters = [0.0; 2];
+            parameters[fixed_axis] = fixed;
+            parameters[1 - fixed_axis] = from + (to - from) * unit;
+            surface
+                .tangents_at(parameters[0], parameters[1])
+                .map(|tangents| if fixed_axis == 0 { tangents.1 } else { tangents.0 })
+                .unwrap_or([0.0; 3])
+        });
+    let split = crate::tessellation::max_direction_angle(&directions) > max_angle;
     if split {
         if depth >= MAX_DEPTH {
             return false;
         }
-        if !sample_isoline(surface, fixed_axis, fixed, from, middle, sag, depth + 1, points)
-            || !sample_isoline(surface, fixed_axis, fixed, middle, to, sag, depth + 1, points)
+        if !sample_isoline(
+            surface,
+            fixed_axis,
+            fixed,
+            from,
+            middle,
+            max_angle,
+            depth + 1,
+            points,
+        ) || !sample_isoline(
+            surface,
+            fixed_axis,
+            fixed,
+            middle,
+            to,
+            max_angle,
+            depth + 1,
+            points,
+        )
         {
             return false;
         }
     } else {
-        points.push(start.to_array());
+        points.push(at(from));
     }
     true
 }
@@ -734,39 +720,10 @@ fn finite_positive(value: f64, fallback: f64) -> f64 {
     }
 }
 
-fn body_span(body: &Body) -> f64 {
-    let mut low = [f64::INFINITY; 3];
-    let mut high = [f64::NEG_INFINITY; 3];
-    let mut include = |point: [f64; 3]| {
-        for axis in 0..3 {
-            low[axis] = low[axis].min(point[axis]);
-            high[axis] = high[axis].max(point[axis]);
-        }
-    };
-    for (_, vertex) in body.vertices.iter() {
-        include(vertex.point);
-    }
-    for (_, edge) in body.edges.iter() {
-        let Some(curve) = body.curves.get(edge.curve) else {
-            continue;
-        };
-        for step in 0..=32 {
-            let parameter = edge.start_parameter
-                + (edge.end_parameter - edge.start_parameter) * step as f64 / 32.0;
-            include(curve.point_at(parameter));
-        }
-    }
-    (0..3)
-        .map(|axis| high[axis] - low[axis])
-        .filter(|span| span.is_finite())
-        .fold(0.0_f64, f64::max)
-        .max(1e-9)
-}
-
 fn shared_edge_samples(
     body: &Body,
     edge_key: EdgeKey,
-    sag: f64,
+    max_angle: f64,
     tolerance: f64,
 ) -> Option<Vec<super::place::EdgeSample>> {
     let edge = body.edges.get(edge_key)?;
@@ -780,7 +737,7 @@ fn shared_edge_samples(
         edge_key,
         edge.start_parameter,
         edge.end_parameter,
-        sag.max(1e-12),
+        crate::tessellation::angle(max_angle),
         tolerance.max(1e-12),
         0,
         &mut samples,
@@ -797,7 +754,7 @@ fn refine_edge(
     edge_key: EdgeKey,
     from: f64,
     to: f64,
-    sag: f64,
+    max_angle: f64,
     tolerance: f64,
     depth: u32,
     samples: &mut Vec<super::place::EdgeSample>,
@@ -805,15 +762,10 @@ fn refine_edge(
     let edge = body.edges.get(edge_key)?;
     let curve = body.curves.get(edge.curve)?;
     let middle = 0.5 * (from + to);
-    let start = Vec3::from(curve.point_at(from));
-    let end = Vec3::from(curve.point_at(to));
     let curved = Vec3::from(curve.point_at(middle));
-    let mut split = [0.25, 0.5, 0.75].into_iter().any(|unit| {
-        start
-            .lerp(end, unit)
-            .distance(Vec3::from(curve.point_at(from + (to - from) * unit)))
-            > sag
-    });
+    let directions = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
+        .map(|unit| curve.tangent_at(from + (to - from) * unit));
+    let mut split = crate::tessellation::max_direction_angle(&directions) > max_angle;
     for coedge_key in &edge.coedges {
         let Some((surface, pcurve, reversed)) = coedge_geometry(body, *coedge_key)
         else {
@@ -828,27 +780,51 @@ fn refine_edge(
             let uv = pcurve.point_at(unit);
             surface.point_at(uv[0], uv[1])
         };
-        let flat_start = Vec3::from(at(from));
-        let flat_end = Vec3::from(at(to));
-        for unit in [0.25, 0.5, 0.75] {
+        let mut normals = Vec::with_capacity(9);
+        for unit in [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0] {
             let parameter = from + (to - from) * unit;
             let on_surface = Vec3::from(at(parameter));
             if on_surface.distance(Vec3::from(curve.point_at(parameter))) > tolerance {
                 return None;
             }
-            split |= flat_start.lerp(flat_end, unit).distance(on_surface) > sag;
+            let mut along = (parameter - edge.start_parameter)
+                / (edge.end_parameter - edge.start_parameter);
+            if reversed {
+                along = 1.0 - along;
+            }
+            let uv = pcurve.point_at(along);
+            normals.push(surface.normal_at(uv[0], uv[1])?);
         }
+        split |= crate::tessellation::max_direction_angle(&normals) > max_angle;
     }
     if split {
         if depth >= MAX_DEPTH {
             return None;
         }
-        refine_edge(body, edge_key, from, middle, sag, tolerance, depth + 1, samples)?;
+        refine_edge(
+            body,
+            edge_key,
+            from,
+            middle,
+            max_angle,
+            tolerance,
+            depth + 1,
+            samples,
+        )?;
         samples.push(super::place::EdgeSample {
             parameter: middle,
             position: curved.to_array(),
         });
-        refine_edge(body, edge_key, middle, to, sag, tolerance, depth + 1, samples)?;
+        refine_edge(
+            body,
+            edge_key,
+            middle,
+            to,
+            max_angle,
+            tolerance,
+            depth + 1,
+            samples,
+        )?;
     }
     Some(())
 }
@@ -877,14 +853,19 @@ struct BoundaryPoint {
 fn scheduled_face(
     body: &Body,
     face: FaceKey,
-    sag: f64,
+    max_angle: f64,
     tolerance: f64,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
 ) -> Option<Mesh> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
+    if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance) {
+        if band.strip {
+            return fill_scheduled_band(body, face, &band, max_angle, tolerance);
+        }
+    }
     let rings = face_rings(body, face, surface, schedules, tolerance)?;
-    fill_scheduled(body, face, surface, &rings, sag, tolerance)
+    fill_scheduled(body, face, surface, &rings, max_angle, tolerance)
 }
 
 fn face_rings(
@@ -894,12 +875,15 @@ fn face_rings(
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
     tolerance: f64,
 ) -> Option<Vec<Vec<BoundaryPoint>>> {
+    if let Some(band) = scheduled_band(body, face, surface, schedules, tolerance) {
+        return Some(vec![band.ring()]);
+    }
     if let Some(rings) = scheduled_rings(body, face, surface, schedules, tolerance) {
         if rings.iter().any(|ring| boundary_area(ring)) {
             return Some(align_rings(rings, periods(surface)));
         }
     }
-    scheduled_band(body, face, surface, schedules, tolerance).map(|ring| vec![ring])
+    None
 }
 
 fn scheduled_rings(
@@ -941,11 +925,17 @@ fn chain_samples(
     let (first, pcurve) = pieces.next()?;
     let mut points = parameterize_samples(surface, &first, pcurve)?;
     unwrap_boundary(&mut points, periods(surface));
-    for (samples, pcurve) in pieces {
+    let mut pieces = pieces.peekable();
+    while let Some((samples, pcurve)) = pieces.next() {
         let head = points.last()?.position;
         let mut next = parameterize_samples(surface, &samples, pcurve)?;
         unwrap_boundary(&mut next, periods(surface));
-        align_parameters(&mut next, &points, periods(surface));
+        align_parameters(
+            &mut next,
+            &points,
+            periods(surface),
+            pieces.peek().is_none(),
+        );
         if distance3(head, next[0].position) > tolerance {
             return None;
         }
@@ -1096,7 +1086,12 @@ fn parameterize_samples(
     parameterize(surface, &positions)
 }
 
-fn align_parameters(points: &mut [BoundaryPoint], chain: &[BoundaryPoint], periods: [Option<f64>; 2]) {
+fn align_parameters(
+    points: &mut [BoundaryPoint],
+    chain: &[BoundaryPoint],
+    periods: [Option<f64>; 2],
+    closes_ring: bool,
+) {
     let Some(first) = points.first() else {
         return;
     };
@@ -1111,7 +1106,8 @@ fn align_parameters(points: &mut [BoundaryPoint], chain: &[BoundaryPoint], perio
             let moved_last = [last[0] + across, last[1] + along];
             if behind.is_some_and(|pair| {
                 parameter_near(moved_first, pair[1]) && parameter_near(moved_last, pair[0])
-            }) || (parameter_near(moved_first, previous)
+            }) || (!closes_ring
+                && parameter_near(moved_first, previous)
                 && chain
                     .first()
                     .is_some_and(|first| parameter_near(moved_last, first.parameters)))
@@ -1145,46 +1141,66 @@ fn parameter_near(a: [f64; 2], b: [f64; 2]) -> bool {
     (a[0] - b[0]).hypot(a[1] - b[1]) <= f64::EPSILON * 64.0 * scale
 }
 
+struct BoundaryBand {
+    low: Vec<BoundaryPoint>,
+    high: Vec<BoundaryPoint>,
+    varying: usize,
+    strip: bool,
+}
+
+impl BoundaryBand {
+    fn ring(&self) -> Vec<BoundaryPoint> {
+        let mut ring = self.low.clone();
+        ring.extend(self.high.iter().rev().cloned());
+        ring
+    }
+}
+
 fn scheduled_band(
     body: &Body,
     face: FaceKey,
     surface: &super::geometry::Surface,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
     tolerance: f64,
-) -> Option<Vec<BoundaryPoint>> {
+) -> Option<BoundaryBand> {
     let node = body.faces.get(face)?;
-    if !(1..=2).contains(&node.loops.len()) {
-        return None;
-    }
     let surface_periods = periods(surface);
-    let mut rims = Vec::with_capacity(node.loops.len());
+    let mut candidates = Vec::new();
+    let mut refined_side = false;
     for loop_key in &node.loops {
         let ring = body.loops.get(*loop_key)?;
-        let [coedge_key] = ring.coedges[..] else {
-            return None;
-        };
-        let coedge = body.coedges.get(coedge_key)?;
-        let mut samples = schedules.get(&coedge.edge)?.clone();
-        if !coedge.forward {
-            samples.reverse();
+        for coedge_key in &ring.coedges {
+            let coedge = body.coedges.get(*coedge_key)?;
+            let mut samples = schedules.get(&coedge.edge)?.clone();
+            if !coedge.forward {
+                samples.reverse();
+            }
+            let mut points = parameterize_samples(surface, &samples, coedge.pcurve.as_ref())?;
+            unwrap_boundary(&mut points, surface_periods);
+            let varying = (0..2)
+                .filter_map(|axis| {
+                    let period = surface_periods[axis]?;
+                    (parameter_range(&points, axis) >= period * 0.5).then_some(axis)
+                })
+                .max_by(|a, b| {
+                    parameter_range(&points, *a).total_cmp(&parameter_range(&points, *b))
+                });
+            if let Some(varying) = varying {
+                candidates.push((varying, points));
+            } else {
+                refined_side |= samples.len() > 2;
+            }
         }
-        let mut points = parameterize_samples(surface, &samples, coedge.pcurve.as_ref())?;
-        unwrap_boundary(&mut points, surface_periods);
-        rims.push(points);
     }
-    let varying = (0..2)
-        .filter(|axis| surface_periods[*axis].is_some())
-        .max_by(|a, b| {
-            parameter_range(&rims[0], *a)
-                .total_cmp(&parameter_range(&rims[0], *b))
-        })?;
-    let period = surface_periods[varying]?;
-    if rims
-        .iter()
-        .any(|rim| parameter_range(rim, varying) < period * 0.5)
-    {
+    if !(1..=2).contains(&candidates.len()) || refined_side {
         return None;
     }
+    let varying = candidates[0].0;
+    if candidates.iter().any(|(axis, _)| *axis != varying) {
+        return None;
+    }
+    let mut rims: Vec<_> = candidates.into_iter().map(|(_, rim)| rim).collect();
+    let period = surface_periods[varying]?;
     let fixed = 1 - varying;
     let traversal: Vec<f64> = rims
         .iter()
@@ -1234,7 +1250,8 @@ fn scheduled_band(
             }
         }
     }
-    if rims.len() == 1 {
+    let strip = rims.len() == 2;
+    if !strip {
         let domain = surface_domain(surface)?;
         let candidates = [domain[fixed][0], domain[fixed][1]];
         let collapsed = candidates.map(|value| {
@@ -1286,9 +1303,12 @@ fn scheduled_band(
     for point in &mut high {
         point.parameters[fixed] = high_fixed;
     }
-    high.reverse();
-    low.extend(high);
-    Some(low)
+    Some(BoundaryBand {
+        low,
+        high,
+        varying,
+        strip,
+    })
 }
 
 fn unwrap_boundary(points: &mut [BoundaryPoint], periods: [Option<f64>; 2]) {
@@ -1419,33 +1439,104 @@ fn parameter_in_span(
         .then_some(parameter)
 }
 
-/// How far a triangle's middle may sit from the surface before it is split.
-///
-/// Only curved faces are ever split; a plane's triangles are exact whatever
-/// this is.
-const DEFAULT_SAG: f64 = 0.01;
-
 /// Recursion guard; tolerance normally stops first.
 const MAX_DEPTH: u32 = 16;
 
 /// Triangulates a whole body.
 ///
-/// `sag` is how far a triangle may depart from the surface it lies on. A
-/// caller rendering at a known zoom passes its own; the default is fine for
-/// a drawing measured in millimetres.
-pub fn body(body: &Body, sag: f64, tolerance: f64) -> Mesh {
-    tessellate(body, TessellationTolerance::new(sag, tolerance)).mesh
+/// `max_angle` is the largest change of direction, in radians.
+pub fn body(body: &Body, max_angle: f64, tolerance: f64) -> Mesh {
+    tessellate(body, TessellationTolerance::new(max_angle, tolerance)).mesh
 }
 
 /// Triangulates one face.
 ///
 /// `None` when its canonical edge schedule cannot be mapped to the surface.
-pub fn face(body: &Body, face: FaceKey, sag: f64, tolerance: f64) -> Option<Mesh> {
+pub fn face(body: &Body, face: FaceKey, max_angle: f64, tolerance: f64) -> Option<Mesh> {
     let schedules: HashMap<EdgeKey, Vec<super::place::EdgeSample>> = body
         .edge_keys()
-        .filter_map(|edge| Some((edge, shared_edge_samples(body, edge, sag, tolerance)?)))
+        .filter_map(|edge| {
+            Some((
+                edge,
+                shared_edge_samples(body, edge, max_angle, tolerance)?,
+            ))
+        })
         .collect();
-    scheduled_face(body, face, sag, tolerance, &schedules)
+    scheduled_face(body, face, max_angle, tolerance, &schedules)
+}
+
+fn fill_scheduled_band(
+    body: &Body,
+    face: FaceKey,
+    band: &BoundaryBand,
+    max_angle: f64,
+    tolerance: f64,
+) -> Option<Mesh> {
+    let mut pins = band.low.clone();
+    pins.extend(band.high.iter().cloned());
+    let mut boundary_segments: Vec<[[f64; 2]; 2]> = band
+        .low
+        .windows(2)
+        .chain(band.high.windows(2))
+        .map(|pair| [pair[0].parameters, pair[1].parameters])
+        .collect();
+    boundary_segments.extend([
+        [band.low.first()?.parameters, band.high.first()?.parameters],
+        [band.low.last()?.parameters, band.high.last()?.parameters],
+    ]);
+    let edges: Vec<EdgeKey> = body
+        .face_coedges(face)
+        .into_iter()
+        .filter_map(|coedge| Some(body.coedges.get(coedge)?.edge))
+        .collect();
+    let mut lower = 0;
+    let mut upper = 0;
+    let mut triangles = Vec::new();
+    while lower + 1 < band.low.len() || upper + 1 < band.high.len() {
+        let take_lower = upper + 1 >= band.high.len()
+            || (lower + 1 < band.low.len()
+                && band.low[lower + 1].parameters[band.varying]
+                    <= band.high[upper + 1].parameters[band.varying]);
+        let mut corners = if take_lower {
+            let corners = [
+                band.low[lower].parameters,
+                band.low[lower + 1].parameters,
+                band.high[upper].parameters,
+            ];
+            lower += 1;
+            corners
+        } else {
+            let corners = [
+                band.low[lower].parameters,
+                band.high[upper + 1].parameters,
+                band.high[upper].parameters,
+            ];
+            upper += 1;
+            corners
+        };
+        if band.varying == 1 {
+            corners.swap(1, 2);
+        }
+        triangles.push(corners);
+    }
+    let mut mesh = Mesh::default();
+    for corners in triangles {
+        if !refine_scheduled(
+            &mut mesh,
+            body,
+            face,
+            corners,
+            max_angle,
+            0,
+            &pins,
+            &boundary_segments,
+            &edges,
+            tolerance,
+        ) {
+            return None;
+        }
+    }
+    (!mesh.triangles.is_empty()).then_some(mesh)
 }
 
 /// Triangulates a face over the rings its boundary makes in `(u, v)`.
@@ -1460,7 +1551,7 @@ fn fill_scheduled(
     face: FaceKey,
     surface: &super::geometry::Surface,
     rings: &[Vec<BoundaryPoint>],
-    sag: f64,
+    max_angle: f64,
     tolerance: f64,
 ) -> Option<Mesh> {
     let widest = rings
@@ -1490,6 +1581,17 @@ fn fill_scheduled(
         .map(|(_, ring)| ring.iter().map(|point| point.parameters).collect())
         .collect();
     let pins: Vec<BoundaryPoint> = rings.iter().flatten().cloned().collect();
+    let boundary_segments: Vec<[[f64; 2]; 2]> = rings
+        .iter()
+        .flat_map(|ring| {
+            (0..ring.len()).map(|index| {
+                [
+                    ring[index].parameters,
+                    ring[(index + 1) % ring.len()].parameters,
+                ]
+            })
+        })
+        .collect();
     let edges: Vec<EdgeKey> = body
         .face_coedges(face)
         .into_iter()
@@ -1516,9 +1618,10 @@ fn fill_scheduled(
                 body,
                 face,
                 corners,
-                sag,
+                max_angle,
                 0,
                 &pins,
+                &boundary_segments,
                 &edges,
                 tolerance,
             ) {
@@ -1534,9 +1637,10 @@ fn refine_scheduled(
     body: &Body,
     face: FaceKey,
     corners: [[f64; 2]; 3],
-    sag: f64,
+    max_angle: f64,
     depth: u32,
     pins: &[BoundaryPoint],
+    boundary_segments: &[[[f64; 2]; 2]],
     edges: &[EdgeKey],
     tolerance: f64,
 ) -> bool {
@@ -1546,7 +1650,62 @@ fn refine_scheduled(
     let Some(surface) = body.surfaces.get(node.surface) else {
         return false;
     };
-    let split = surface_triangle_error(surface, corners) > sag;
+    let edge_vertices = [[0, 1], [1, 2], [2, 0]];
+    let edge_angles = edge_vertices.map(|[from, to]| {
+        let parameters = [0.0, 0.25, 0.5, 0.75, 1.0].map(|unit| {
+            [
+                corners[from][0] + (corners[to][0] - corners[from][0]) * unit,
+                corners[from][1] + (corners[to][1] - corners[from][1]) * unit,
+            ]
+        });
+        surface_normal_angle(surface, &parameters).unwrap_or(std::f64::consts::PI)
+    });
+    let split_edge = edge_vertices
+        .into_iter()
+        .enumerate()
+        .filter(|(index, [from, to])| {
+            edge_angles[*index] > max_angle
+                && !boundary_segments.iter().any(|segment| {
+                    (segment[0] == corners[*from] && segment[1] == corners[*to])
+                        || (segment[1] == corners[*from] && segment[0] == corners[*to])
+                })
+        })
+        .max_by(|(a, _), (b, _)| edge_angles[*a].total_cmp(&edge_angles[*b]));
+    if let Some((_, [from, to])) = split_edge {
+        if depth >= MAX_DEPTH {
+            return false;
+        }
+        let opposite = 3 - from - to;
+        let middle = [
+            0.5 * (corners[from][0] + corners[to][0]),
+            0.5 * (corners[from][1] + corners[to][1]),
+        ];
+        return [
+            [corners[from], middle, corners[opposite]],
+            [middle, corners[to], corners[opposite]],
+        ]
+        .into_iter()
+        .all(|part| {
+            refine_scheduled(
+                mesh,
+                body,
+                face,
+                part,
+                max_angle,
+                depth + 1,
+                pins,
+                boundary_segments,
+                edges,
+                tolerance,
+            )
+        });
+    }
+    if edge_angles.into_iter().any(|angle| angle > max_angle) {
+        return false;
+    }
+    let split = surface_triangle_angle(surface, corners)
+        .map(|angle| angle > max_angle)
+        .unwrap_or(true);
     if split {
         if depth >= MAX_DEPTH {
             return false;
@@ -1565,9 +1724,10 @@ fn refine_scheduled(
                 body,
                 face,
                 part,
-                sag,
+                max_angle,
                 depth + 1,
                 pins,
+                boundary_segments,
                 edges,
                 tolerance,
             ) {
@@ -1580,12 +1740,14 @@ fn refine_scheduled(
     true
 }
 
-fn surface_triangle_error(
+fn surface_triangle_angle(
     surface: &super::geometry::Surface,
     corners: [[f64; 2]; 3],
-) -> f64 {
-    let positions = corners.map(|uv| Vec3::from(surface.point_at(uv[0], uv[1])));
-    [
+) -> Option<f64> {
+    let parameters = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
         [0.5, 0.5, 0.0],
         [0.0, 0.5, 0.5],
         [0.5, 0.0, 0.5],
@@ -1594,22 +1756,28 @@ fn surface_triangle_error(
         [0.25, 0.5, 0.25],
         [0.25, 0.25, 0.5],
     ]
-    .into_iter()
     .map(|weights| {
-        let uv = [
+        [
             corners[0][0] * weights[0]
                 + corners[1][0] * weights[1]
                 + corners[2][0] * weights[2],
             corners[0][1] * weights[0]
                 + corners[1][1] * weights[1]
                 + corners[2][1] * weights[2],
-        ];
-        let flat = positions[0] * weights[0]
-            + positions[1] * weights[1]
-            + positions[2] * weights[2];
-        flat.distance(Vec3::from(surface.point_at(uv[0], uv[1])))
-    })
-    .fold(0.0, f64::max)
+        ]
+    });
+    surface_normal_angle(surface, &parameters)
+}
+
+fn surface_normal_angle(
+    surface: &super::geometry::Surface,
+    parameters: &[[f64; 2]],
+) -> Option<f64> {
+    let normals = parameters
+        .iter()
+        .map(|uv| surface.normal_at(uv[0], uv[1]))
+        .collect::<Option<Vec<_>>>()?;
+    Some(crate::tessellation::max_direction_angle(&normals))
 }
 
 fn emit_scheduled(
@@ -1697,9 +1865,9 @@ fn canonical_point(
 /// What they do say is where the band starts and stops, which with a full
 /// turn of `u` is the whole region. `None` for anything else: a face bounded
 /// by arcs and generators traces a proper ring and goes the ordinary way.
-/// The default sag, for a caller with no opinion.
-pub fn default_sag() -> f64 {
-    DEFAULT_SAG
+/// The default angular threshold, for a caller with no opinion.
+pub fn default_angle() -> f64 {
+    crate::tessellation::DEFAULT_ANGLE
 }
 
 #[cfg(test)]
@@ -1712,7 +1880,7 @@ mod tests {
     #[test]
     fn a_box_meshes_into_two_triangles_a_side() {
         let solid = cuboid([0.0; 3], [2.0, 3.0, 4.0]).unwrap();
-        let mesh = self::body(&solid, 0.01, TOL);
+        let mesh = self::body(&solid, default_angle(), TOL);
         assert_eq!(mesh.len(), 12, "six faces, two triangles each");
         assert_eq!(mesh.positions.len(), 36);
     }
@@ -1720,7 +1888,7 @@ mod tests {
     #[test]
     fn the_triangles_cover_the_boxs_own_area() {
         let solid = cuboid([0.0; 3], [2.0, 3.0, 4.0]).unwrap();
-        let mesh = self::body(&solid, 0.01, TOL);
+        let mesh = self::body(&solid, default_angle(), TOL);
         let area: f64 = mesh
             .triangles
             .iter()
@@ -1740,7 +1908,7 @@ mod tests {
         // The one that matters for anything drawn: a face wound the wrong way
         // lights the solid inside out and no shading afterwards recovers it.
         let solid = cuboid([0.0; 3], [4.0, 6.0, 8.0]).unwrap();
-        let mesh = self::body(&solid, 0.01, TOL);
+        let mesh = self::body(&solid, default_angle(), TOL);
         let centre = Vec3::new(2.0, 3.0, 4.0);
         for triangle in &mesh.triangles {
             let corner = Vec3::from(mesh.positions[triangle[0]]);
@@ -1756,7 +1924,7 @@ mod tests {
     fn a_wall_is_sampled_as_finely_as_the_tolerance_asks() {
         // The subdivision cap used to decide this instead of the tolerance. A
         // tube starts as one rectangle spanning a whole turn, so five levels
-        // of halving reached 32 segments and stopped — however fine a sag was
+        // of halving reached 32 segments and stopped — however small the angle
         // asked for. The wall then stayed visibly coarser than the rim drawn
         // around it, which is a mismatch no shading hides.
         let solid = crate::brep::make::cylinder([0.0; 3], 5.0, 10.0).unwrap();
@@ -1834,7 +2002,8 @@ mod tests {
             solid.faces.get_mut(wall).unwrap().loops.push(owner);
         }
 
-        let mesh = crate::brep::mesh::face(&solid, wall, 0.01, 1e-9).expect("a drawn wall");
+        let mesh = crate::brep::mesh::face(&solid, wall, default_angle(), 1e-9)
+            .expect("a drawn wall");
         let area: f64 = mesh
             .triangles
             .iter()
@@ -1879,7 +2048,7 @@ mod tests {
             .expect("a face with a hole in it");
 
         let area = |body: &Body, face| {
-            crate::brep::mesh::face(body, face, 0.01, 1e-9)
+            crate::brep::mesh::face(body, face, default_angle(), 1e-9)
                 .map(|mesh| {
                     mesh.triangles
                         .iter()
@@ -1909,7 +2078,7 @@ mod tests {
     #[test]
     fn the_winding_agrees_with_the_normal() {
         let solid = cuboid([0.0; 3], [4.0, 6.0, 8.0]).unwrap();
-        let mesh = self::body(&solid, 0.01, TOL);
+        let mesh = self::body(&solid, default_angle(), TOL);
         for triangle in &mesh.triangles {
             let a = Vec3::from(mesh.positions[triangle[0]]);
             let b = Vec3::from(mesh.positions[triangle[1]]);
@@ -1926,7 +2095,7 @@ mod tests {
     #[test]
     fn every_vertex_is_on_the_solid_it_came_from() {
         let solid = cuboid([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]).unwrap();
-        let mesh = self::body(&solid, 0.01, TOL);
+        let mesh = self::body(&solid, default_angle(), TOL);
         for position in &mesh.positions {
             let on_a_face = solid.face_keys().any(|face| {
                 solid
@@ -1940,12 +2109,12 @@ mod tests {
     }
 
     #[test]
-    fn a_flat_face_is_never_split_however_fine_the_sag() {
+    fn a_flat_face_is_never_split_however_fine_the_angle() {
         // A plane's triangles are exact, so refining them would only cost
         // vertices.
         let solid = cuboid([0.0; 3], [10.0; 3]).unwrap();
         let coarse = self::body(&solid, 1.0, TOL).len();
-        let fine = self::body(&solid, 1e-9, TOL).len();
+        let fine = self::body(&solid, default_angle() * 0.25, TOL).len();
         assert_eq!(coarse, fine, "a plane does not curve");
         assert_eq!(fine, 12);
     }
@@ -1964,7 +2133,7 @@ mod tests {
     #[test]
     fn a_cylinders_mesh_stays_on_the_cylinder() {
         let solid = crate::brep::make::cylinder([0.0; 3], 5.0, 10.0).unwrap();
-        let mesh = self::body(&solid, 0.02, TOL);
+        let mesh = self::body(&solid, default_angle(), TOL);
         assert!(!mesh.is_empty());
         for position in &mesh.positions {
             let radius = (position[0] * position[0] + position[1] * position[1]).sqrt();
@@ -1977,15 +2146,15 @@ mod tests {
 
     #[test]
     fn a_body_with_nothing_in_it_meshes_to_nothing() {
-        let mesh = self::body(&Body::new(), 0.01, TOL);
+        let mesh = self::body(&Body::new(), default_angle(), TOL);
         assert!(mesh.is_empty());
     }
 
     #[test]
     fn two_meshes_join_without_their_indices_colliding() {
         let solid = cuboid([0.0; 3], [1.0; 3]).unwrap();
-        let mut one = self::body(&solid, 0.01, TOL);
-        let other = self::body(&solid, 0.01, TOL);
+        let mut one = self::body(&solid, default_angle(), TOL);
+        let other = self::body(&solid, default_angle(), TOL);
         let counts = (one.len(), other.len());
         one.absorb(other);
         assert_eq!(one.len(), counts.0 + counts.1);
@@ -1998,7 +2167,7 @@ mod tests {
     fn a_solid_at_survey_coordinates_meshes_where_it_is() {
         let origin = [512_345.678, 4_512_345.678, 91.5];
         let solid = cuboid(origin, [0.5, 0.5, 0.5]).unwrap();
-        let mesh = self::body(&solid, 0.01, 1e-6);
+        let mesh = self::body(&solid, default_angle(), 1e-6);
         assert_eq!(mesh.len(), 12);
         for position in &mesh.positions {
             assert!((position[0] - origin[0]).abs() <= 0.5 + 1e-6, "{position:?}");
@@ -2012,7 +2181,7 @@ mod tests {
         let joined =
             crate::brep::boolean::combine(a, b, crate::brep::boolean::Operation::Union, TOL)
                 .unwrap();
-        let mesh = self::body(&joined, 0.01, TOL);
+        let mesh = self::body(&joined, default_angle(), TOL);
         assert!(!mesh.is_empty());
         // An imprinted face is no longer a rectangle, so it takes more than
         // two triangles — but never fewer.

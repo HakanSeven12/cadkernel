@@ -36,9 +36,10 @@
 /// bridging a file format still has to say where a face's frame points.
 pub mod space;
 
+pub mod tessellation;
+
 #[cfg(feature = "geom2d")]
 pub mod geom2d;
 
 #[cfg(feature = "brep")]
 pub mod brep;
-
