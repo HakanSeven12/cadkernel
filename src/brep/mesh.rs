@@ -2656,7 +2656,30 @@ fn whole_surface_domain(
     face: FaceKey,
     surface: &super::geometry::Surface,
 ) -> Option<[[f64; 2]; 2]> {
-    if !body.faces.get(face)?.loops.is_empty() {
+    let node = body.faces.get(face)?;
+    let seam_loop = matches!(
+        surface,
+        super::geometry::Surface::Sphere(_) | super::geometry::Surface::Torus(_)
+    ) && node.loops.as_slice().first().is_some_and(|loop_key| {
+        let Some(ring) = body.loops.get(*loop_key) else {
+            return false;
+        };
+        node.loops.len() == 1
+            && !ring.coedges.is_empty()
+            && ring.coedges.iter().all(|coedge_key| {
+                let Some(coedge) = body.coedges.get(*coedge_key) else {
+                    return false;
+                };
+                let matching: Vec<_> = ring
+                    .coedges
+                    .iter()
+                    .filter_map(|candidate| body.coedges.get(*candidate))
+                    .filter(|candidate| candidate.edge == coedge.edge)
+                    .collect();
+                matching.len() == 2 && matching[0].forward != matching[1].forward
+            })
+    });
+    if !node.loops.is_empty() && !seam_loop {
         return None;
     }
     let closed = match surface {
@@ -3172,9 +3195,26 @@ fn fill_whole_surface(
     max_angle: f64,
     tolerance: f64,
 ) -> Option<Mesh> {
-    let sphere = matches!(surface, super::geometry::Surface::Sphere(_));
-    let u_cells = 4;
-    let v_cells = if sphere { 2 } else { 4 };
+    let analytic = matches!(
+        surface,
+        super::geometry::Surface::Sphere(_) | super::geometry::Surface::Torus(_)
+    );
+    let step = (max_angle / std::f64::consts::SQRT_2).max(f64::EPSILON);
+    let u_cells = if analytic {
+        ((domain[0][1] - domain[0][0]) / step).ceil() as usize
+    } else {
+        4
+    };
+    let v_cells = if analytic {
+        ((domain[1][1] - domain[1][0]) / step).ceil() as usize
+    } else if matches!(surface, super::geometry::Surface::Sphere(_)) {
+        2
+    } else {
+        4
+    };
+    if u_cells.saturating_mul(v_cells).saturating_mul(2) > MAX_FACE_ADDITIONS {
+        return None;
+    }
     let mut mesh = Mesh::default();
     for v_index in 0..v_cells {
         let v0 = domain[1][0]
@@ -3190,6 +3230,10 @@ fn fill_whole_surface(
                 [[u0, v0], [u1, v0], [u0, v1]],
                 [[u1, v0], [u1, v1], [u0, v1]],
             ] {
+                if analytic {
+                    emit_scheduled(&mut mesh, body, face, corners, &[]);
+                    continue;
+                }
                 if !refine_scheduled(
                     &mut mesh,
                     body,
