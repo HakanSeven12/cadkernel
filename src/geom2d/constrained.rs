@@ -112,8 +112,12 @@ impl ConstrainedMesh {
         Some(self.triangulation.num_vertices() > before)
     }
 
+    pub fn contains(&self, parameters: [f64; 2]) -> bool {
+        self.inside(parameters)
+    }
+
     fn vertex(&self, parameters: [f64; 2]) -> ParameterVertex {
-        let step = f64::EPSILON * 256.0;
+        let step = f64::EPSILON;
         let normalized = [0, 1].map(|axis| {
             let value = (parameters[axis] - self.origin[axis]) / self.scale[axis];
             (value / step).round() * step

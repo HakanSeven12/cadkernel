@@ -15,6 +15,7 @@ use crate::brep::{
 use crate::geom2d::{Curve as Curve2, NurbsCurve};
 use crate::space::{NurbsCurve3, NurbsSurface3, Plane, Vec3};
 use std::collections::HashMap;
+use std::f64::consts::TAU;
 
 /// What a lift could not represent.
 ///
@@ -188,12 +189,27 @@ fn lift_face(
             if let Some(edge) = edge_of(document, body, seen, loss, source_coedge.edge()) {
                 let edge_forward = resolve(document, source_coedge.edge())
                     .and_then(SatEdge::from_record)
-                    .is_some_and(|edge| edge.sense() == Sense::Forward);
+                    .is_some_and(|source_edge| {
+                        let Some(edge) = body.edges.get(edge) else {
+                            return false;
+                        };
+                        if edge.start == edge.end {
+                            return source_edge.sense() == Sense::Forward;
+                        }
+                        let source_start = resolve(document, source_edge.start_vertex())
+                            .and_then(index_of);
+                        let kernel_start = body
+                            .vertices
+                            .get(edge.start)
+                            .and_then(|vertex| vertex.provenance.source())
+                            .map(|source| source.index() as u32);
+                        source_start.is_some() && source_start == kernel_start
+                    });
                 let forward = (source_coedge.sense() == Sense::Forward) == edge_forward;
                 let coedge = body.coedges.insert(Coedge {
                     edge,
                     forward,
-                    pcurve: read_pcurve(document, source_coedge.pcurve(), forward, reversed_v),
+                    pcurve: read_pcurve(document, source_coedge.pcurve(), reversed_v),
                     owner: ring,
                     provenance: clean(record),
                 });
@@ -234,46 +250,55 @@ fn edge_of(
         None
     })?;
     let curve = curve_of(document, body, seen, loss, source.curve())?;
-    let start = vertex_of(document, body, seen, loss, source.start_vertex())?;
-    let end = vertex_of(document, body, seen, loss, source.end_vertex())?;
-    // ACIS stores the two parameters in the curve's own direction; the kernel
-    // keeps the smaller first and lets a coedge's sense say which way a loop
-    // runs it.
-    //
-    // On a straight curve the vertices are read instead, and are believed over
-    // the record. A line's parameter is a distance along an infinite curve, so
-    // two endpoints fix it and nothing else can; files exist whose stored pair
-    // spans the right *length* from the wrong end, which puts the edge beside
-    // the face it bounds. The loop then fails to close in parameter space and
-    // the face is quietly dropped — a hole in the solid, from a record that
-    // looked well formed.
-    //
-    // Only for straight curves. A circle's parameter is an angle, where two
-    // endpoints leave which way round undecided — 350° to 10° is ten degrees
-    // or three hundred and fifty — and there the record is the only thing that
-    // knows.
-    let straight = matches!(body.curves.get(curve), Some(Curve3::Line(_)));
+    let source_start = vertex_of(document, body, seen, loss, source.start_vertex())?;
+    let source_end = vertex_of(document, body, seen, loss, source.end_vertex())?;
+    let edge_forward = source.sense() == Sense::Forward;
+    let (start, end) = if edge_forward {
+        (source_start, source_end)
+    } else {
+        (source_end, source_start)
+    };
+    // Open curves have an unambiguous span, so their vertices resolve stale
+    // stored parameters. Closed curves keep the stored choice of arc.
     let ends = (body.vertices.get(start)?.point, body.vertices.get(end)?.point);
     let apart = Vec3::from(ends.0).distance(Vec3::from(ends.1)) > 1e-9;
+    let mut stored_low = source.start_param();
+    let mut stored_high = source.end_param();
+    if stored_high < stored_low {
+        std::mem::swap(&mut stored_low, &mut stored_high);
+    }
     let (low, high) = match body.curves.get(curve) {
-        Some(shape) if straight && apart => {
+        Some(shape @ Curve3::Line(_)) if apart => {
             (shape.parameter_at(ends.0), shape.parameter_at(ends.1))
         }
-        _ => (source.start_param(), source.end_param()),
-    };
-    let periodic_span = match body.curves.get(curve) {
-        Some(Curve3::Nurbs(curve)) if curve.periodicity() => {
-            let (from, to) = curve.domain();
-            Some(to - from)
+        Some(shape @ Curve3::Nurbs(nurbs))
+            if start == end
+                && nurbs.periodicity()
+                && stored_high - stored_low >= (nurbs.domain().1 - nurbs.domain().0) * (1.0 - 1e-6) =>
+        {
+            let period = nurbs.domain().1 - nurbs.domain().0;
+            let projected = shape.parameter_at(ends.0);
+            let stored_gap = Vec3::from(shape.point_at(stored_low)).distance(Vec3::from(ends.0));
+            let projected_gap = Vec3::from(shape.point_at(projected)).distance(Vec3::from(ends.0));
+            let low = if projected_gap < stored_gap {
+                projected
+            } else {
+                stored_low
+            };
+            (low, low + period)
         }
-        _ => None,
-    };
-    let (start, end, low, high) = if low <= high {
-        (start, end, low, high)
-    } else if let Some(period) = periodic_span {
-        (start, end, low, high + period)
-    } else {
-        (end, start, high, low)
+        Some(shape @ Curve3::Nurbs(curve)) if apart && !curve.periodicity() => {
+            (shape.parameter_at(ends.0), shape.parameter_at(ends.1))
+        }
+        Some(shape @ (Curve3::Circle(_) | Curve3::Ellipse(_))) if apart => {
+            let low = periodic_near(shape.parameter_at(ends.0), stored_low, TAU);
+            let mut high = periodic_near(shape.parameter_at(ends.1), stored_high, TAU);
+            while high <= low {
+                high += TAU;
+            }
+            (low, high)
+        }
+        _ => (stored_low, stored_high),
     };
     let key = body.edges.insert(Edge {
         curve,
@@ -286,6 +311,10 @@ fn edge_of(
     });
     seen.edges.insert(index, key);
     Some(key)
+}
+
+fn periodic_near(value: f64, reference: f64, period: f64) -> f64 {
+    value + period * ((reference - value) / period).round()
 }
 
 fn vertex_of(
@@ -396,7 +425,6 @@ fn read_curve(document: &SatDocument, record: &SatRecord) -> Option<Curve3> {
 fn read_pcurve(
     document: &SatDocument,
     pointer: SatPointer,
-    forward: bool,
     reversed_v: bool,
 ) -> Option<Curve2> {
     let source = SatPCurve::from_record(resolve(document, pointer)?)?;
@@ -417,10 +445,7 @@ fn read_pcurve(
     } else {
         curve
     };
-    Some(match curve {
-        Curve2::Nurbs(curve) if !forward => Curve2::Nurbs(curve.reversed()),
-        curve => curve,
-    })
+    Some(curve)
 }
 
 fn analytic_surface_reversed(record: &SatRecord) -> bool {

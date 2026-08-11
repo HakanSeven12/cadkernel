@@ -15,7 +15,7 @@
 //! off. Weights are carried here and applied in homogeneous coordinates.
 
 use super::vec::Vec2;
-use crate::space::spline::de_boor;
+use crate::space::spline::{de_boor, de_boor_by};
 /// Re-exported from [`space::spline`](crate::space::spline), where it now
 /// lives so a space curve can use it too. Kept reachable here because a
 /// caller building a plane curve looks for it beside one.
@@ -137,11 +137,16 @@ impl NurbsCurve {
     /// weights are honoured rather than ignored.
     pub fn point_at_knot(&self, u: f64) -> [f64; 2] {
         let (start, end) = self.domain();
-        let result = de_boor(
+        let result = de_boor_by(
             self.degree,
             &self.knots,
-            &self.homogeneous(),
+            self.control_points.len(),
             u.clamp(start, end),
+            |index| {
+                let point = self.control_points[index];
+                let weight = self.weights[index];
+                [point[0] * weight, point[1] * weight, weight]
+            },
         );
         if result[2].abs() < 1e-15 {
             [result[0], result[1]]

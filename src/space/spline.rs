@@ -23,24 +23,35 @@ pub fn de_boor<const N: usize>(
     points: &[[f64; N]],
     u: f64,
 ) -> [f64; N] {
-    if points.is_empty() {
+    de_boor_by(degree, knots, points.len(), u, |index| points[index])
+}
+
+pub(crate) fn de_boor_by<const N: usize, F>(
+    degree: usize,
+    knots: &[f64],
+    point_count: usize,
+    u: f64,
+    mut point_at: F,
+) -> [f64; N]
+where
+    F: FnMut(usize) -> [f64; N],
+{
+    if point_count == 0 {
         return [0.0; N];
     }
     if degree == 0 {
-        // A step function: the value is whichever control point's span `u`
-        // falls in.
         let index = knots
             .iter()
             .rposition(|knot| *knot <= u)
             .unwrap_or(0)
-            .min(points.len() - 1);
-        return points[index];
+            .min(point_count - 1);
+        return point_at(index);
     }
-    let last = points.len() - 1;
+    let last = point_count - 1;
     let span = span_of(degree, knots, last, u);
 
     let mut working: Vec<[f64; N]> = (0..=degree)
-        .map(|step| points[span + step - degree])
+        .map(|step| point_at(span + step - degree))
         .collect();
     for round in 1..=degree {
         for step in (round..=degree).rev() {

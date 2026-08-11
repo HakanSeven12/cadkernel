@@ -21,7 +21,7 @@
 //! already-divided points — gives a curve that looks close and is not, and
 //! the difference is exactly where the weights matter.
 
-use super::spline::{clamped_uniform_knots, de_boor};
+use super::spline::{clamped_uniform_knots, de_boor_by};
 use super::Vec3;
 
 fn valid_knots(knots: &[f64]) -> bool {
@@ -161,20 +161,22 @@ impl NurbsCurve3 {
     pub fn point_at_knot(&self, u: f64) -> [f64; 3] {
         let (from, to) = self.domain();
         let u = wrap_parameter(u, from, to, self.closed);
-        let homogeneous: Vec<[f64; 4]> = self
-            .control_points
-            .iter()
-            .zip(&self.weights)
-            .map(|(point, weight)| {
+        let raw = de_boor_by(
+            self.degree,
+            &self.knots,
+            self.control_points.len(),
+            u,
+            |index| {
+                let point = self.control_points[index];
+                let weight = self.weights[index];
                 [
                     point[0] * weight,
                     point[1] * weight,
                     point[2] * weight,
-                    *weight,
+                    weight,
                 ]
-            })
-            .collect();
-        let raw = de_boor(self.degree, &self.knots, &homogeneous, u);
+            },
+        );
         if raw[3].abs() < 1e-15 {
             return [raw[0], raw[1], raw[2]];
         }
@@ -416,6 +418,17 @@ impl NurbsSurface3 {
             }
             _ => vec![vec![1.0; columns]; rows],
         };
+        let u_closed = matching_seam(
+            control_points[0].iter().zip(&weights[0]),
+            control_points[rows - 1].iter().zip(&weights[rows - 1]),
+        );
+        let v_closed = matching_seam(
+            control_points.iter().map(|row| &row[0]).zip(weights.iter().map(|row| &row[0])),
+            control_points
+                .iter()
+                .map(|row| &row[columns - 1])
+                .zip(weights.iter().map(|row| &row[columns - 1])),
+        );
         Some(Self {
             u_degree,
             v_degree,
@@ -423,8 +436,8 @@ impl NurbsSurface3 {
             v_knots,
             control_points,
             weights,
-            u_closed: false,
-            v_closed: false,
+            u_closed,
+            v_closed,
             v_reversed: false,
         })
     }
@@ -463,6 +476,17 @@ impl NurbsSurface3 {
         {
             return None;
         }
+        let u_closed = matching_seam(
+            control_points[0].iter().zip(&weights[0]),
+            control_points[rows - 1].iter().zip(&weights[rows - 1]),
+        );
+        let v_closed = matching_seam(
+            control_points.iter().map(|row| &row[0]).zip(weights.iter().map(|row| &row[0])),
+            control_points
+                .iter()
+                .map(|row| &row[columns - 1])
+                .zip(weights.iter().map(|row| &row[columns - 1])),
+        );
         Some(Self {
             u_degree,
             v_degree,
@@ -470,15 +494,15 @@ impl NurbsSurface3 {
             v_knots,
             control_points,
             weights,
-            u_closed: false,
-            v_closed: false,
+            u_closed,
+            v_closed,
             v_reversed: false,
         })
     }
 
     pub fn with_periodicity(mut self, u_closed: bool, v_closed: bool) -> Self {
-        self.u_closed = u_closed;
-        self.v_closed = v_closed;
+        self.u_closed |= u_closed;
+        self.v_closed |= v_closed;
         self
     }
 
@@ -522,6 +546,99 @@ impl NurbsSurface3 {
         &self.weights
     }
 
+    fn homogeneous_control(&self, row: usize, column: usize) -> [f64; 4] {
+        let point = self.control_points[row][column];
+        let weight = self.weights[row][column];
+        [
+            point[0] * weight,
+            point[1] * weight,
+            point[2] * weight,
+            weight,
+        ]
+    }
+
+    fn homogeneous_at(&self, u: f64, v: f64) -> [f64; 4] {
+        de_boor_by(
+            self.u_degree,
+            &self.u_knots,
+            self.control_points.len(),
+            u,
+            |row| {
+                de_boor_by(
+                    self.v_degree,
+                    &self.v_knots,
+                    self.control_points[row].len(),
+                    v,
+                    |column| self.homogeneous_control(row, column),
+                )
+            },
+        )
+    }
+
+    fn homogeneous_u_derivative_at(&self, u: f64, v: f64) -> [f64; 4] {
+        if self.u_degree == 0 || self.control_points.len() < 2 {
+            return [0.0; 4];
+        }
+        de_boor_by(
+            self.u_degree - 1,
+            &self.u_knots[1..self.u_knots.len() - 1],
+            self.control_points.len() - 1,
+            u,
+            |row| {
+                let denominator = self.u_knots[row + self.u_degree + 1]
+                    - self.u_knots[row + 1];
+                let factor = if denominator.abs() > f64::EPSILON {
+                    self.u_degree as f64 / denominator
+                } else {
+                    0.0
+                };
+                de_boor_by(
+                    self.v_degree,
+                    &self.v_knots,
+                    self.control_points[row].len(),
+                    v,
+                    |column| {
+                        let before = self.homogeneous_control(row, column);
+                        let after = self.homogeneous_control(row + 1, column);
+                        std::array::from_fn(|axis| (after[axis] - before[axis]) * factor)
+                    },
+                )
+            },
+        )
+    }
+
+    fn homogeneous_v_derivative_at(&self, u: f64, v: f64) -> [f64; 4] {
+        if self.v_degree == 0 || self.control_points[0].len() < 2 {
+            return [0.0; 4];
+        }
+        de_boor_by(
+            self.u_degree,
+            &self.u_knots,
+            self.control_points.len(),
+            u,
+            |row| {
+                de_boor_by(
+                    self.v_degree - 1,
+                    &self.v_knots[1..self.v_knots.len() - 1],
+                    self.control_points[row].len() - 1,
+                    v,
+                    |column| {
+                        let denominator = self.v_knots[column + self.v_degree + 1]
+                            - self.v_knots[column + 1];
+                        let factor = if denominator.abs() > f64::EPSILON {
+                            self.v_degree as f64 / denominator
+                        } else {
+                            0.0
+                        };
+                        let before = self.homogeneous_control(row, column);
+                        let after = self.homogeneous_control(row, column + 1);
+                        std::array::from_fn(|axis| (after[axis] - before[axis]) * factor)
+                    },
+                )
+            },
+        )
+    }
+
     /// The point at knot parameters `(u, v)`.
     ///
     /// Two passes of the same algorithm: along `v` through each row of the
@@ -532,27 +649,7 @@ impl NurbsSurface3 {
         let u = wrap_parameter(u, u0, u1, self.u_closed);
         let v = wrap_parameter(v, v0, v1, self.v_closed);
         let v = if self.v_reversed { v0 + v1 - v } else { v };
-        let along_rows: Vec<[f64; 4]> = self
-            .control_points
-            .iter()
-            .zip(&self.weights)
-            .map(|(row, row_weights)| {
-                let homogeneous: Vec<[f64; 4]> = row
-                    .iter()
-                    .zip(row_weights)
-                    .map(|(point, weight)| {
-                        [
-                            point[0] * weight,
-                            point[1] * weight,
-                            point[2] * weight,
-                            *weight,
-                        ]
-                    })
-                    .collect();
-                de_boor(self.v_degree, &self.v_knots, &homogeneous, v)
-            })
-            .collect();
-        let raw = de_boor(self.u_degree, &self.u_knots, &along_rows, u);
+        let raw = self.homogeneous_at(u, v);
         if raw[3].abs() < 1e-15 {
             return [raw[0], raw[1], raw[2]];
         }
@@ -571,16 +668,31 @@ impl NurbsSurface3 {
     /// Surface tangents at knot parameters `(u, v)`.
     pub fn tangents_at_knot(&self, u: f64, v: f64) -> Option<([f64; 3], [f64; 3])> {
         let ((u0, u1), (v0, v1)) = self.domain();
-        let (u_span, v_span) = (u1 - u0, v1 - v0);
-        if u_span <= 0.0 || v_span <= 0.0 {
+        if u1 <= u0 || v1 <= v0 {
             return None;
         }
-        let (du, dv) = (u_span * 1e-4, v_span * 1e-4);
-        let along_u = Vec3::from(self.point_at_knot((u + du).min(u1), v))
-            - Vec3::from(self.point_at_knot((u - du).max(u0), v));
-        let along_v = Vec3::from(self.point_at_knot(u, (v + dv).min(v1)))
-            - Vec3::from(self.point_at_knot(u, (v - dv).max(v0)));
-        Some((along_u.to_array(), along_v.to_array()))
+        let u = wrap_parameter(u, u0, u1, self.u_closed);
+        let v = wrap_parameter(v, v0, v1, self.v_closed);
+        let (v, v_sign) = if self.v_reversed {
+            (v0 + v1 - v, -1.0)
+        } else {
+            (v, 1.0)
+        };
+        let raw = self.homogeneous_at(u, v);
+        if raw[3].abs() < 1e-15 {
+            return None;
+        }
+        let point = Vec3::new(raw[0] / raw[3], raw[1] / raw[3], raw[2] / raw[3]);
+        let tangent = |derivative: [f64; 4], sign: f64| {
+            ((Vec3::new(derivative[0], derivative[1], derivative[2])
+                - point * derivative[3])
+                * (sign / raw[3]))
+                .to_array()
+        };
+        Some((
+            tangent(self.homogeneous_u_derivative_at(u, v), 1.0),
+            tangent(self.homogeneous_v_derivative_at(u, v), v_sign),
+        ))
     }
 
     /// The unit normal at knot parameters `(u, v)`.
@@ -602,6 +714,36 @@ impl NurbsSurface3 {
             u0 + (u1 - u0) * s.clamp(0.0, 1.0),
             v0 + (v1 - v0) * t.clamp(0.0, 1.0),
         )
+    }
+}
+
+fn matching_seam<'a, A, B>(first: A, second: B) -> bool
+where
+    A: IntoIterator<Item = (&'a [f64; 3], &'a f64)>,
+    B: IntoIterator<Item = (&'a [f64; 3], &'a f64)>,
+{
+    let mut first = first.into_iter();
+    let mut second = second.into_iter();
+    let mut matched = false;
+    loop {
+        match (first.next(), second.next()) {
+            (Some((a, aw)), Some((b, bw))) => {
+                matched = true;
+                let point_scale = a
+                    .iter()
+                    .chain(b)
+                    .fold(1.0_f64, |scale, value| scale.max(value.abs()));
+                let weight_scale = 1.0_f64.max(aw.abs()).max(bw.abs());
+                let precision = f64::EPSILON * 4096.0;
+                if Vec3::from(*a).distance(Vec3::from(*b)) > precision * point_scale
+                    || (aw - bw).abs() > precision * weight_scale
+                {
+                    return false;
+                }
+            }
+            (None, None) => return matched,
+            _ => return false,
+        }
     }
 }
 

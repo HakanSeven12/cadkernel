@@ -141,10 +141,10 @@ impl Placement {
 /// Moves a whole body.
 ///
 /// `None` for a map that is not a similarity — see the module note — and for
-/// one that leaves the body inconsistent, which is checked rather than
-/// assumed.
+/// one that introduces a topology flaw.
 pub fn transform(body: &Body, place: &Placement) -> Option<Body> {
     let scale = place.scale()?;
+    let original_flaws = body.validate();
     let mut out = body.clone();
 
     for vertex in out.vertices.values_mut() {
@@ -180,7 +180,7 @@ pub fn transform(body: &Body, place: &Placement) -> Option<Body> {
             }
         }
     }
-    out.validate().is_empty().then_some(out)
+    (out.validate() == original_flaws).then_some(out)
 }
 
 fn moved_pcurve(
