@@ -112,8 +112,27 @@ impl ConstrainedMesh {
         Some(self.triangulation.num_vertices() > before)
     }
 
-    pub fn contains(&self, parameters: [f64; 2]) -> bool {
-        self.inside(parameters)
+    pub fn constrain(&mut self, from: [f64; 2], to: [f64; 2]) -> Option<usize> {
+        let before = self.triangulation.num_vertices();
+        let from = self.triangulation.insert(self.vertex(from)).ok()?;
+        let to = self.triangulation.insert(self.vertex(to)).ok()?;
+        if from != to {
+            let origin = self.origin;
+            let scale = self.scale;
+            let edges = self
+                .triangulation
+                .add_constraint_and_split(from, to, |position| ParameterVertex {
+                    parameters: [
+                        origin[0] + position.x * scale[0],
+                        origin[1] + position.y * scale[1],
+                    ],
+                    position,
+                });
+            if edges.is_empty() {
+                return None;
+            }
+        }
+        Some(self.triangulation.num_vertices() - before)
     }
 
     fn vertex(&self, parameters: [f64; 2]) -> ParameterVertex {

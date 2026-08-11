@@ -49,10 +49,27 @@ where
     }
     let last = point_count - 1;
     let span = span_of(degree, knots, last, u);
-
-    let mut working: Vec<[f64; N]> = (0..=degree)
+    const STACK_POINTS: usize = 16;
+    if degree < STACK_POINTS {
+        let mut working = [[0.0; N]; STACK_POINTS];
+        for (step, slot) in working.iter_mut().enumerate().take(degree + 1) {
+            *slot = point_at(span + step - degree);
+        }
+        return blend(degree, knots, span, u, &mut working[..=degree]);
+    }
+    let mut working = (0..=degree)
         .map(|step| point_at(span + step - degree))
-        .collect();
+        .collect::<Vec<_>>();
+    blend(degree, knots, span, u, &mut working)
+}
+
+fn blend<const N: usize>(
+    degree: usize,
+    knots: &[f64],
+    span: usize,
+    u: f64,
+    working: &mut [[f64; N]],
+) -> [f64; N] {
     for round in 1..=degree {
         for step in (round..=degree).rev() {
             let index = span + step - degree;

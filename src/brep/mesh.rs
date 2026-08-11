@@ -26,7 +26,9 @@ use super::topology::{Body, EdgeKey, FaceKey};
 use crate::geom2d::{constrained::ConstrainedMesh, triangulate};
 use crate::space::Vec3;
 use std::collections::HashMap;
-use std::f64::consts::{FRAC_PI_2, TAU};
+use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, TAU};
+
+type ParameterMap<T> = rustc_hash::FxHashMap<[u64; 2], T>;
 
 /// A triangulated solid.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -822,6 +824,33 @@ fn shared_edge_samples(
 ) -> Option<Vec<super::place::EdgeSample>> {
     let edge = body.edges.get(edge_key)?;
     let curve = body.curves.get(edge.curve)?;
+    let directions = edge
+        .coedges
+        .iter()
+        .map(|coedge| {
+            let (_, pcurve) = coedge_geometry(body, *coedge)?;
+            Some((
+                *coedge,
+                if pcurve.is_some() {
+                    pcurve_edge_forward(body, edge_key, *coedge)?
+                } else {
+                    true
+                },
+            ))
+        })
+        .collect::<Option<HashMap<_, _>>>()?;
+    let has_nurbs_pcurve = edge.coedges.iter().any(|coedge| {
+        coedge_geometry(body, *coedge).is_some_and(|(surface, pcurve)| {
+            matches!(surface, super::geometry::Surface::Nurbs(_)) && pcurve.is_some()
+        })
+    });
+    if has_nurbs_pcurve {
+        if let Some(samples) =
+            edge_samples_from_pcurves(body, edge_key, max_angle, tolerance, &directions)
+        {
+            return Some(samples);
+        }
+    }
     let mut samples = vec![super::place::EdgeSample {
         parameter: edge.start_parameter,
         position: curve.point_at(edge.start_parameter),
@@ -831,10 +860,11 @@ fn shared_edge_samples(
         edge_key,
         edge.start_parameter,
         edge.end_parameter,
-        crate::tessellation::angle(max_angle) * 0.5,
+        crate::tessellation::angle(max_angle),
         tolerance.max(1e-12),
         0,
         &mut samples,
+        &directions,
     )
     .is_some()
     {
@@ -844,7 +874,7 @@ fn shared_edge_samples(
         });
         return Some(samples);
     }
-    edge_samples_from_pcurves(body, edge_key, max_angle, tolerance)
+    edge_samples_from_pcurves(body, edge_key, max_angle, tolerance, &directions)
 }
 
 fn edge_samples_from_pcurves(
@@ -852,6 +882,7 @@ fn edge_samples_from_pcurves(
     edge_key: EdgeKey,
     max_angle: f64,
     tolerance: f64,
+    directions: &HashMap<super::topology::CoedgeKey, bool>,
 ) -> Option<Vec<super::place::EdgeSample>> {
     let edge = body.edges.get(edge_key)?;
     for coedge_key in &edge.coedges {
@@ -885,10 +916,11 @@ fn edge_samples_from_pcurves(
                 *coedge_key,
                 pair[0],
                 pair[1],
-                crate::tessellation::angle(max_angle) * 0.5,
+                crate::tessellation::angle(max_angle),
                 tolerance.max(1e-12),
                 0,
                 &mut samples,
+                directions,
             )
             .is_some()
         });
@@ -922,12 +954,13 @@ fn refine_pcurve_edge(
     tolerance: f64,
     depth: u32,
     samples: &mut Vec<super::place::EdgeSample>,
+    coedge_directions: &HashMap<super::topology::CoedgeKey, bool>,
 ) -> Option<()> {
     let edge = body.edges.get(edge_key)?;
     let (source_surface, Some(source_pcurve)) = coedge_geometry(body, source_coedge)? else {
         return None;
     };
-    let source_forward = pcurve_edge_forward(body, edge_key, source_coedge)?;
+    let source_forward = *coedge_directions.get(&source_coedge)?;
     let source_parameter = |parameter: f64| {
         if source_forward {
             parameter
@@ -967,7 +1000,7 @@ fn refine_pcurve_edge(
             } else if let Some((u, v)) = surface.parameters_at(position) {
                 [u, v]
             } else {
-                let pcurve_forward = pcurve_edge_forward(body, edge_key, *coedge_key)?;
+                let pcurve_forward = *coedge_directions.get(coedge_key)?;
                 let preferred = if pcurve_forward {
                     *parameter
                 } else {
@@ -978,7 +1011,7 @@ fn refine_pcurve_edge(
                 if distance3(position, surface.point_at(direct[0], direct[1])) <= tolerance {
                     direct
                 } else {
-                    closest_pcurve_parameters(surface, pcurve, position, preferred)?.1
+                    closest_pcurve_parameters(surface, pcurve, position, preferred, tolerance)?.1
                 }
             };
             if distance3(position, surface.point_at(uv[0], uv[1])) > tolerance {
@@ -1017,6 +1050,7 @@ fn refine_pcurve_edge(
             tolerance,
             depth + 1,
             samples,
+            coedge_directions,
         )?;
         refine_pcurve_edge(
             body,
@@ -1028,6 +1062,7 @@ fn refine_pcurve_edge(
             tolerance,
             depth + 1,
             samples,
+            coedge_directions,
         )?;
     } else {
         samples.push(super::place::EdgeSample {
@@ -1076,6 +1111,7 @@ fn refine_edge(
     tolerance: f64,
     depth: u32,
     samples: &mut Vec<super::place::EdgeSample>,
+    coedge_directions: &HashMap<super::topology::CoedgeKey, bool>,
 ) -> Option<()> {
     let edge = body.edges.get(edge_key)?;
     let curve = body.curves.get(edge.curve)?;
@@ -1092,11 +1128,7 @@ fn refine_edge(
         else {
             continue;
         };
-        let pcurve_forward = if pcurve.is_some() {
-            pcurve_edge_forward(body, edge_key, *coedge_key)?
-        } else {
-            true
-        };
+        let pcurve_forward = *coedge_directions.get(coedge_key)?;
         let mut normals = Vec::with_capacity(9);
         for unit in [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0] {
             let parameter = from + (to - from) * unit;
@@ -1118,7 +1150,14 @@ fn refine_edge(
                     (direct, true)
                 } else {
                     (
-                        closest_pcurve_parameters(surface, pcurve, on_curve, preferred)?.1,
+                        closest_pcurve_parameters(
+                            surface,
+                            pcurve,
+                            on_curve,
+                            preferred,
+                            tolerance,
+                        )?
+                        .1,
                         true,
                     )
                 }
@@ -1152,6 +1191,7 @@ fn refine_edge(
             tolerance,
             depth + 1,
             samples,
+            coedge_directions,
         )?;
         samples.push(super::place::EdgeSample {
             parameter: middle,
@@ -1166,6 +1206,7 @@ fn refine_edge(
             tolerance,
             depth + 1,
             samples,
+            coedge_directions,
         )?;
     }
     Some(())
@@ -1283,9 +1324,40 @@ fn scheduled_loop(
     tolerance: f64,
 ) -> Option<Vec<BoundaryPoint>> {
     let ring = body.loops.get(loop_key)?;
-    let mut pieces = Vec::with_capacity(ring.coedges.len());
+    let mut uses = Vec::with_capacity(ring.coedges.len());
     for coedge_key in &ring.coedges {
         let coedge = body.coedges.get(*coedge_key)?;
+        let cancels = uses
+            .last()
+            .and_then(|previous| body.coedges.get(*previous))
+            .is_some_and(|previous| {
+                previous.edge == coedge.edge
+                    && previous.forward != coedge.forward
+                    && previous.pcurve.is_none()
+                    && coedge.pcurve.is_none()
+            });
+        if cancels {
+            uses.pop();
+        } else {
+            uses.push(*coedge_key);
+        }
+    }
+    while uses.len() >= 2 {
+        let first = body.coedges.get(uses[0])?;
+        let last = body.coedges.get(*uses.last()?)?;
+        if first.edge != last.edge
+            || first.forward == last.forward
+            || first.pcurve.is_some()
+            || last.pcurve.is_some()
+        {
+            break;
+        }
+        uses.remove(0);
+        uses.pop();
+    }
+    let mut pieces = Vec::with_capacity(uses.len());
+    for coedge_key in uses {
+        let coedge = body.coedges.get(coedge_key)?;
         let mut samples = schedules.get(&coedge.edge)?.clone();
         if !coedge.forward {
             samples.reverse();
@@ -1471,6 +1543,7 @@ fn closest_pcurve_parameters(
     pcurve: &crate::geom2d::Curve,
     position: [f64; 3],
     preferred: f64,
+    tolerance: f64,
 ) -> Option<(f64, [f64; 2], f64)> {
     const COARSE: usize = 32;
     let distance_at = |parameter: f64| {
@@ -1478,6 +1551,33 @@ fn closest_pcurve_parameters(
         let distance = distance3(position, surface.point_at(uv[0], uv[1]));
         distance.is_finite().then_some((uv, distance * distance))
     };
+    let mut parameter = preferred.clamp(0.0, 1.0);
+    let mut projected = None;
+    for _ in 0..12 {
+        let (uv, squared) = distance_at(parameter)?;
+        if projected.is_none_or(|(_, _, best): (f64, [f64; 2], f64)| squared < best) {
+            projected = Some((parameter, uv, squared));
+        }
+        if squared.sqrt() <= tolerance {
+            return Some((parameter, uv, squared.sqrt()));
+        }
+        let uv_tangent = pcurve.tangent_at(parameter);
+        let (along_u, along_v) = surface.tangents_at(uv[0], uv[1])?;
+        let tangent = Vec3::from(along_u) * uv_tangent[0]
+            + Vec3::from(along_v) * uv_tangent[1];
+        let length2 = tangent.dot(tangent);
+        if !length2.is_finite() || length2 <= f64::MIN_POSITIVE {
+            break;
+        }
+        let point = Vec3::from(surface.point_at(uv[0], uv[1]));
+        let correction = ((point - Vec3::from(position)).dot(tangent) / length2)
+            .clamp(-0.25, 0.25);
+        let next = (parameter - correction).clamp(0.0, 1.0);
+        if parameter_value_near(next, parameter) {
+            break;
+        }
+        parameter = next;
+    }
     let mut candidates: Vec<f64> = (0..=COARSE)
         .map(|index| index as f64 / COARSE as f64)
         .collect();
@@ -1499,7 +1599,7 @@ fn closest_pcurve_parameters(
     let midpoints: Vec<f64> = candidates.windows(2).map(|pair| 0.5 * (pair[0] + pair[1])).collect();
     candidates.extend(midpoints);
     candidates.sort_by(f64::total_cmp);
-    let mut best = None;
+    let mut best = projected;
     let mut best_index = 0;
     for (index, parameter) in candidates.iter().copied().enumerate() {
         let (uv, distance) = distance_at(parameter)?;
@@ -1591,7 +1691,13 @@ fn parameterize_samples(
                 let (parameter, parameters, deviation) = if direct_deviation <= tolerance {
                     (preferred, direct, direct_deviation)
                 } else {
-                    closest_pcurve_parameters(surface, pcurve, sample.position, preferred)?
+                    closest_pcurve_parameters(
+                        surface,
+                        pcurve,
+                        sample.position,
+                        preferred,
+                        tolerance,
+                    )?
                 };
                 (deviation <= tolerance).then_some((parameter, BoundaryPoint {
                     parameters,
@@ -2946,7 +3052,7 @@ fn fill_scheduled_singular_cap(
             point.parameters[band.varying],
             apex.parameters[fixed],
             point.parameters[fixed],
-            max_angle * 0.5,
+            max_angle,
             0,
         )?))
     })?;
@@ -3123,6 +3229,7 @@ fn fill_scheduled(
     let flat = matches!(surface, super::geometry::Surface::Plane(_));
     let mut additions = additions;
     let mut complete = None;
+    let mut normal_cache = ParameterMap::default();
     for _ in 0..MAX_FACE_PASSES {
         let triangles = domain.triangles();
         if triangles.is_empty() {
@@ -3135,7 +3242,13 @@ fn fill_scheduled(
         let mut candidates = Vec::new();
         let mut candidates_within_tolerance = true;
         for triangle in &triangles {
-            let refinement = triangle_refinement(surface, triangle, max_angle, tolerance)?;
+            let refinement = triangle_refinement(
+                surface,
+                triangle,
+                max_angle,
+                tolerance,
+                &mut normal_cache,
+            )?;
             match refinement {
                 TriangleRefinement::Complete => {}
                 TriangleRefinement::Boundary => {
@@ -3152,6 +3265,8 @@ fn fill_scheduled(
             complete = Some(triangles);
             break;
         }
+        let mut unique = std::collections::HashSet::with_capacity(candidates.len());
+        candidates.retain(|(parameters, _)| unique.insert(parameters.map(f64::to_bits)));
         let mut inserted = 0;
         for (parameters, corners) in candidates {
             if additions >= MAX_FACE_ADDITIONS {
@@ -3199,11 +3314,20 @@ fn fill_scheduled(
     let triangles = complete?;
 
     let mut mesh = Mesh::default();
+    let mut point_cache = ParameterMap::default();
     for triangle in triangles {
         if parameter_triangle_degenerate(triangle.parameters) {
             continue;
         }
-        emit_scheduled(&mut mesh, body, face, triangle.parameters, &pins);
+        emit_scheduled_cached(
+            &mut mesh,
+            body,
+            face,
+            triangle.parameters,
+            &pins,
+            &normal_cache,
+            &mut point_cache,
+        );
     }
     (!mesh.triangles.is_empty()).then_some(mesh)
 }
@@ -3214,18 +3338,24 @@ fn seed_surface_grid(
     rings: &[Vec<[f64; 2]>],
     max_angle: f64,
 ) -> Option<usize> {
-    let super::geometry::Surface::Nurbs(nurbs) = surface else {
+    if matches!(surface, super::geometry::Surface::Plane(_)) {
         return Some(0);
+    }
+    let nurbs = match surface {
+        super::geometry::Surface::Nurbs(nurbs) => Some(nurbs),
+        _ => None,
     };
     let bounds = parameter_bounds(rings)?;
-    let knots = nurbs.knots();
     let values = [0, 1].map(|axis| {
         let other = 1 - axis;
-        let mut probes = if other == 0 {
-            knots.0.to_vec()
-        } else {
-            knots.1.to_vec()
-        };
+        let mut probes = nurbs.map_or_else(Vec::new, |nurbs| {
+            let knots = nurbs.knots();
+            if other == 0 {
+                knots.0.to_vec()
+            } else {
+                knots.1.to_vec()
+            }
+        });
         probes.retain(|value| *value >= bounds[other][0] && *value <= bounds[other][1]);
         probes.extend(bounds[other]);
         probes.sort_by(f64::total_cmp);
@@ -3237,6 +3367,11 @@ fn seed_surface_grid(
                 .collect::<Vec<_>>(),
         );
         let mut values = Vec::new();
+        let axis_angle = match surface {
+            super::geometry::Surface::Cylinder(_) | super::geometry::Surface::Cone(_)
+                if axis == 0 => max_angle,
+            _ => max_angle * FRAC_1_SQRT_2,
+        };
         for probe in probes {
             surface_span_breaks(
                 surface,
@@ -3244,30 +3379,29 @@ fn seed_surface_grid(
                 probe,
                 bounds[axis][0],
                 bounds[axis][1],
-                max_angle * 0.5,
+                axis_angle,
                 0,
                 &mut values,
             )?;
         }
-        let axis_knots = if axis == 0 { knots.0 } else { knots.1 };
-        let ((u0, u1), (v0, v1)) = nurbs.domain();
-        let axis_domain = if axis == 0 { (u0, u1) } else { (v0, v1) };
-        let period = nurbs.periodicity()[axis].then_some(axis_domain.1 - axis_domain.0);
-        for knot in axis_knots {
-            for turn in if period.is_some() { -2..=2 } else { 0..=0 } {
-                let value = *knot + f64::from(turn) * period.unwrap_or(0.0);
-                if value >= bounds[axis][0] && value <= bounds[axis][1] {
-                    values.push(value);
+        if let Some(nurbs) = nurbs {
+            let knots = nurbs.knots();
+            let axis_knots = if axis == 0 { knots.0 } else { knots.1 };
+            let ((u0, u1), (v0, v1)) = nurbs.domain();
+            let axis_domain = if axis == 0 { (u0, u1) } else { (v0, v1) };
+            let period = nurbs.periodicity()[axis].then_some(axis_domain.1 - axis_domain.0);
+            for knot in axis_knots {
+                for turn in if period.is_some() { -2..=2 } else { 0..=0 } {
+                    let value = *knot + f64::from(turn) * period.unwrap_or(0.0);
+                    if value >= bounds[axis][0] && value <= bounds[axis][1] {
+                        values.push(value);
+                    }
                 }
             }
         }
         values.push(bounds[axis][1]);
         values.sort_by(f64::total_cmp);
         values.dedup_by(|a, b| parameter_value_near(*a, *b));
-        if values.len() == 2 {
-            values.push(0.5 * (values[0] + values[1]));
-            values.sort_by(f64::total_cmp);
-        }
         Some(values)
     });
     let [Some(u_values), Some(v_values)] = values else {
@@ -3277,11 +3411,27 @@ fn seed_surface_grid(
         return None;
     }
     let mut inserted = 0;
-    for u in u_values {
-        for v in &v_values {
-            let parameters = [u, *v];
-            if domain.contains(parameters) && domain.insert(parameters)? {
-                inserted += 1;
+    for (fixed_axis, values) in [u_values, v_values].into_iter().enumerate() {
+        for fixed in values.iter().skip(1).take(values.len().saturating_sub(2)) {
+            for interval in line_intervals(rings, fixed_axis, *fixed) {
+                let span = interval[1] - interval[0];
+                let inset = span * 1e-9;
+                if !span.is_finite() || span <= 0.0 || inset <= 0.0 {
+                    continue;
+                }
+                let mut from = [0.0; 2];
+                let mut to = [0.0; 2];
+                from[fixed_axis] = *fixed;
+                to[fixed_axis] = *fixed;
+                from[1 - fixed_axis] = interval[0] + inset;
+                to[1 - fixed_axis] = interval[1] - inset;
+                if from[1 - fixed_axis] >= to[1 - fixed_axis] {
+                    continue;
+                }
+                inserted += domain.constrain(from, to)?;
+                if inserted > MAX_FACE_ADDITIONS {
+                    return None;
+                }
             }
         }
     }
@@ -3333,6 +3483,7 @@ fn triangle_refinement(
     triangle: &crate::geom2d::constrained::ConstrainedTriangle,
     max_angle: f64,
     tolerance: f64,
+    normal_cache: &mut ParameterMap<Option<[f64; 3]>>,
 ) -> Option<TriangleRefinement> {
     let corners = triangle.parameters;
     if parameter_triangle_degenerate(corners) {
@@ -3347,7 +3498,7 @@ fn triangle_refinement(
                 corners[from][1] + (corners[to][1] - corners[from][1]) * unit,
             ]
         });
-        edge_angles[index] = surface_normal_angle(surface, &parameters)?;
+        edge_angles[index] = surface_normal_angle_cached(surface, &parameters, normal_cache)?;
     }
     if (0..3).any(|index| {
         let [from, to] = edge_vertices[index];
@@ -3381,7 +3532,7 @@ fn triangle_refinement(
         }
         return Some(TriangleRefinement::Interior(middle));
     }
-    match surface_triangle_angle(surface, corners) {
+    match surface_triangle_angle_cached(surface, corners, normal_cache) {
         Some(angle) if !angle_exceeds(angle, max_angle) => Some(TriangleRefinement::Complete),
         Some(_) => Some(TriangleRefinement::Interior([
             (corners[0][0] + corners[1][0] + corners[2][0]) / 3.0,
@@ -3589,6 +3740,36 @@ fn surface_triangle_angle(
     surface_normal_angle(surface, &parameters)
 }
 
+fn surface_triangle_angle_cached(
+    surface: &super::geometry::Surface,
+    corners: [[f64; 2]; 3],
+    cache: &mut ParameterMap<Option<[f64; 3]>>,
+) -> Option<f64> {
+    let parameters = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.5, 0.5, 0.0],
+        [0.0, 0.5, 0.5],
+        [0.5, 0.0, 0.5],
+        [1.0 / 3.0; 3],
+        [0.5, 0.25, 0.25],
+        [0.25, 0.5, 0.25],
+        [0.25, 0.25, 0.5],
+    ]
+    .map(|weights| {
+        [
+            corners[0][0] * weights[0]
+                + corners[1][0] * weights[1]
+                + corners[2][0] * weights[2],
+            corners[0][1] * weights[0]
+                + corners[1][1] * weights[1]
+                + corners[2][1] * weights[2],
+        ]
+    });
+    surface_normal_angle_cached(surface, &parameters, cache)
+}
+
 fn surface_normal_angle(
     surface: &super::geometry::Surface,
     parameters: &[[f64; 2]],
@@ -3596,6 +3777,26 @@ fn surface_normal_angle(
     let normals = parameters
         .iter()
         .map(|uv| surface.normal_at(uv[0], uv[1]))
+        .collect::<Option<Vec<_>>>()?;
+    Some(crate::tessellation::max_direction_angle(&normals))
+}
+
+fn surface_normal_angle_cached(
+    surface: &super::geometry::Surface,
+    parameters: &[[f64; 2]],
+    cache: &mut ParameterMap<Option<[f64; 3]>>,
+) -> Option<f64> {
+    let normals = parameters
+        .iter()
+        .map(|uv| {
+            let key = uv.map(f64::to_bits);
+            if let Some(normal) = cache.get(&key) {
+                return *normal;
+            }
+            let normal = surface.normal_at(uv[0], uv[1]);
+            cache.insert(key, normal);
+            normal
+        })
         .collect::<Option<Vec<_>>>()?;
     Some(crate::tessellation::max_direction_angle(&normals))
 }
@@ -3670,6 +3871,38 @@ fn emit_scheduled(
     corners: [[f64; 2]; 3],
     pins: &[BoundaryPoint],
 ) {
+    emit_scheduled_with_cache(mesh, body, face, corners, pins, None, None);
+}
+
+fn emit_scheduled_cached(
+    mesh: &mut Mesh,
+    body: &Body,
+    face: FaceKey,
+    corners: [[f64; 2]; 3],
+    pins: &[BoundaryPoint],
+    cache: &ParameterMap<Option<[f64; 3]>>,
+    point_cache: &mut ParameterMap<[f64; 3]>,
+) {
+    emit_scheduled_with_cache(
+        mesh,
+        body,
+        face,
+        corners,
+        pins,
+        Some(cache),
+        Some(point_cache),
+    );
+}
+
+fn emit_scheduled_with_cache(
+    mesh: &mut Mesh,
+    body: &Body,
+    face: FaceKey,
+    corners: [[f64; 2]; 3],
+    pins: &[BoundaryPoint],
+    cache: Option<&ParameterMap<Option<[f64; 3]>>>,
+    mut point_cache: Option<&mut ParameterMap<[f64; 3]>>,
+) {
     let Some(node) = body.faces.get(face) else {
         return;
     };
@@ -3679,7 +3912,12 @@ fn emit_scheduled(
     let points: Vec<Vec3> = corners
         .iter()
         .map(|parameters| {
-            Vec3::from(canonical_point(surface, *parameters, pins))
+            Vec3::from(canonical_point_cached(
+                surface,
+                *parameters,
+                pins,
+                point_cache.as_deref_mut(),
+            ))
         })
         .collect();
     let Some(normal) = (points[1] - points[0])
@@ -3689,8 +3927,12 @@ fn emit_scheduled(
         return;
     };
     let normals = corners.map(|parameters| {
-        let normal = surface
-            .normal_at(parameters[0], parameters[1])
+        let stored = cache
+            .and_then(|cache| cache.get(&parameters.map(f64::to_bits)))
+            .copied()
+            .flatten()
+            .or_else(|| surface.normal_at(parameters[0], parameters[1]));
+        let normal = stored
             .and_then(|normal| Vec3::from(normal).normalize())
             .unwrap_or(normal);
         if node.forward { normal } else { -normal }
@@ -3704,13 +3946,23 @@ fn emit_scheduled(
     mesh.triangles.push([base, base + 1, base + 2]);
 }
 
-fn canonical_point(
+fn canonical_point_cached(
     surface: &super::geometry::Surface,
     parameters: [f64; 2],
     pins: &[BoundaryPoint],
+    cache: Option<&mut ParameterMap<[f64; 3]>>,
 ) -> [f64; 3] {
     if let Some(pin) = pins.iter().find(|pin| pin.parameters == parameters) {
         return pin.position;
+    }
+    let key = parameters.map(f64::to_bits);
+    if let Some(cache) = cache {
+        if let Some(point) = cache.get(&key) {
+            return *point;
+        }
+        let point = surface.point_at(parameters[0], parameters[1]);
+        cache.insert(key, point);
+        return point;
     }
     surface.point_at(parameters[0], parameters[1])
 }

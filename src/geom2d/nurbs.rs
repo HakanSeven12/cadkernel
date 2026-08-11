@@ -15,7 +15,7 @@
 //! off. Weights are carried here and applied in homogeneous coordinates.
 
 use super::vec::Vec2;
-use crate::space::spline::{de_boor, de_boor_by};
+use crate::space::spline::de_boor_by;
 /// Re-exported from [`space::spline`](crate::space::spline), where it now
 /// lives so a space curve can use it too. Kept reachable here because a
 /// caller building a plane curve looks for it beside one.
@@ -172,31 +172,42 @@ impl NurbsCurve {
         }
         let (start, end) = self.domain();
         let u = u.clamp(start, end);
-        let homogeneous = self.homogeneous();
         let degree = self.degree as f64;
-        let derivative: Vec<[f64; 3]> = (0..homogeneous.len() - 1)
-            .map(|i| {
+        let value = de_boor_by(
+            self.degree,
+            &self.knots,
+            self.control_points.len(),
+            u,
+            |index| {
+                let point = self.control_points[index];
+                let weight = self.weights[index];
+                [point[0] * weight, point[1] * weight, weight]
+            },
+        );
+        let slope = de_boor_by(
+            self.degree - 1,
+            &self.knots[1..self.knots.len() - 1],
+            self.control_points.len() - 1,
+            u,
+            |i| {
                 let span = self.knots[i + self.degree + 1] - self.knots[i + 1];
                 let scale = if span.abs() < 1e-15 {
                     0.0
                 } else {
                     degree / span
                 };
-                let (before, after) = (homogeneous[i], homogeneous[i + 1]);
+                let point = |index: usize| -> [f64; 3] {
+                    let control = self.control_points[index];
+                    let weight = self.weights[index];
+                    [control[0] * weight, control[1] * weight, weight]
+                };
+                let (before, after) = (point(i), point(i + 1));
                 [
                     (after[0] - before[0]) * scale,
                     (after[1] - before[1]) * scale,
                     (after[2] - before[2]) * scale,
                 ]
-            })
-            .collect();
-
-        let value = de_boor(self.degree, &self.knots, &homogeneous, u);
-        let slope = de_boor(
-            self.degree - 1,
-            &self.knots[1..self.knots.len() - 1],
-            &derivative,
-            u,
+            },
         );
         if value[2].abs() < 1e-15 {
             return [slope[0], slope[1]];
