@@ -4,6 +4,8 @@ use std::f64::consts::{FRAC_PI_2, PI};
 
 /// Default maximum change of direction between samples: 7.5 degrees.
 pub const DEFAULT_ANGLE: f64 = PI / 24.0;
+/// Coarsest chordal display angle: 20 degrees.
+pub const DISPLAY_ANGLE: f64 = PI / 9.0;
 /// Finest display angle: 5 degrees.
 pub const FINE_ANGLE: f64 = PI / 36.0;
 
@@ -24,6 +26,16 @@ pub fn angle_for_resolution(resolution: f64) -> f64 {
         1.0
     };
     angle(DEFAULT_ANGLE / resolution.sqrt()).max(FINE_ANGLE)
+}
+
+/// Maps display resolution to an angular cap for chordal tessellation.
+pub fn display_angle_for_resolution(resolution: f64) -> f64 {
+    let resolution = if resolution.is_finite() && resolution > 0.0 {
+        resolution.clamp(0.01, 10.0)
+    } else {
+        1.0
+    };
+    angle(DISPLAY_ANGLE / resolution.max(1.0).sqrt()).max(FINE_ANGLE)
 }
 
 /// Angle between two directions. A zero direction cannot satisfy a bound.

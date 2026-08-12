@@ -71,6 +71,7 @@ impl Mesh {
 pub struct TessellationTolerance {
     pub angle: f64,
     pub linear: f64,
+    chordal: Option<f64>,
     isolines: usize,
 }
 
@@ -79,8 +80,14 @@ impl TessellationTolerance {
         Self {
             angle: crate::tessellation::angle(angle),
             linear: finite_positive(linear, 1e-9),
+            chordal: None,
             isolines: 0,
         }
+    }
+
+    pub fn with_chordal_deflection(mut self, deflection: f64) -> Self {
+        self.chordal = (deflection.is_finite() && deflection > 0.0).then_some(deflection);
+        self
     }
 
     pub fn with_isolines(mut self, count: usize) -> Self {
@@ -579,18 +586,20 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
     let schedules: HashMap<EdgeKey, Vec<super::place::EdgeSample>> = body
         .edge_keys()
         .filter_map(|edge| {
+            let max_angle = edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal);
             Some((
                 edge,
-                shared_edge_samples(body, edge, tolerance.angle, tolerance.linear)?,
+                shared_edge_samples(body, edge, max_angle, tolerance.linear)?,
             ))
         })
         .collect();
     let mut out = BodyMesh::default();
     for face_key in body.face_keys() {
+        let max_angle = face_chordal_angle(body, face_key, tolerance.angle, tolerance.chordal);
         match scheduled_face(
             body,
             face_key,
-            tolerance.angle,
+            max_angle,
             tolerance.linear,
             &schedules,
         ) {
@@ -602,7 +611,7 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
                     match face_isolines(
                         body,
                         face_key,
-                        tolerance.angle,
+                        max_angle,
                         tolerance.linear,
                         tolerance.isolines,
                         &schedules,
@@ -807,6 +816,87 @@ fn finite_positive(value: f64, fallback: f64) -> f64 {
     } else {
         fallback
     }
+}
+
+fn angle_for_chordal_radius(cap: f64, deflection: Option<f64>, radius: f64) -> f64 {
+    let Some(deflection) = deflection else {
+        return cap;
+    };
+    if !radius.is_finite() || radius <= f64::MIN_POSITIVE {
+        return cap;
+    }
+    let ratio = (deflection / radius).clamp(0.0, 1.0);
+    let chord_angle = (2.0 * (1.0 - ratio).acos()).max(f64::EPSILON);
+    cap.min(crate::tessellation::angle(chord_angle))
+}
+
+fn curve_chordal_radius(curve: &super::geometry::Curve3) -> f64 {
+    match curve {
+        super::geometry::Curve3::Circle(value) => value.radius.abs(),
+        super::geometry::Curve3::Ellipse(value) => {
+            let major = value.major_radius.abs().max(value.minor_radius.abs());
+            let minor = value.major_radius.abs().min(value.minor_radius.abs());
+            if minor > f64::MIN_POSITIVE {
+                major * major / minor
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+fn surface_chordal_radius(surface: &super::geometry::Surface) -> f64 {
+    match surface {
+        super::geometry::Surface::Cylinder(value) => value.radius.abs(),
+        super::geometry::Surface::Cone(value) => value.radius.abs(),
+        super::geometry::Surface::Sphere(value) => value.radius.abs(),
+        super::geometry::Surface::Torus(value) => {
+            value.major_radius.abs() + value.minor_radius.abs()
+        }
+        _ => 0.0,
+    }
+}
+
+fn edge_chordal_angle(
+    body: &Body,
+    edge: EdgeKey,
+    cap: f64,
+    deflection: Option<f64>,
+) -> f64 {
+    let radius = body
+        .edges
+        .get(edge)
+        .and_then(|edge| body.curves.get(edge.curve))
+        .map_or(0.0, curve_chordal_radius);
+    angle_for_chordal_radius(cap, deflection, radius)
+}
+
+fn face_chordal_angle(
+    body: &Body,
+    face: FaceKey,
+    cap: f64,
+    deflection: Option<f64>,
+) -> f64 {
+    let Some(node) = body.faces.get(face) else {
+        return cap;
+    };
+    let mut radius = body
+        .surfaces
+        .get(node.surface)
+        .map_or(0.0, surface_chordal_radius);
+    for coedge in body.face_coedges(face) {
+        let candidate = body
+            .coedges
+            .get(coedge)
+            .and_then(|coedge| body.edges.get(coedge.edge))
+            .and_then(|edge| body.curves.get(edge.curve))
+            .map_or(0.0, curve_chordal_radius);
+        if candidate.is_finite() {
+            radius = radius.max(candidate);
+        }
+    }
+    angle_for_chordal_radius(cap, deflection, radius)
 }
 
 fn angle_exceeds(value: f64, limit: f64) -> bool {
