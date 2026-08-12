@@ -52,7 +52,7 @@ pub use snap::{
 };
 pub use tessellate::{arc, ellipse_arc, lerp, DEFAULT_SEGMENTS_PER_RADIAN};
 pub use transform::Transform;
-pub use triangulate::polygon as triangulate;
+pub use triangulate::{polygon as triangulate, rings as triangulate_rings};
 pub use vec::Vec2;
 
 /// An ellipse in the plane.

@@ -25,6 +25,324 @@
 
 use super::vec::Vec2;
 
+#[derive(Clone, Copy)]
+struct RingBounds {
+    min: Vec2,
+    max: Vec2,
+}
+
+impl RingBounds {
+    fn of(ring: &[[f64; 2]]) -> Option<Self> {
+        let mut points = ring.iter().copied().map(Vec2::from);
+        let first = points.next()?;
+        let mut bounds = Self {
+            min: first,
+            max: first,
+        };
+        for point in points {
+            bounds.min.x = bounds.min.x.min(point.x);
+            bounds.min.y = bounds.min.y.min(point.y);
+            bounds.max.x = bounds.max.x.max(point.x);
+            bounds.max.y = bounds.max.y.max(point.y);
+        }
+        Some(bounds)
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.max.x >= other.min.x
+            && other.max.x >= self.min.x
+            && self.max.y >= other.min.y
+            && other.max.y >= self.min.y
+    }
+}
+
+struct CheckedRing {
+    points: Vec<[f64; 2]>,
+    area: f64,
+    bounds: RingBounds,
+}
+
+/// Triangulates rings using even-odd containment.
+///
+/// Disjoint outer rings, holes, and nested islands may be mixed in any order.
+/// Invalid intersecting components are omitted.
+pub fn rings(input: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
+    let mut rings = Vec::new();
+    let mut invalid = Vec::new();
+    for raw in input {
+        let points = sanitize(raw);
+        let Some(bounds) = RingBounds::of(&points) else {
+            continue;
+        };
+        let area = signed_area_arrays(&points);
+        if !simple(&points) || !area.is_finite() || area == 0.0 {
+            invalid.push(CheckedRing {
+                points,
+                area: area.abs(),
+                bounds,
+            });
+            continue;
+        }
+        rings.push(CheckedRing {
+            points,
+            area: area.abs(),
+            bounds,
+        });
+    }
+
+    let mut bad = vec![false; rings.len()];
+    for first in 0..rings.len() {
+        for second in first + 1..rings.len() {
+            if rings[first].bounds.overlaps(rings[second].bounds)
+                && ring_boundaries_intersect(&rings[first].points, &rings[second].points)
+            {
+                bad[first] = true;
+                bad[second] = true;
+            }
+        }
+    }
+    for (index, ring) in rings.iter().enumerate() {
+        if invalid.iter().any(|other| rings_interact(ring, other)) {
+            bad[index] = true;
+        }
+    }
+    loop {
+        let active_bad: Vec<usize> = bad
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bad)| bad.then_some(index))
+            .collect();
+        let mut changed = false;
+        for (index, ring) in rings.iter().enumerate() {
+            if !bad[index]
+                && active_bad
+                    .iter()
+                    .any(|other| rings_interact(ring, &rings[*other]))
+            {
+                bad[index] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let valid: Vec<CheckedRing> = rings
+        .into_iter()
+        .zip(bad)
+        .filter_map(|(ring, bad)| (!bad).then_some(ring))
+        .collect();
+    let mut parent = vec![None; valid.len()];
+    for index in 0..valid.len() {
+        parent[index] = (0..valid.len())
+            .filter(|other| {
+                *other != index
+                    && valid[*other].area > valid[index].area
+                    && ring_contains(&valid[*other].points, valid[index].points[0])
+            })
+            .min_by(|a, b| valid[*a].area.total_cmp(&valid[*b].area));
+    }
+    let depth: Vec<usize> = (0..valid.len())
+        .map(|index| {
+            let mut depth = 0;
+            let mut next = parent[index];
+            while let Some(ancestor) = next {
+                depth += 1;
+                next = parent[ancestor];
+            }
+            depth
+        })
+        .collect();
+
+    let mut points = Vec::new();
+    let mut triangles = Vec::new();
+    for root in (0..valid.len()).filter(|index| parent[*index].is_none()) {
+        let members: Vec<usize> = (0..valid.len())
+            .filter(|index| root_of(*index, &parent) == root)
+            .collect();
+        let mut component_points = Vec::new();
+        let mut component_triangles = Vec::new();
+        let mut complete = true;
+        for outer in members.iter().copied().filter(|index| depth[*index] % 2 == 0) {
+            let holes: Vec<Vec<[f64; 2]>> = members
+                .iter()
+                .copied()
+                .filter(|index| parent[*index] == Some(outer) && depth[*index] % 2 == 1)
+                .map(|index| valid[index].points.clone())
+                .collect();
+            let expected = valid[outer].area
+                - holes.iter().map(|hole| signed_area_arrays(hole).abs()).sum::<f64>();
+            let (local_points, local_triangles) = polygon(&valid[outer].points, &holes);
+            if !triangulation_matches(&local_points, &local_triangles, expected) {
+                complete = false;
+                break;
+            }
+            let base = component_points.len();
+            component_points.extend(local_points);
+            component_triangles.extend(local_triangles.into_iter().map(|triangle| {
+                [triangle[0] + base, triangle[1] + base, triangle[2] + base]
+            }));
+        }
+        if complete {
+            let base = points.len();
+            points.extend(component_points);
+            triangles.extend(component_triangles.into_iter().map(|triangle| {
+                [triangle[0] + base, triangle[1] + base, triangle[2] + base]
+            }));
+        }
+    }
+    (points, triangles)
+}
+
+fn rings_interact(first: &CheckedRing, second: &CheckedRing) -> bool {
+    first.bounds.overlaps(second.bounds)
+        && (ring_boundaries_intersect(&first.points, &second.points)
+            || ring_contains(&first.points, second.points[0])
+            || ring_contains(&second.points, first.points[0]))
+}
+
+fn sanitize(ring: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    if ring.iter().flatten().any(|value| !value.is_finite()) {
+        return Vec::new();
+    }
+    let mut points = Vec::with_capacity(ring.len());
+    for point in ring {
+        if points.last() != Some(point) {
+            points.push(*point);
+        }
+    }
+    while points.len() > 1 && points.first() == points.last() {
+        points.pop();
+    }
+    points
+}
+
+fn signed_area_arrays(ring: &[[f64; 2]]) -> f64 {
+    let points: Vec<Vec2> = ring.iter().copied().map(Vec2::from).collect();
+    signed_area(&points)
+}
+
+fn simple(ring: &[[f64; 2]]) -> bool {
+    if ring.len() < 3 {
+        return false;
+    }
+    for first in 0..ring.len() {
+        if (first + 1..ring.len()).any(|second| ring[first] == ring[second]) {
+            return false;
+        }
+    }
+    for index in 0..ring.len() {
+        let before = Vec2::from(ring[(index + ring.len() - 1) % ring.len()]);
+        let here = Vec2::from(ring[index]);
+        let after = Vec2::from(ring[(index + 1) % ring.len()]);
+        let incoming = before - here;
+        let outgoing = after - here;
+        let epsilon = 64.0
+            * f64::EPSILON
+            * incoming.length_squared().max(outgoing.length_squared()).max(1.0);
+        if incoming.cross(outgoing).abs() <= epsilon && incoming.dot(outgoing) > 0.0 {
+            return false;
+        }
+    }
+    for first in 0..ring.len() {
+        let first_next = (first + 1) % ring.len();
+        for second in first + 1..ring.len() {
+            let second_next = (second + 1) % ring.len();
+            if first_next == second || second_next == first {
+                continue;
+            }
+            if segments_intersect(ring[first], ring[first_next], ring[second], ring[second_next]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn ring_boundaries_intersect(first: &[[f64; 2]], second: &[[f64; 2]]) -> bool {
+    (0..first.len()).any(|a| {
+        (0..second.len()).any(|b| {
+            segments_intersect(
+                first[a],
+                first[(a + 1) % first.len()],
+                second[b],
+                second[(b + 1) % second.len()],
+            )
+        })
+    })
+}
+
+fn segments_intersect(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    let (a, b, c, d) = (Vec2::from(a), Vec2::from(b), Vec2::from(c), Vec2::from(d));
+    let turn = |p: Vec2, q: Vec2, r: Vec2| (q - p).cross(r - p);
+    let values = [turn(a, b, c), turn(a, b, d), turn(c, d, a), turn(c, d, b)];
+    let scale = (b - a).length_squared().max((d - c).length_squared()).max(1.0);
+    let epsilon = 64.0 * f64::EPSILON * scale;
+    let on = |p: Vec2, q: Vec2, r: Vec2, value: f64| {
+        value.abs() <= epsilon
+            && r.x >= p.x.min(q.x) - epsilon
+            && r.x <= p.x.max(q.x) + epsilon
+            && r.y >= p.y.min(q.y) - epsilon
+            && r.y <= p.y.max(q.y) + epsilon
+    };
+    (values[0] > epsilon && values[1] < -epsilon
+        || values[0] < -epsilon && values[1] > epsilon)
+        && (values[2] > epsilon && values[3] < -epsilon
+            || values[2] < -epsilon && values[3] > epsilon)
+        || on(a, b, c, values[0])
+        || on(a, b, d, values[1])
+        || on(c, d, a, values[2])
+        || on(c, d, b, values[3])
+}
+
+fn ring_contains(ring: &[[f64; 2]], point: [f64; 2]) -> bool {
+    ring.iter()
+        .zip(ring.iter().cycle().skip(1))
+        .take(ring.len())
+        .fold(false, |inside, (from, to)| {
+            inside
+                ^ ((from[1] > point[1]) != (to[1] > point[1])
+                    && point[0]
+                        < (to[0] - from[0]) * (point[1] - from[1]) / (to[1] - from[1])
+                            + from[0])
+        })
+}
+
+fn root_of(mut index: usize, parent: &[Option<usize>]) -> usize {
+    while let Some(next) = parent[index] {
+        index = next;
+    }
+    index
+}
+
+fn triangulation_matches(
+    points: &[[f64; 2]],
+    triangles: &[[usize; 3]],
+    expected: f64,
+) -> bool {
+    if triangles.is_empty() || !expected.is_finite() || expected <= 0.0 {
+        return false;
+    }
+    let mut area = 0.0;
+    for triangle in triangles {
+        let Some((&a, &b, &c)) = points
+            .get(triangle[0])
+            .zip(points.get(triangle[1]))
+            .zip(points.get(triangle[2]))
+            .map(|((a, b), c)| (a, b, c))
+        else {
+            return false;
+        };
+        let twice = (Vec2::from(b) - Vec2::from(a)).cross(Vec2::from(c) - Vec2::from(a));
+        if !twice.is_finite() || twice <= 0.0 {
+            return false;
+        }
+        area += twice * 0.5;
+    }
+    (area - expected).abs() <= expected.max(1.0) * 1.0e-9
+}
+
 /// Triangles filling `outer`, with `holes` removed.
 ///
 /// Each triangle is three indices into a single point list, which is returned
