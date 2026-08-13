@@ -74,16 +74,13 @@ pub fn nesting_depths(input: &[Vec<[f64; 2]>]) -> Vec<usize> {
         .iter()
         .enumerate()
         .map(|(index, ring)| {
-            let Some(&point) = ring.first() else {
-                return 0;
-            };
             rings
                 .iter()
                 .enumerate()
                 .filter(|(other, outer)| {
                     *other != index
                         && areas[*other] > areas[index]
-                        && ring_contains(outer, point)
+                        && ring_strictly_contains(outer, ring)
                 })
                 .count()
         })
@@ -122,7 +119,7 @@ pub fn rings(input: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
     for first in 0..rings.len() {
         for second in first + 1..rings.len() {
             if rings[first].bounds.overlaps(rings[second].bounds)
-                && ring_boundaries_intersect(&rings[first].points, &rings[second].points)
+                && ring_boundaries_properly_cross(&rings[first].points, &rings[second].points)
             {
                 bad[first] = true;
                 bad[second] = true;
@@ -165,9 +162,9 @@ pub fn rings(input: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
     for index in 0..valid.len() {
         parent[index] = (0..valid.len())
             .filter(|other| {
-                *other != index
-                    && valid[*other].area > valid[index].area
-                    && ring_contains(&valid[*other].points, valid[index].points[0])
+                    *other != index
+                        && valid[*other].area > valid[index].area
+                    && ring_strictly_contains(&valid[*other].points, &valid[index].points)
             })
             .min_by(|a, b| valid[*a].area.total_cmp(&valid[*b].area));
     }
@@ -226,8 +223,8 @@ pub fn rings(input: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
 fn rings_interact(first: &CheckedRing, second: &CheckedRing) -> bool {
     first.bounds.overlaps(second.bounds)
         && (ring_boundaries_intersect(&first.points, &second.points)
-            || ring_contains(&first.points, second.points[0])
-            || ring_contains(&second.points, first.points[0]))
+            || ring_strictly_contains(&first.points, &second.points)
+            || ring_strictly_contains(&second.points, &first.points))
 }
 
 fn sanitize(ring: &[[f64; 2]]) -> Vec<[f64; 2]> {
@@ -301,6 +298,31 @@ fn ring_boundaries_intersect(first: &[[f64; 2]], second: &[[f64; 2]]) -> bool {
     })
 }
 
+fn ring_boundaries_properly_cross(first: &[[f64; 2]], second: &[[f64; 2]]) -> bool {
+    (0..first.len()).any(|a| {
+        (0..second.len()).any(|b| {
+            segments_properly_cross(
+                first[a],
+                first[(a + 1) % first.len()],
+                second[b],
+                second[(b + 1) % second.len()],
+            )
+        })
+    })
+}
+
+fn segments_properly_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    let (a, b, c, d) = (Vec2::from(a), Vec2::from(b), Vec2::from(c), Vec2::from(d));
+    let turn = |p: Vec2, q: Vec2, r: Vec2| (q - p).cross(r - p);
+    let values = [turn(a, b, c), turn(a, b, d), turn(c, d, a), turn(c, d, b)];
+    let scale = (b - a).length_squared().max((d - c).length_squared()).max(1.0);
+    let epsilon = 64.0 * f64::EPSILON * scale;
+    (values[0] > epsilon && values[1] < -epsilon
+        || values[0] < -epsilon && values[1] > epsilon)
+        && (values[2] > epsilon && values[3] < -epsilon
+            || values[2] < -epsilon && values[3] > epsilon)
+}
+
 fn segments_intersect(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     let (a, b, c, d) = (Vec2::from(a), Vec2::from(b), Vec2::from(c), Vec2::from(d));
     let turn = |p: Vec2, q: Vec2, r: Vec2| (q - p).cross(r - p);
@@ -335,6 +357,33 @@ fn ring_contains(ring: &[[f64; 2]], point: [f64; 2]) -> bool {
                         < (to[0] - from[0]) * (point[1] - from[1]) / (to[1] - from[1])
                             + from[0])
         })
+}
+
+fn ring_strictly_contains(outer: &[[f64; 2]], inner: &[[f64; 2]]) -> bool {
+    inner
+        .iter()
+        .copied()
+        .find(|point| !point_on_boundary(outer, *point))
+        .is_some_and(|point| ring_contains(outer, point))
+}
+
+fn point_on_boundary(ring: &[[f64; 2]], point: [f64; 2]) -> bool {
+    ring.iter()
+        .zip(ring.iter().cycle().skip(1))
+        .take(ring.len())
+        .any(|(&start, &end)| point_on_segment(start, end, point))
+}
+
+fn point_on_segment(start: [f64; 2], end: [f64; 2], point: [f64; 2]) -> bool {
+    let (start, end, point) = (Vec2::from(start), Vec2::from(end), Vec2::from(point));
+    let edge = end - start;
+    let offset = point - start;
+    let epsilon = 64.0 * f64::EPSILON * edge.length_squared().max(1.0);
+    edge.cross(offset).abs() <= epsilon
+        && point.x >= start.x.min(end.x) - epsilon
+        && point.x <= start.x.max(end.x) + epsilon
+        && point.y >= start.y.min(end.y) - epsilon
+        && point.y <= start.y.max(end.y) + epsilon
 }
 
 fn root_of(mut index: usize, parent: &[Option<usize>]) -> usize {
