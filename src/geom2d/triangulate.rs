@@ -62,6 +62,34 @@ struct CheckedRing {
     bounds: RingBounds,
 }
 
+/// Containment depth of each input ring. Even depths are filled exteriors.
+pub fn nesting_depths(input: &[Vec<[f64; 2]>]) -> Vec<usize> {
+    let rings: Vec<Vec<[f64; 2]>> = input.iter().map(|ring| sanitize(ring)).collect();
+    let areas: Vec<f64> = rings
+        .iter()
+        .map(|ring| signed_area_arrays(ring).abs())
+        .collect();
+
+    rings
+        .iter()
+        .enumerate()
+        .map(|(index, ring)| {
+            let Some(&point) = ring.first() else {
+                return 0;
+            };
+            rings
+                .iter()
+                .enumerate()
+                .filter(|(other, outer)| {
+                    *other != index
+                        && areas[*other] > areas[index]
+                        && ring_contains(outer, point)
+                })
+                .count()
+        })
+        .collect()
+}
+
 /// Triangulates rings using even-odd containment.
 ///
 /// Disjoint outer rings, holes, and nested islands may be mixed in any order.
