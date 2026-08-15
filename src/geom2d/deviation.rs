@@ -90,6 +90,9 @@ impl Curve {
         } else {
             count.saturating_sub(1)
         };
+        if segments == 0 {
+            return polyline.vertices.iter().map(|vertex| vertex.position).collect();
+        }
         let mut out = Vec::new();
         for index in 0..segments {
             let next = (index + 1) % count;
@@ -152,6 +155,9 @@ impl Curve {
         let Self::Polyline(polyline) = self else {
             return Vec::new();
         };
+        if polyline.vertices.len() < 2 {
+            return polyline.vertices.iter().map(|vertex| vertex.position).collect();
+        }
         let count = polyline.vertices.len();
         let mut out: Vec<[f64; 2]> = Vec::new();
         for (index, segment) in self.segments().into_iter().enumerate() {

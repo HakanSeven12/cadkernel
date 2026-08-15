@@ -1416,6 +1416,7 @@ mod tests {
                 Some(Surface::Cone(_)) => "cone",
                 Some(Surface::Sphere(_)) => "sphere",
                 Some(Surface::Torus(_)) => "torus",
+                Some(Surface::Nurbs(_)) => "nurbs",
                 None => "missing",
             })
             .collect();
