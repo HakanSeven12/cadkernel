@@ -28,6 +28,8 @@
 //! whether a loop is a hole wants the sign.
 
 use super::curve::Curve;
+use super::polyline::{BulgeArc, Polyline};
+use super::transform::Transform;
 use super::vec::Vec2;
 use std::f64::consts::TAU;
 
@@ -66,23 +68,42 @@ impl Curve {
                 circular_area(arc.centre, arc.radius, start, start + arc.sweep())
             }
             Self::Ellipse(_) | Self::Nurbs(_) => self.integrated_area(),
-            Self::Polyline(polyline) => {
-                let mut total: f64 = self.segments().iter().map(Curve::enclosed_area).sum();
-                if !polyline.closed {
-                    // An open polyline's chain is closed by the chord from its
-                    // far end back to its start, so that its area is the
-                    // region a caller sees rather than an open sum. A closed
-                    // one already has that edge among its segments.
-                    if let (Some(first), Some(last)) =
-                        (polyline.vertices.first(), polyline.vertices.last())
-                    {
-                        total += 0.5
-                            * Vec2::from(last.position).cross(Vec2::from(first.position));
-                    }
-                }
-                total
-            }
+            Self::Polyline(polyline) => polyline_area(polyline),
         }
+    }
+
+    /// Centroid of the region closed by this curve.
+    pub fn enclosed_centroid(&self) -> Option<[f64; 2]> {
+        match self {
+            Self::Polyline(polyline) if polyline.vertices.len() < 2 => return None,
+            Self::Polyline(_) => {}
+            _ if !self.is_closed() => return None,
+            _ => {}
+        }
+        let origin = self.point_at(0.0);
+        let local = self.transformed(&Transform::translation([-origin[0], -origin[1]]))?;
+        let (area, first_x, first_y) = local.enclosed_moments();
+        (area.is_finite()
+            && area != 0.0
+            && first_x.is_finite()
+            && first_y.is_finite())
+        .then_some([origin[0] + first_x / area, origin[1] + first_y / area])
+    }
+
+    fn enclosed_moments(&self) -> (f64, f64, f64) {
+        match self {
+            Self::Polyline(polyline) => polyline_moments(polyline),
+            _ => self.moment_contribution(),
+        }
+    }
+
+    fn moment_contribution(&self) -> (f64, f64, f64) {
+        let (first_x, first_y) = self.integrated_first_moments();
+        (self.enclosed_area(), first_x, first_y)
+    }
+
+    fn integrated_first_moments(&self) -> (f64, f64) {
+        integrated_first_moments(|t| self.point_at(t), |t| self.tangent_at(t))
     }
 
     /// The area contribution by numeric integration, for the kinds with no
@@ -107,6 +128,132 @@ impl Curve {
             .sum::<f64>()
             * 0.5
     }
+}
+
+fn add_moments(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64, f64) {
+    (a.0 + b.0, a.1 + b.1, a.2 + b.2)
+}
+
+fn polyline_area(polyline: &Polyline) -> f64 {
+    let vertices = polyline.vertices.len();
+    let segments = if vertices < 2 {
+        0
+    } else if polyline.closed {
+        vertices
+    } else {
+        vertices - 1
+    };
+    let mut area = 0.0;
+    for index in 0..segments {
+        let start = polyline.vertices[index].position;
+        let end = polyline.vertices[(index + 1) % vertices].position;
+        area += match polyline.segment_arc(index) {
+            Some(arc) => circular_area(
+                arc.center,
+                arc.radius,
+                arc.start_angle,
+                arc.start_angle + arc.sweep,
+            ),
+            None => 0.5 * Vec2::from(start).cross(Vec2::from(end)),
+        };
+    }
+    if !polyline.closed && vertices >= 2 {
+        area += 0.5
+            * Vec2::from(polyline.vertices[vertices - 1].position)
+                .cross(Vec2::from(polyline.vertices[0].position));
+    }
+    area
+}
+
+fn polyline_moments(polyline: &Polyline) -> (f64, f64, f64) {
+    let vertices = polyline.vertices.len();
+    let segments = if vertices < 2 {
+        0
+    } else if polyline.closed {
+        vertices
+    } else {
+        vertices - 1
+    };
+    let mut total = (0.0, 0.0, 0.0);
+    for index in 0..segments {
+        let start = polyline.vertices[index].position;
+        let end = polyline.vertices[(index + 1) % vertices].position;
+        let contribution = match polyline.segment_arc(index) {
+            Some(arc) => bulge_moments(&arc),
+            None => line_moments(start, end),
+        };
+        total = add_moments(total, contribution);
+    }
+    if !polyline.closed && vertices >= 2 {
+        total = add_moments(
+            total,
+            line_moments(
+                polyline.vertices[vertices - 1].position,
+                polyline.vertices[0].position,
+            ),
+        );
+    }
+    total
+}
+
+fn bulge_moments(arc: &BulgeArc) -> (f64, f64, f64) {
+    let first = integrated_first_moments(
+        |t| arc.sample(t),
+        |t| {
+            let angle = arc.start_angle + arc.sweep * t;
+            [
+                -arc.radius * angle.sin() * arc.sweep,
+                arc.radius * angle.cos() * arc.sweep,
+            ]
+        },
+    );
+    (
+        circular_area(
+            arc.center,
+            arc.radius,
+            arc.start_angle,
+            arc.start_angle + arc.sweep,
+        ),
+        first.0,
+        first.1,
+    )
+}
+
+fn line_moments(start: [f64; 2], end: [f64; 2]) -> (f64, f64, f64) {
+    let step = [end[0] - start[0], end[1] - start[1]];
+    let first = integrated_first_moments(
+        |t| [start[0] + step[0] * t, start[1] + step[1] * t],
+        |_| step,
+    );
+    (
+        0.5 * Vec2::from(start).cross(Vec2::from(end)),
+        first.0,
+        first.1,
+    )
+}
+
+fn integrated_first_moments(
+    point_at: impl Fn(f64) -> [f64; 2],
+    tangent_at: impl Fn(f64) -> [f64; 2],
+) -> (f64, f64) {
+    let width = 1.0 / PANELS as f64;
+    (0..PANELS)
+        .flat_map(|panel| {
+            let half = 0.5 * width;
+            let middle = width * panel as f64 + half;
+            let point_at = &point_at;
+            let tangent_at = &tangent_at;
+            NODES.iter().map(move |(node, weight)| {
+                let t = middle + half * node;
+                let point = point_at(t);
+                let step = tangent_at(t);
+                (
+                    half * weight * 0.5 * point[0] * point[0] * step[1],
+                    -half * weight * 0.5 * point[1] * point[1] * step[0],
+                )
+            })
+        })
+        .fold((0.0, 0.0), |(ax, ay), (bx, by)| (ax + bx, ay + by))
 }
 
 /// `½∮(x dy − y dx)` along a circular arc from `start` to `end` radians.
