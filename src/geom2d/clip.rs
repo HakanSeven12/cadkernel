@@ -24,6 +24,67 @@ use super::curve::{Curve, Extent};
 use super::vec::Vec2;
 use super::Tolerance;
 
+/// Curve spans left after removing the cut interval containing `picked`.
+pub fn trim_spans(
+    curve: &Curve,
+    cuts: &[f64],
+    picked: f64,
+    tolerance: Tolerance,
+) -> Vec<[f64; 2]> {
+    let extent = curve.extent();
+    if !picked.is_finite() {
+        return Vec::new();
+    }
+    let (first, last) = match extent {
+        Extent::Bounded => (0.0, 1.0),
+        Extent::Forward => (0.0, f64::INFINITY),
+        Extent::Infinite => (f64::NEG_INFINITY, f64::INFINITY),
+    };
+    let picked = match extent {
+        Extent::Bounded => picked.clamp(0.0, 1.0),
+        Extent::Forward => picked.max(0.0),
+        Extent::Infinite => picked,
+    };
+    let speed = Vec2::from(curve.tangent_at(picked)).length();
+    let merge = if speed > 0.0 {
+        (tolerance.linear() / speed).min(1.0)
+    } else {
+        tolerance.linear()
+    };
+
+    let mut bounds = vec![first];
+    bounds.extend(
+        cuts
+            .iter()
+            .copied()
+            .filter(|cut| cut.is_finite() && extent.holds(*cut))
+            .map(|cut| match extent {
+                Extent::Bounded => cut.clamp(0.0, 1.0),
+                Extent::Forward => cut.max(0.0),
+                Extent::Infinite => cut,
+            }),
+    );
+    bounds.push(last);
+    bounds.sort_by(f64::total_cmp);
+    bounds.dedup_by(|a, b| (*a - *b).abs() <= merge);
+
+    let Some(removed) = bounds
+        .windows(2)
+        .position(|span| picked >= span[0] - merge && picked <= span[1] + merge)
+    else {
+        return Vec::new();
+    };
+
+    let mut kept = Vec::with_capacity(2);
+    if bounds[removed] - first > merge {
+        kept.push([first, bounds[removed]]);
+    }
+    if last - bounds[removed + 1] > merge {
+        kept.push([bounds[removed + 1], last]);
+    }
+    kept
+}
+
 /// The spans of `curve` that lie inside `boundary`, as parameter pairs.
 ///
 /// The boundary is taken as a set of curves that between them close one or

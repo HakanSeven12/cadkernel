@@ -34,7 +34,7 @@ pub mod vec;
 
 pub use angle::{angle_within_arc, arc_parameter, arc_span, normalize_angle};
 pub use arrangement::{bounded_faces, segment_crossing, signed_area, SegmentCrossing};
-pub use clip::{inside_pieces, inside_spans};
+pub use clip::{inside_pieces, inside_spans, trim_spans};
 pub use containment::{closest_point, contains, distance_to, nearest_of, Closest};
 pub use cross::{intersect, Crossing};
 pub use curve::{Arc, Circle, Curve, EllipseArc, Extent, Line, Ray, XLine};
