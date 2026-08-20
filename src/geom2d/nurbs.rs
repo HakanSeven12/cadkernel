@@ -585,6 +585,31 @@ impl NurbsCurve {
             .then_some((left, right))
     }
 
+    /// A smooth curve that remains within `tolerance` of an open polyline.
+    pub fn fit_polyline(points: &[[f64; 2]], tolerance: f64) -> Option<Self> {
+        if !tolerance.is_finite()
+            || tolerance < 0.0
+            || points.iter().flatten().any(|value| !value.is_finite())
+        {
+            return None;
+        }
+        let mut points = points.to_vec();
+        points.dedup();
+        if points.len() < 2 {
+            return None;
+        }
+        if tolerance == 0.0 {
+            return Self::new(1, points, Vec::new(), None);
+        }
+
+        let allowance = tolerance * 0.5;
+        let points = simplify_polyline(&points, allowance);
+        if points.len() == 2 {
+            return Self::new(1, points, Vec::new(), None);
+        }
+        rounded_polyline(&points, allowance)
+    }
+
     /// The C² cubic through every one of `points`.
     ///
     /// This is the other way a drawing describes a spline: fit points it must
@@ -744,6 +769,113 @@ impl NurbsCurve {
     }
 }
 
+fn simplify_polyline(points: &[[f64; 2]], tolerance: f64) -> Vec<[f64; 2]> {
+    if points.len() <= 2 || tolerance == 0.0 {
+        return points.to_vec();
+    }
+    let mut keep = vec![false; points.len()];
+    keep[0] = true;
+    keep[points.len() - 1] = true;
+    let mut ranges = vec![(0usize, points.len() - 1)];
+    while let Some((start, end)) = ranges.pop() {
+        let mut farthest = None;
+        let mut distance = tolerance;
+        let from = Vec2::from(points[start]);
+        let along = Vec2::from(points[end]) - from;
+        let squared = along.length_squared();
+        let mut previous_parameter = 0.0;
+        let mut reversal = None;
+        for index in start + 1..end {
+            let point = Vec2::from(points[index]);
+            let parameter = if squared > 0.0 {
+                (point - from).dot(along) / squared
+            } else {
+                0.0
+            };
+            if parameter + 1e-12 < previous_parameter {
+                reversal = Some(index);
+                break;
+            }
+            previous_parameter = parameter;
+            let here = point.distance_to_segment(from, Vec2::from(points[end]));
+            if here > distance {
+                distance = here;
+                farthest = Some(index);
+            }
+        }
+        if reversal.is_none() && previous_parameter > 1.0 + 1e-12 {
+            reversal = Some(end - 1);
+        }
+        if let Some(index) = reversal.or(farthest) {
+            keep[index] = true;
+            ranges.push((start, index));
+            ranges.push((index, end));
+        }
+    }
+    points
+        .iter()
+        .copied()
+        .zip(keep)
+        .filter_map(|(point, keep)| keep.then_some(point))
+        .collect()
+}
+
+type CubicSegment = ([[f64; 2]; 4], f64);
+
+fn push_line_segment(segments: &mut Vec<CubicSegment>, from: Vec2, to: Vec2) {
+    let length = from.distance(to);
+    if length == 0.0 {
+        return;
+    }
+    segments.push((
+        [
+            from.into(),
+            from.lerp(to, 1.0 / 3.0).into(),
+            from.lerp(to, 2.0 / 3.0).into(),
+            to.into(),
+        ],
+        length,
+    ));
+}
+
+fn rounded_polyline(points: &[[f64; 2]], allowance: f64) -> Option<NurbsCurve> {
+    let mut segments = Vec::<CubicSegment>::new();
+    let mut current = Vec2::from(points[0]);
+    for window in points.windows(3) {
+        let previous = Vec2::from(window[0]);
+        let corner = Vec2::from(window[1]);
+        let next = Vec2::from(window[2]);
+        let incoming = (corner - previous).normalize()?;
+        let outgoing = (next - corner).normalize()?;
+        let trim = allowance
+            .min(previous.distance(corner) * 0.5)
+            .min(corner.distance(next) * 0.5);
+        let entry = corner - incoming * trim;
+        let exit = corner + outgoing * trim;
+        push_line_segment(&mut segments, current, entry);
+        if entry.distance(exit) > 0.0 {
+            segments.push((
+                [entry.into(), corner.into(), corner.into(), exit.into()],
+                entry.distance(corner) + corner.distance(exit),
+            ));
+        }
+        current = exit;
+    }
+    push_line_segment(&mut segments, current, Vec2::from(*points.last()?));
+
+    let (first, rest) = segments.split_first()?;
+    let mut control_points = first.0.to_vec();
+    let mut knots = vec![0.0; 4];
+    let mut parameter = first.1;
+    for segment in rest {
+        knots.extend([parameter; 3]);
+        control_points.extend_from_slice(&segment.0[1..]);
+        parameter += segment.1;
+    }
+    knots.extend([parameter; 4]);
+    NurbsCurve::new_strict(3, control_points.clone(), knots, vec![1.0; control_points.len()])
+}
+
 /// In-place Thomas solve for a tridiagonal system: `a` sub-diagonal, `b` main,
 /// `c` super, `d` right-hand side, overwritten with the solution.
 fn solve_tridiagonal(a: &[f64], b: &[f64], c: &[f64], d: &mut [f64]) {
@@ -792,6 +924,35 @@ mod tests {
             Some(vec![1.0, weight, 1.0]),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn freehand_fit_stays_within_tolerance() {
+        let source = [[0.0, 0.0], [1.0, 0.8], [2.0, -0.6], [3.0, 0.0]];
+        let tolerance = 0.4;
+        let curve = NurbsCurve::fit_polyline(&source, tolerance).unwrap();
+        for point in curve.tessellate(32) {
+            let distance = source
+                .windows(2)
+                .map(|pair| {
+                    Vec2::from(point)
+                        .distance_to_segment(pair[0].into(), pair[1].into())
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(distance <= tolerance + 1e-9);
+        }
+        for point in source {
+            let on_curve = curve.point_at(curve.parameter_at(point));
+            assert!(Vec2::from(point).distance(on_curve.into()) <= tolerance + 1e-9);
+        }
+    }
+
+    #[test]
+    fn zero_freehand_tolerance_keeps_the_polyline() {
+        let source = [[0.0, 0.0], [1.0, 2.0], [3.0, 1.0]];
+        let curve = NurbsCurve::fit_polyline(&source, 0.0).unwrap();
+        assert_eq!(curve.degree(), 1);
+        assert_eq!(curve.control_points(), source.as_slice());
     }
 
     #[test]
