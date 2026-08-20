@@ -21,6 +21,7 @@ pub mod curve;
 pub mod deviation;
 pub mod fillet;
 pub mod frame;
+pub mod gradient;
 pub mod intersect;
 pub mod nurbs;
 #[cfg(feature = "offset")]
@@ -41,6 +42,7 @@ pub use curve::{Arc, Circle, Curve, EllipseArc, Extent, Line, Ray, XLine};
 pub use nurbs::{NurbsCurve, Parameterization};
 pub use frame::Frame;
 pub use fillet::{fillet_between_rays, fillets_between, Fillet};
+pub use gradient::{gradient_frame, GradientFrame};
 pub use intersect::{
     circle_circle_angles, circle_circle_points, line_circle, line_ellipse, line_line,
 };
