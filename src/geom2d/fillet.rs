@@ -201,7 +201,7 @@ fn offsets(curve: &Curve, radius: f64) -> Option<Vec<Curve>> {
 }
 
 fn concentric(centre: [f64; 2], own: f64, radius: f64) -> Vec<Curve> {
-    [own + radius, own - radius]
+    [own + radius, (own - radius).abs()]
         .into_iter()
         .filter(|r| *r > 1e-12)
         .map(|r| Curve::Circle(Circle { centre, radius: r }))
@@ -224,20 +224,33 @@ fn touch_point(curve: &Curve, centre: Vec2, radius: f64, tolerance: Tolerance) -
             }
             origin + along * ((centre - origin).dot(along) / squared)
         }
-        Curve::Circle(circle) => {
-            let middle = Vec2::from(circle.centre);
-            let out = (centre - middle).normalize()?;
-            middle + out * circle.radius
-        }
-        Curve::Arc(arc) => {
-            let middle = Vec2::from(arc.centre);
-            let out = (centre - middle).normalize()?;
-            middle + out * arc.radius
-        }
+        Curve::Circle(circle) => circle_touch(
+            Vec2::from(circle.centre),
+            circle.radius,
+            centre,
+            radius,
+        )?,
+        Curve::Arc(arc) => circle_touch(
+            Vec2::from(arc.centre),
+            arc.radius,
+            centre,
+            radius,
+        )?,
         _ => return None,
     };
     let off_by = (touch.distance(centre) - radius).abs();
     (off_by <= tolerance.linear()).then_some(touch)
+}
+
+fn circle_touch(middle: Vec2, own: f64, centre: Vec2, radius: f64) -> Option<Vec2> {
+    let out = (centre - middle).normalize()?;
+    [middle + out * own, middle - out * own]
+        .into_iter()
+        .min_by(|a, b| {
+            (a.distance(centre) - radius)
+                .abs()
+                .total_cmp(&(b.distance(centre) - radius).abs())
+        })
 }
 
 /// The arc from one tangent point to the other about `centre`, taking the
@@ -369,6 +382,44 @@ mod tests {
         // A radius large enough to bridge the gap between them.
         let found = check_tangency(&left, &right, 30.0);
         assert!(!found.is_empty(), "expected a bridging fillet");
+    }
+
+    #[test]
+    fn a_larger_circle_can_enclose_two_tangent_circles() {
+        let left = Curve::Circle(Circle {
+            centre: [-3.0, 0.0],
+            radius: 1.0,
+        });
+        let right = Curve::Circle(Circle {
+            centre: [3.0, 0.0],
+            radius: 1.0,
+        });
+        let found = check_tangency(&left, &right, 5.0);
+        let y = 7.0f64.sqrt();
+        assert!(found.iter().any(|fillet| {
+            (fillet.centre[0].abs() < 1e-9)
+                && ((fillet.centre[1] - y).abs() < 1e-9
+                    || (fillet.centre[1] + y).abs() < 1e-9)
+        }));
+    }
+
+    #[test]
+    fn a_larger_circle_can_enclose_a_circle_beside_a_line() {
+        let line = Curve::Line(Line {
+            start: [-10.0, 0.0],
+            end: [10.0, 0.0],
+        });
+        let circle = Curve::Circle(Circle {
+            centre: [0.0, 2.0],
+            radius: 1.0,
+        });
+        let found = check_tangency(&line, &circle, 5.0);
+        let x = 7.0f64.sqrt();
+        assert!(found.iter().any(|fillet| {
+            (fillet.centre[1] - 5.0).abs() < 1e-9
+                && ((fillet.centre[0] - x).abs() < 1e-9
+                    || (fillet.centre[0] + x).abs() < 1e-9)
+        }));
     }
 
     #[test]
