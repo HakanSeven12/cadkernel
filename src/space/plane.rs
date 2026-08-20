@@ -205,6 +205,32 @@ impl Plane {
         self.project_vector(offset.to_array())
     }
 
+    /// Plane coordinates at a requested world XY position.
+    ///
+    /// This intersects the plane with the world-Z line through `xy`. It is
+    /// undefined when the plane is edge-on to XY.
+    pub fn coordinates_at_xy(&self, xy: [f64; 2]) -> Option<[f64; 2]> {
+        if !xy.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        let [xx, xy_axis, _] = self.x_axis;
+        let [yx, yy, _] = self.y_axis;
+        let determinant = xx * yy - xy_axis * yx;
+        let scale = (xx * xx + xy_axis * xy_axis)
+            * (yx * yx + yy * yy);
+        if !determinant.is_finite()
+            || determinant.abs() <= 1e-24 * scale.max(f64::MIN_POSITIVE)
+        {
+            return None;
+        }
+        let dx = xy[0] - self.origin[0];
+        let dy = xy[1] - self.origin[1];
+        Some([
+            (dx * yy - dy * yx) / determinant,
+            (dy * xx - dx * xy_axis) / determinant,
+        ])
+    }
+
     /// The same for a direction: the origin is not subtracted, so a tangent
     /// or an axis keeps its meaning. The inverse of
     /// [`vector_at`](Self::vector_at).

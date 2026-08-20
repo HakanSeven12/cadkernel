@@ -62,6 +62,51 @@ struct CheckedRing {
     bounds: RingBounds,
 }
 
+/// A validated polygon and its axis-aligned local frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolygonFrame {
+    pub origin: [f64; 2],
+    pub size: [f64; 2],
+    pub points: Vec<[f64; 2]>,
+}
+
+/// Cleans and validates one simple polygon.
+pub fn polygon_frame(input: &[[f64; 2]], tolerance: super::Tolerance) -> Option<PolygonFrame> {
+    if input.iter().flatten().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let limit = tolerance.linear();
+    let mut points = Vec::with_capacity(input.len());
+    for &point in input {
+        if points.last().is_none_or(|previous| {
+            Vec2::from(*previous).distance(Vec2::from(point)) > limit
+        }) {
+            points.push(point);
+        }
+    }
+    while points.len() > 1
+        && Vec2::from(points[0]).distance(Vec2::from(*points.last().unwrap())) <= limit
+    {
+        points.pop();
+    }
+    let bounds = RingBounds::of(&points)?;
+    let size = [bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y];
+    let scale = size[0].max(size[1]);
+    let area = signed_area_arrays(&points).abs();
+    if size[0] <= limit
+        || size[1] <= limit
+        || area <= limit * scale.max(limit)
+        || !simple(&points, limit)
+    {
+        return None;
+    }
+    Some(PolygonFrame {
+        origin: [bounds.min.x, bounds.min.y],
+        size,
+        points,
+    })
+}
+
 /// Containment depth of each input ring. Even depths are filled exteriors.
 pub fn nesting_depths(input: &[Vec<[f64; 2]>]) -> Vec<usize> {
     let rings: Vec<Vec<[f64; 2]>> = input.iter().map(|ring| sanitize(ring)).collect();
@@ -100,7 +145,7 @@ pub fn rings(input: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
             continue;
         };
         let area = signed_area_arrays(&points);
-        if !simple(&points) || !area.is_finite() || area == 0.0 {
+        if !simple(&points, 0.0) || !area.is_finite() || area == 0.0 {
             invalid.push(CheckedRing {
                 points,
                 area: area.abs(),
@@ -248,12 +293,14 @@ fn signed_area_arrays(ring: &[[f64; 2]]) -> f64 {
     signed_area(&points)
 }
 
-fn simple(ring: &[[f64; 2]]) -> bool {
+fn simple(ring: &[[f64; 2]], tolerance: f64) -> bool {
     if ring.len() < 3 {
         return false;
     }
     for first in 0..ring.len() {
-        if (first + 1..ring.len()).any(|second| ring[first] == ring[second]) {
+        if (first + 1..ring.len()).any(|second| {
+            Vec2::from(ring[first]).distance(Vec2::from(ring[second])) <= tolerance
+        }) {
             return false;
         }
     }
@@ -263,9 +310,8 @@ fn simple(ring: &[[f64; 2]]) -> bool {
         let after = Vec2::from(ring[(index + 1) % ring.len()]);
         let incoming = before - here;
         let outgoing = after - here;
-        let epsilon = 64.0
-            * f64::EPSILON
-            * incoming.length_squared().max(outgoing.length_squared()).max(1.0);
+        let length = incoming.length().max(outgoing.length()).max(1.0);
+        let epsilon = (64.0 * f64::EPSILON * length * length).max(tolerance * length);
         if incoming.cross(outgoing).abs() <= epsilon && incoming.dot(outgoing) > 0.0 {
             return false;
         }
@@ -277,7 +323,13 @@ fn simple(ring: &[[f64; 2]]) -> bool {
             if first_next == second || second_next == first {
                 continue;
             }
-            if segments_intersect(ring[first], ring[first_next], ring[second], ring[second_next]) {
+            if segments_intersect_with_tolerance(
+                ring[first],
+                ring[first_next],
+                ring[second],
+                ring[second_next],
+                tolerance,
+            ) {
                 return false;
             }
         }
@@ -324,17 +376,27 @@ fn segments_properly_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -
 }
 
 fn segments_intersect(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    segments_intersect_with_tolerance(a, b, c, d, 0.0)
+}
+
+fn segments_intersect_with_tolerance(
+    a: [f64; 2],
+    b: [f64; 2],
+    c: [f64; 2],
+    d: [f64; 2],
+    tolerance: f64,
+) -> bool {
     let (a, b, c, d) = (Vec2::from(a), Vec2::from(b), Vec2::from(c), Vec2::from(d));
     let turn = |p: Vec2, q: Vec2, r: Vec2| (q - p).cross(r - p);
     let values = [turn(a, b, c), turn(a, b, d), turn(c, d, a), turn(c, d, b)];
-    let scale = (b - a).length_squared().max((d - c).length_squared()).max(1.0);
-    let epsilon = 64.0 * f64::EPSILON * scale;
+    let length = (b - a).length().max((d - c).length()).max(1.0);
+    let epsilon = (64.0 * f64::EPSILON * length * length).max(tolerance * length);
     let on = |p: Vec2, q: Vec2, r: Vec2, value: f64| {
         value.abs() <= epsilon
-            && r.x >= p.x.min(q.x) - epsilon
-            && r.x <= p.x.max(q.x) + epsilon
-            && r.y >= p.y.min(q.y) - epsilon
-            && r.y <= p.y.max(q.y) + epsilon
+            && r.x >= p.x.min(q.x) - tolerance
+            && r.x <= p.x.max(q.x) + tolerance
+            && r.y >= p.y.min(q.y) - tolerance
+            && r.y <= p.y.max(q.y) + tolerance
     };
     (values[0] > epsilon && values[1] < -epsilon
         || values[0] < -epsilon && values[1] > epsilon)

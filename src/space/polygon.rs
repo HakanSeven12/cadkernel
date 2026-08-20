@@ -74,6 +74,136 @@ pub fn chain_length(points: &[[f64; 3]]) -> f64 {
         .sum()
 }
 
+/// Triangulate a simple planar ring into a triangle soup.
+#[cfg(feature = "geom2d")]
+pub fn triangulate(
+    input: &[[f64; 3]],
+    tolerance: crate::geom2d::Tolerance,
+) -> Vec<[f64; 3]> {
+    let mut ring = Vec::with_capacity(input.len());
+    for &point in input {
+        if !point.iter().all(|value| value.is_finite()) {
+            return Vec::new();
+        }
+        if ring.last().is_none_or(|previous| {
+            Vec3::from(*previous).distance(Vec3::from(point)) > tolerance.linear()
+        }) {
+            ring.push(point);
+        }
+    }
+    if ring.len() > 1
+        && Vec3::from(ring[0]).distance(Vec3::from(*ring.last().unwrap()))
+            <= tolerance.linear()
+    {
+        ring.pop();
+    }
+    if ring.len() < 3 {
+        return Vec::new();
+    }
+    let Some(normal) = normal(&ring) else {
+        return Vec::new();
+    };
+    let Some(axis) = ring
+        .iter()
+        .skip(1)
+        .map(|point| Vec3::from(*point) - Vec3::from(ring[0]))
+        .find(|axis| axis.length() > tolerance.linear())
+    else {
+        return Vec::new();
+    };
+    let Some(plane) = super::Plane::orthonormal(ring[0], axis.to_array(), normal) else {
+        return Vec::new();
+    };
+    if ring
+        .iter()
+        .any(|point| !plane.contains(*point, tolerance.linear()))
+    {
+        return Vec::new();
+    }
+    let Some(projected) = ring
+        .iter()
+        .map(|point| plane.project(*point))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Vec::new();
+    };
+    let (points, triangles) = crate::geom2d::triangulate(&projected, &[]);
+    triangles
+        .into_iter()
+        .flat_map(|triangle| triangle.map(|index| plane.point_at(points[index])))
+        .collect()
+}
+
+/// Triangulate coplanar rings with even-odd nesting.
+#[cfg(feature = "geom2d")]
+pub fn triangulate_rings(
+    input: &[Vec<[f64; 3]>],
+    tolerance: crate::geom2d::Tolerance,
+) -> Vec<[f64; 3]> {
+    let mut rings = Vec::new();
+    for input_ring in input {
+        let mut ring = Vec::with_capacity(input_ring.len());
+        for &point in input_ring {
+            if !point.iter().all(|value| value.is_finite()) {
+                return Vec::new();
+            }
+            if ring.last().is_none_or(|previous| {
+                Vec3::from(*previous).distance(Vec3::from(point)) > tolerance.linear()
+            }) {
+                ring.push(point);
+            }
+        }
+        if ring.len() > 1
+            && Vec3::from(ring[0]).distance(Vec3::from(*ring.last().unwrap()))
+                <= tolerance.linear()
+        {
+            ring.pop();
+        }
+        if ring.len() >= 3 {
+            rings.push(ring);
+        }
+    }
+    let Some(first) = rings.first() else {
+        return Vec::new();
+    };
+    let Some(normal) = normal(first) else {
+        return Vec::new();
+    };
+    let Some(axis) = first
+        .iter()
+        .skip(1)
+        .map(|point| Vec3::from(*point) - Vec3::from(first[0]))
+        .find(|axis| axis.length() > tolerance.linear())
+    else {
+        return Vec::new();
+    };
+    let Some(plane) = super::Plane::orthonormal(first[0], axis.to_array(), normal) else {
+        return Vec::new();
+    };
+    let mut projected = Vec::with_capacity(rings.len());
+    for ring in &rings {
+        if ring
+            .iter()
+            .any(|point| !plane.contains(*point, tolerance.linear()))
+        {
+            return Vec::new();
+        }
+        let Some(ring) = ring
+            .iter()
+            .map(|point| plane.project(*point))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Vec::new();
+        };
+        projected.push(ring);
+    }
+    let (points, triangles) = crate::geom2d::triangulate_rings(&projected);
+    triangles
+        .into_iter()
+        .flat_map(|triangle| triangle.map(|index| plane.point_at(points[index])))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
