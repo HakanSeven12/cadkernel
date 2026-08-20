@@ -15,11 +15,9 @@
 //! off. Weights are carried here and applied in homogeneous coordinates.
 
 use super::vec::Vec2;
-use crate::space::spline::de_boor_by;
-/// Re-exported from [`space::spline`](crate::space::spline), where it now
-/// lives so a space curve can use it too. Kept reachable here because a
-/// caller building a plane curve looks for it beside one.
-pub use crate::space::spline::clamped_uniform_knots;
+use crate::space::spline::{de_boor_by, interpolate_periodic};
+/// Fit-point spacing shared with space curves.
+pub use crate::space::spline::{clamped_uniform_knots, Parameterization};
 
 /// A non-uniform rational B-spline curve in the plane.
 #[derive(Debug, Clone, PartialEq)]
@@ -711,6 +709,21 @@ impl NurbsCurve {
         })
     }
 
+    /// The closed C² cubic through every fit point.
+    pub fn interpolate_periodic(
+        points: &[[f64; 2]],
+        parameterization: Parameterization,
+    ) -> Option<Self> {
+        let (control_points, knots) = interpolate_periodic(points, parameterization)?;
+        let weights = vec![1.0; control_points.len()];
+        Some(Self {
+            degree: 3,
+            knots,
+            control_points,
+            weights,
+        })
+    }
+
     /// Index of the knot span holding `u`.
     fn span_containing(&self, u: f64) -> usize {
         let last = self.control_points.len() - 1;
@@ -729,19 +742,6 @@ impl NurbsCurve {
         }
         low
     }
-}
-
-/// How fit points are spaced along the parameter when interpolating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Parameterization {
-    /// Equal parameter per span, ignoring distance. Bunches the curve where
-    /// the points are far apart.
-    Uniform,
-    /// Square root of chord length. The usual compromise, and what tends to
-    /// avoid the loops chord-length parameterisation produces at sharp turns.
-    Centripetal,
-    /// Chord length.
-    Chord,
 }
 
 /// In-place Thomas solve for a tridiagonal system: `a` sub-diagonal, `b` main,

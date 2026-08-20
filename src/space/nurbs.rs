@@ -21,7 +21,9 @@
 //! already-divided points — gives a curve that looks close and is not, and
 //! the difference is exactly where the weights matter.
 
-use super::spline::{clamped_uniform_knots, de_boor_by};
+use super::spline::{
+    clamped_uniform_knots, de_boor_by, interpolate_periodic, Parameterization,
+};
 use super::Vec3;
 
 fn valid_knots(knots: &[f64]) -> bool {
@@ -110,6 +112,22 @@ impl NurbsCurve3 {
             control_points,
             weights,
             closed: false,
+        })
+    }
+
+    /// The closed C² cubic through every fit point.
+    pub fn interpolate_periodic(
+        points: &[[f64; 3]],
+        parameterization: Parameterization,
+    ) -> Option<Self> {
+        let (control_points, knots) = interpolate_periodic(points, parameterization)?;
+        let weights = vec![1.0; control_points.len()];
+        Some(Self {
+            degree: 3,
+            knots,
+            control_points,
+            weights,
+            closed: true,
         })
     }
 

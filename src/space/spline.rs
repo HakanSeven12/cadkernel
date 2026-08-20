@@ -131,6 +131,177 @@ pub fn clamped_uniform_knots(degree: usize, control_point_count: usize) -> Vec<f
     knots
 }
 
+/// Fit-point spacing used by spline interpolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parameterization {
+    Uniform,
+    Centripetal,
+    Chord,
+}
+
+pub(crate) fn interpolate_periodic<const N: usize>(
+    points: &[[f64; N]],
+    parameterization: Parameterization,
+) -> Option<(Vec<[f64; N]>, Vec<f64>)> {
+    let mut points = points.to_vec();
+    if points.len() > 1 {
+        let distance2 = (0..N)
+            .map(|axis| (points[points.len() - 1][axis] - points[0][axis]).powi(2))
+            .sum::<f64>();
+        if distance2 <= 1e-18 {
+            points.pop();
+        }
+    }
+    let count = points.len();
+    if count < 3 {
+        return None;
+    }
+
+    let spans: Vec<f64> = (0..count)
+        .map(|index| {
+            let next = (index + 1) % count;
+            let chord = (0..N)
+                .map(|axis| (points[next][axis] - points[index][axis]).powi(2))
+                .sum::<f64>()
+                .sqrt()
+                .max(1e-9);
+            match parameterization {
+                Parameterization::Uniform => 1.0,
+                Parameterization::Centripetal => chord.sqrt(),
+                Parameterization::Chord => chord,
+            }
+        })
+        .collect();
+
+    let mut lower = vec![0.0; count];
+    let mut diagonal = vec![0.0; count];
+    let mut upper = vec![0.0; count];
+    let mut right = vec![[0.0; N]; count];
+    for index in 0..count {
+        let previous = (index + count - 1) % count;
+        let next = (index + 1) % count;
+        let before = spans[previous];
+        let after = spans[index];
+        lower[index] = after;
+        diagonal[index] = 2.0 * (before + after);
+        upper[index] = before;
+        for axis in 0..N {
+            let previous_slope = (points[index][axis] - points[previous][axis]) / before;
+            let next_slope = (points[next][axis] - points[index][axis]) / after;
+            right[index][axis] =
+                3.0 * (after * previous_slope + before * next_slope);
+        }
+    }
+    let alpha = lower[0];
+    let beta = upper[count - 1];
+    lower[0] = 0.0;
+    upper[count - 1] = 0.0;
+    let slopes = solve_cyclic_system(&lower, &diagonal, &upper, alpha, beta, right)?;
+
+    let mut control_points = Vec::with_capacity(3 * count + 1);
+    let mut boundaries = Vec::with_capacity(count + 1);
+    control_points.push(points[0]);
+    boundaries.push(0.0);
+    let mut parameter = 0.0;
+    for index in 0..count {
+        let next = (index + 1) % count;
+        let span = spans[index];
+        let mut after = points[index];
+        let mut before = points[next];
+        for axis in 0..N {
+            after[axis] += slopes[index][axis] * span / 3.0;
+            before[axis] -= slopes[next][axis] * span / 3.0;
+        }
+        control_points.extend([after, before, points[next]]);
+        parameter += span;
+        boundaries.push(parameter);
+    }
+
+    let mut knots = vec![0.0; 4];
+    for boundary in boundaries.iter().take(count).skip(1) {
+        knots.extend([*boundary; 3]);
+    }
+    knots.extend([parameter; 4]);
+    Some((control_points, knots))
+}
+
+fn solve_cyclic_system<const N: usize>(
+    lower: &[f64],
+    diagonal: &[f64],
+    upper: &[f64],
+    alpha: f64,
+    beta: f64,
+    mut right: Vec<[f64; N]>,
+) -> Option<Vec<[f64; N]>> {
+    let count = right.len();
+    let gamma = -diagonal[0];
+    if gamma.abs() < 1e-14 {
+        return None;
+    }
+    let mut adjusted = diagonal.to_vec();
+    adjusted[0] -= gamma;
+    adjusted[count - 1] -= alpha * beta / gamma;
+    solve_tridiagonal_system(lower, &adjusted, upper, &mut right)?;
+
+    let mut correction = vec![[0.0; N]; count];
+    correction[0] = [gamma; N];
+    correction[count - 1] = [alpha; N];
+    solve_tridiagonal_system(lower, &adjusted, upper, &mut correction)?;
+    for axis in 0..N {
+        let denominator = 1.0
+            + correction[0][axis]
+            + beta * correction[count - 1][axis] / gamma;
+        if denominator.abs() < 1e-14 {
+            return None;
+        }
+        let factor =
+            (right[0][axis] + beta * right[count - 1][axis] / gamma) / denominator;
+        for row in 0..count {
+            right[row][axis] -= factor * correction[row][axis];
+        }
+    }
+    right
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite())
+        .then_some(right)
+}
+
+fn solve_tridiagonal_system<const N: usize>(
+    lower: &[f64],
+    diagonal: &[f64],
+    upper: &[f64],
+    right: &mut [[f64; N]],
+) -> Option<()> {
+    let count = right.len();
+    let mut modified_upper = vec![0.0; count];
+    let first = diagonal[0];
+    if first.abs() < 1e-14 {
+        return None;
+    }
+    modified_upper[0] = upper[0] / first;
+    for value in &mut right[0] {
+        *value /= first;
+    }
+    for row in 1..count {
+        let pivot = diagonal[row] - lower[row] * modified_upper[row - 1];
+        if pivot.abs() < 1e-14 {
+            return None;
+        }
+        modified_upper[row] = upper[row] / pivot;
+        for axis in 0..N {
+            right[row][axis] =
+                (right[row][axis] - lower[row] * right[row - 1][axis]) / pivot;
+        }
+    }
+    for row in (0..count - 1).rev() {
+        for axis in 0..N {
+            right[row][axis] -= modified_upper[row] * right[row + 1][axis];
+        }
+    }
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

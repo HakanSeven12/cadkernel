@@ -22,8 +22,8 @@ pub mod vec;
 pub mod planar;
 
 pub use nurbs::{NurbsCurve3, NurbsSurface3};
-pub use plane::Plane;
-pub use spline::{clamped_uniform_knots, de_boor};
+pub use plane::{are_coplanar, coplanarity_tolerance, Plane};
+pub use spline::{clamped_uniform_knots, de_boor, Parameterization};
 pub use vec::Vec3;
 
 #[cfg(feature = "geom2d")]

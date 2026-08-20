@@ -25,6 +25,82 @@
 
 use super::vec::Vec3;
 
+const COPLANARITY_TOLERANCE: f64 = 1e-9;
+
+/// Scale-aware distance used by coplanarity checks.
+pub fn coplanarity_tolerance(points: &[[f64; 3]]) -> f64 {
+    if !points.iter().flatten().all(|value| value.is_finite()) {
+        return f64::NAN;
+    }
+    let Some(origin) = points.first().copied() else {
+        return COPLANARITY_TOLERANCE;
+    };
+    let origin = Vec3::from(origin);
+    let extent = points
+        .iter()
+        .map(|point| (Vec3::from(*point) - origin).length())
+        .fold(1.0, f64::max);
+    let coordinate_scale = points
+        .iter()
+        .flatten()
+        .map(|value| value.abs())
+        .fold(1.0, f64::max);
+    COPLANARITY_TOLERANCE * extent + f64::EPSILON * coordinate_scale * 64.0
+}
+
+/// Whether points and directions share a plane.
+pub fn are_coplanar(points: &[[f64; 3]], directions: &[[f64; 3]]) -> bool {
+    if !points
+        .iter()
+        .chain(directions)
+        .flatten()
+        .all(|value| value.is_finite())
+    {
+        return false;
+    }
+    let Some(origin) = points.first().copied() else {
+        return true;
+    };
+    let origin = Vec3::from(origin);
+    let offsets: Vec<Vec3> = points
+        .iter()
+        .skip(1)
+        .map(|point| Vec3::from(*point) - origin)
+        .collect();
+    let tolerance = coplanarity_tolerance(points);
+    let point_axes = offsets
+        .iter()
+        .copied()
+        .filter(|offset| offset.length() > tolerance)
+        .filter_map(Vec3::normalize);
+    let direction_axes = directions
+        .iter()
+        .copied()
+        .map(Vec3::from)
+        .filter_map(Vec3::normalize);
+    let axes: Vec<Vec3> = point_axes.chain(direction_axes).collect();
+    let Some(axis) = axes.first().copied()
+    else {
+        return true;
+    };
+    let Some(normal) = axes.iter().find_map(|candidate| {
+        let cross = axis.cross(*candidate);
+        (cross.length() > COPLANARITY_TOLERANCE)
+            .then(|| cross.normalize())
+            .flatten()
+    }) else {
+        return true;
+    };
+    offsets
+        .iter()
+        .all(|offset| offset.dot(normal).abs() <= tolerance)
+        && directions.iter().copied().map(Vec3::from).all(|direction| {
+            direction.length_squared() == 0.0
+                || direction.dot(normal).abs()
+                    <= COPLANARITY_TOLERANCE * direction.length()
+        })
+}
+
 /// A plane in space, with a coordinate frame on it.
 ///
 /// [`point_at`](Self::point_at) and [`project`](Self::project) are inverses
