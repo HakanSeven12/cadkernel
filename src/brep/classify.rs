@@ -27,7 +27,7 @@
 
 use super::pcurve;
 use super::topology::{Body, FaceKey};
-use crate::geom2d::{contains as inside_loops, Tolerance};
+use crate::geom2d::Tolerance;
 use crate::space::Vec3;
 
 /// Where a point stands relative to a solid.
@@ -139,7 +139,12 @@ fn face_hits(
             // placed within the face's boundary, so the count is unusable.
             return None;
         };
-        if inside_loops(&boundary, [u, v], Tolerance::new(tolerance)) {
+        if pcurve::contains_parameter(
+            surface,
+            &boundary,
+            [u, v],
+            Tolerance::new(tolerance),
+        ) {
             out.push(distance);
         }
     }
@@ -158,7 +163,12 @@ fn face_distance(body: &Body, face: FaceKey, point: [f64; 3], tolerance: f64) ->
     // boundary.
     let boundary = pcurve::face_boundary(body, face, tolerance)?;
     let (u, v) = surface.parameters_at(point)?;
-    if inside_loops(&boundary, [u, v], Tolerance::new(tolerance)) {
+    if pcurve::contains_parameter(
+        surface,
+        &boundary,
+        [u, v],
+        Tolerance::new(tolerance),
+    ) {
         Some(gap)
     } else {
         Some(f64::INFINITY)
@@ -199,6 +209,14 @@ mod tests {
                 "{point:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_cylinder_uses_its_periodic_face_boundary() {
+        let body = crate::brep::make::cylinder([10.0, 5.0, -2.0], 3.0, 14.0).unwrap();
+        assert_eq!(contains_point(&body, [10.0, 5.0, 5.0], TOL), Containment::Inside);
+        assert_eq!(contains_point(&body, [5.0, 0.0, 5.0], TOL), Containment::Outside);
+        assert_eq!(contains_point(&body, [13.0, 5.0, 5.0], TOL), Containment::OnBoundary);
     }
 
     #[test]

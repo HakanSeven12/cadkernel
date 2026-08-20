@@ -24,13 +24,14 @@
 //! classified, a coincident pair. Refusing is cheap; a leaking solid is not.
 
 use super::classify::{contains_point, Containment};
+use super::geometry::Surface;
 use super::imprint::{imprint, Snag};
 use super::pcurve;
 use super::topology::{Body, Face, FaceKey, Lump, Shell};
 use super::Provenance;
 use crate::geom2d::Curve;
-use super::geometry::Surface;
 use crate::space::Vec3;
+use std::collections::{HashMap, VecDeque};
 
 /// Which combination to take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +103,95 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
         // solids that do not touch, intersected.
         return Ok(Body::new());
     }
+    orient_shell(&mut result)?;
+    if result.edges.iter().any(|(_, edge)| edge.coedges.len() != 2)
+        || !result.validate().is_empty()
+    {
+        return Err(Snag::CutRefused);
+    }
     Ok(result)
+}
+
+fn orient_shell(body: &mut Body) -> Result<(), Snag> {
+    let mut adjacent: HashMap<FaceKey, Vec<(FaceKey, bool)>> = HashMap::new();
+    for (_, edge) in body.edges.iter() {
+        let [first, second] = edge.coedges.as_slice() else {
+            continue;
+        };
+        let first = body.coedges.get(*first).ok_or(Snag::CutRefused)?;
+        let second = body.coedges.get(*second).ok_or(Snag::CutRefused)?;
+        let first_face = body
+            .loops
+            .get(first.owner)
+            .ok_or(Snag::CutRefused)?
+            .owner;
+        let second_face = body
+            .loops
+            .get(second.owner)
+            .ok_or(Snag::CutRefused)?
+            .owner;
+        if first_face == second_face {
+            if first.forward == second.forward {
+                return Err(Snag::CutRefused);
+            }
+            continue;
+        }
+        let differ = first.forward == second.forward;
+        adjacent.entry(first_face).or_default().push((second_face, differ));
+        adjacent.entry(second_face).or_default().push((first_face, differ));
+    }
+
+    let mut flips = HashMap::new();
+    for face in body.face_keys().collect::<Vec<_>>() {
+        if flips.contains_key(&face) {
+            continue;
+        }
+        flips.insert(face, false);
+        let mut pending = VecDeque::from([face]);
+        while let Some(current) = pending.pop_front() {
+            let current_flip = flips[&current];
+            for (other, differ) in adjacent.get(&current).into_iter().flatten() {
+                let wanted = current_flip != *differ;
+                match flips.get(other) {
+                    Some(existing) if *existing != wanted => return Err(Snag::CutRefused),
+                    Some(_) => {}
+                    None => {
+                        flips.insert(*other, wanted);
+                        pending.push_back(*other);
+                    }
+                }
+            }
+        }
+    }
+
+    for (face, flip) in flips {
+        if !flip {
+            continue;
+        }
+        let loops = body.faces.get(face).ok_or(Snag::CutRefused)?.loops.clone();
+        for ring in loops {
+            let coedges = body
+                .loops
+                .get(ring)
+                .ok_or(Snag::CutRefused)?
+                .coedges
+                .clone();
+            for key in &coedges {
+                let coedge = body.coedges.get_mut(*key).ok_or(Snag::CutRefused)?;
+                coedge.forward = !coedge.forward;
+                if let Some(curve) = coedge.pcurve.take() {
+                    coedge.pcurve = Some(reversed_pcurve(&curve).ok_or(Snag::CutRefused)?);
+                }
+            }
+            body
+                .loops
+                .get_mut(ring)
+                .ok_or(Snag::CutRefused)?
+                .coedges
+                .reverse();
+        }
+    }
+    Ok(())
 }
 
 /// The other body's face covering the same ground as this one, if there is
@@ -445,7 +534,7 @@ pub fn boundary_of(body: &Body, face: FaceKey, tolerance: f64) -> Option<Vec<Cur
 mod tests {
     use super::*;
     use crate::brep::bounds::body_bounds;
-    use crate::brep::make::cuboid;
+    use crate::brep::make::{cuboid, cylinder};
 
     const TOL: f64 = 1e-9;
 
@@ -455,6 +544,29 @@ mod tests {
             cuboid([0.0; 3], [10.0, 10.0, 10.0]).unwrap(),
             cuboid([5.0; 3], [10.0, 10.0, 10.0]).unwrap(),
         )
+    }
+
+    #[test]
+    fn box_cylinder_booleans_are_closed_solids() {
+        let cases = [
+            ([10.0, 5.0, 0.0], 10.0),
+            ([10.0, 10.0, 0.0], 10.0),
+            ([10.0, 5.0, -2.0], 14.0),
+            ([9.0, 5.0, -2.0], 14.0),
+        ];
+        for (base, height) in cases {
+            for operation in [
+                Operation::Union,
+                Operation::Difference,
+                Operation::Intersection,
+            ] {
+                let box_body = cuboid([0.0; 3], [10.0; 3]).unwrap();
+                let round = cylinder(base, 3.0, height).unwrap();
+                let result = combine(box_body, round, operation, TOL).unwrap();
+                assert!(result.validate().is_empty(), "{base:?} {operation:?}");
+                assert!(result.edges.iter().all(|(_, edge)| edge.coedges.len() == 2));
+            }
+        }
     }
 
     #[test]

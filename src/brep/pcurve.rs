@@ -197,6 +197,19 @@ pub fn face_boundary(
     face: super::topology::FaceKey,
     tolerance: f64,
 ) -> Option<Vec<Curve>> {
+    Some(
+        face_boundary_parts(body, face, tolerance)?
+            .into_iter()
+            .map(|(_, curve)| curve)
+            .collect(),
+    )
+}
+
+pub(crate) fn face_boundary_parts(
+    body: &super::topology::Body,
+    face: super::topology::FaceKey,
+    tolerance: f64,
+) -> Option<Vec<(super::topology::CoedgeKey, Curve)>> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
     let mut out = Vec::new();
@@ -205,7 +218,7 @@ pub fn face_boundary(
         for coedge in &body.loops.get(*ring)?.coedges {
             let coedge_node = body.coedges.get(*coedge)?;
             if let Some(curve) = &coedge_node.pcurve {
-                pieces.push(curve.clone());
+                pieces.push((*coedge, curve.clone()));
                 continue;
             }
             let edge_key = coedge_node.edge;
@@ -219,9 +232,13 @@ pub fn face_boundary(
             } else {
                 (edge.end_parameter, edge.start_parameter)
             };
-            pieces.push(trim_to(surface, curve, span, flat)?);
+            pieces.push((*coedge, trim_to(surface, curve, span, flat)?));
         }
-        chain_round(&mut pieces, periods(surface));
+        let mut curves: Vec<Curve> = pieces.iter().map(|(_, curve)| curve.clone()).collect();
+        chain_round(&mut curves, periods(surface));
+        for ((_, curve), moved) in pieces.iter_mut().zip(curves) {
+            *curve = moved;
+        }
         out.extend(pieces);
     }
     Some(out)
@@ -442,7 +459,7 @@ fn meridian_at(angle: f64) -> Curve {
 /// `u` runs round every closed surface here; `v` only runs round a torus. A
 /// plane's do not wrap at all, and unwinding one there would move the curve
 /// rather than place it.
-fn periods(surface: &Surface) -> [Option<f64>; 2] {
+pub(crate) fn periods(surface: &Surface) -> [Option<f64>; 2] {
     match surface {
         Surface::Plane(_) => [None, None],
         Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_) => [Some(TAU), None],
@@ -456,6 +473,28 @@ fn periods(surface: &Surface) -> [Option<f64>; 2] {
             ]
         }
     }
+}
+
+pub(crate) fn contains_parameter(
+    surface: &Surface,
+    boundary: &[Curve],
+    point: [f64; 2],
+    tolerance: crate::geom2d::Tolerance,
+) -> bool {
+    let periods = periods(surface);
+    let turns = |period: Option<f64>| match period {
+        Some(period) => vec![-period, 0.0, period],
+        None => vec![0.0],
+    };
+    turns(periods[0]).into_iter().any(|u| {
+        turns(periods[1]).into_iter().any(|v| {
+            crate::geom2d::contains(
+                boundary,
+                [point[0] + u, point[1] + v],
+                tolerance,
+            )
+        })
+    })
 }
 
 /// A line of constant `u`, unbounded in `v` — a generator, which the face's
