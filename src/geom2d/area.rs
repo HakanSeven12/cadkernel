@@ -72,6 +72,22 @@ impl Curve {
         }
     }
 
+    /// Area obtained by closing a bounded curve with the straight chord from
+    /// its end point back to its start point.
+    ///
+    /// This is the useful area convention for an open arc, spline or
+    /// polyline shown in an object-properties palette. It deliberately stays
+    /// separate from [`Self::enclosed_area`], whose open-curve contribution is
+    /// composable when several entities form a boundary.
+    pub fn chord_closed_area(&self) -> Option<f64> {
+        if matches!(self, Self::Ray(_) | Self::XLine(_)) {
+            return None;
+        }
+        let start = self.point_at(0.0);
+        let end = self.point_at(1.0);
+        Some(self.enclosed_area() + line_moments(end, start).0)
+    }
+
     /// Centroid of the region closed by this curve.
     pub fn enclosed_centroid(&self) -> Option<[f64; 2]> {
         match self {
@@ -83,6 +99,25 @@ impl Curve {
         let origin = self.point_at(0.0);
         let local = self.transformed(&Transform::translation([-origin[0], -origin[1]]))?;
         let (area, first_x, first_y) = local.enclosed_moments();
+        (area.is_finite()
+            && area != 0.0
+            && first_x.is_finite()
+            && first_y.is_finite())
+        .then_some([origin[0] + first_x / area, origin[1] + first_y / area])
+    }
+
+    /// Centroid of the region obtained by closing a bounded curve with its
+    /// end-to-start chord.
+    pub fn chord_closed_centroid(&self) -> Option<[f64; 2]> {
+        if matches!(self, Self::Ray(_) | Self::XLine(_)) {
+            return None;
+        }
+        let origin = self.point_at(0.0);
+        let local = self.transformed(&Transform::translation([-origin[0], -origin[1]]))?;
+        let start = local.point_at(0.0);
+        let end = local.point_at(1.0);
+        let (area, first_x, first_y) =
+            add_moments(local.enclosed_moments(), line_moments(end, start));
         (area.is_finite()
             && area != 0.0
             && first_x.is_finite()
