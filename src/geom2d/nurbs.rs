@@ -585,6 +585,40 @@ impl NurbsCurve {
             .then_some((left, right))
     }
 
+    /// The exact portion of this curve between two normalised parameters.
+    ///
+    /// Parameters run over the public `0..=1` domain.  Supplying them in the
+    /// opposite order returns the same portion with its direction reversed.
+    /// Knot insertion is used internally, so rational weights and the original
+    /// shape are preserved instead of sampling the result into a polyline.
+    pub fn trimmed(&self, from: f64, to: f64) -> Option<Self> {
+        if !from.is_finite() || !to.is_finite() {
+            return None;
+        }
+        let from = from.clamp(0.0, 1.0);
+        let to = to.clamp(0.0, 1.0);
+        if (from - to).abs() <= 1.0e-12 {
+            return None;
+        }
+        if from > to {
+            return self.trimmed(to, from).map(|curve| curve.reversed());
+        }
+        if from <= 1.0e-12 && to >= 1.0 - 1.0e-12 {
+            return Some(self.clone());
+        }
+
+        let left = if to < 1.0 - 1.0e-12 {
+            self.split_at(to)?.0
+        } else {
+            self.clone()
+        };
+        if from <= 1.0e-12 {
+            return Some(left);
+        }
+        let local = if to > 1.0e-12 { from / to } else { return None };
+        left.split_at(local).map(|(_, right)| right)
+    }
+
     /// A smooth curve that remains within `tolerance` of an open polyline.
     pub fn fit_polyline(points: &[[f64; 2]], tolerance: f64) -> Option<Self> {
         if !tolerance.is_finite()
