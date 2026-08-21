@@ -42,7 +42,7 @@ pub use centerline::{centerline_between, CenterLineGeometry};
 pub use containment::{closest_point, contains, distance_to, nearest_of, Closest};
 pub use construct::{
     arc_from_endpoints_angle, arc_from_endpoints_radius, arc_from_sagitta,
-    arc_from_start_tangent, arc_sweep_from_chord, arc_through_points,
+    arc_from_start_tangent, arc_sweep_from_chord, arc_through_points, bounded_arc,
 };
 pub use cross::{intersect, Crossing};
 pub use curve::{Arc, Circle, Curve, EllipseArc, Extent, Line, Ray, XLine};

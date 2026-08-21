@@ -7,6 +7,30 @@ use std::f64::consts::TAU;
 
 const ANGLE_EPSILON: f64 = 1.0e-9;
 
+/// A non-degenerate bounded arc from centre, radius and angles.
+pub fn bounded_arc(
+    centre: [f64; 2],
+    radius: f64,
+    start_angle: f64,
+    end_angle: f64,
+) -> Option<Arc> {
+    let sweep = (end_angle - start_angle).rem_euclid(TAU);
+    if !radius.is_finite()
+        || !start_angle.is_finite()
+        || !end_angle.is_finite()
+        || radius <= ANGLE_EPSILON
+        || sweep <= ANGLE_EPSILON
+    {
+        return None;
+    }
+    Some(Arc {
+        centre,
+        radius,
+        start_angle,
+        end_angle,
+    })
+}
+
 fn stored_arc(start: [f64; 2], end: [f64; 2], bulge: f64) -> Option<Arc> {
     let arc = BulgeArc::from_bulge(start, end, bulge)?;
     let (start_angle, end_angle) = if arc.sweep > 0.0 {
