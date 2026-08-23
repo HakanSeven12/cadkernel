@@ -233,23 +233,102 @@ pub fn split_face(
                 if along < low - slack || along > high + slack {
                     continue;
                 }
-                if landings
-                    .iter()
-                    .any(|seen| Vec3::from(seen.point).distance(Vec3::from(point)) <= tolerance)
+                if landings.iter().any(|seen| {
+                    Vec3::from(seen.point).distance(Vec3::from(point)) <= tolerance
+                        && (seen.edge != edge_key || seen.coedge == *coedge)
+                })
                 {
                     continue;
                 }
                 landings.push(Landing {
                     edge: edge_key,
+                    coedge: *coedge,
                     point,
                 });
             }
         }
     }
+    if landings.is_empty() {
+        let period = closed_period(cutter)?;
+        let point = cutter.point_at(0.0);
+        let (u, v) = surface.parameters_at(point)?;
+        let strictly_inside = periodic_points([u, v], periods).into_iter().any(|point| {
+            crate::geom2d::contains(
+                &original_boundary,
+                point,
+                Tolerance::new(tolerance),
+            ) && original_boundary
+                .iter()
+                .all(|edge| distance_to(edge, point) > tolerance)
+        });
+        if !strictly_inside {
+            return None;
+        }
+
+        let seam = body.vertices.insert(Vertex {
+            point,
+            provenance: Provenance::Synthesized,
+        });
+        let curve = body.curves.insert(cutter.clone());
+        let cut = body.edges.insert(Edge {
+            curve,
+            start_parameter: 0.0,
+            end_parameter: period,
+            start: seam,
+            end: seam,
+            coedges: Vec::new(),
+            provenance: Provenance::Synthesized,
+        });
+
+        let hole_ring = body.loops.insert(Loop {
+            coedges: Vec::new(),
+            owner: face,
+            provenance: Provenance::Synthesized,
+        });
+        let hole = body.coedges.insert(Coedge {
+            edge: cut,
+            forward: !node.forward,
+            pcurve: None,
+            owner: hole_ring,
+            provenance: Provenance::Synthesized,
+        });
+        body.loops.get_mut(hole_ring)?.coedges = vec![hole];
+        let kept = body.faces.get_mut(face)?;
+        kept.loops.push(hole_ring);
+        kept.provenance.soil();
+
+        let other = body.faces.insert(Face {
+            surface: node.surface,
+            forward: node.forward,
+            loops: Vec::new(),
+            owner: node.owner,
+            provenance: Provenance::Synthesized,
+        });
+        let other_ring = body.loops.insert(Loop {
+            coedges: Vec::new(),
+            owner: other,
+            provenance: Provenance::Synthesized,
+        });
+        let inner = body.coedges.insert(Coedge {
+            edge: cut,
+            forward: node.forward,
+            pcurve: None,
+            owner: other_ring,
+            provenance: Provenance::Synthesized,
+        });
+        body.loops.get_mut(other_ring)?.coedges = vec![inner];
+        body.faces.get_mut(other)?.loops = vec![other_ring];
+        body.shells.get_mut(node.owner)?.faces.push(other);
+        body.edges.get_mut(cut)?.coedges = vec![hole, inner];
+        return Some([face, other]);
+    }
     if landings.len() != 2 {
         return None;
     }
 
+    let same_vertex_landing = Vec3::from(landings[0].point)
+        .distance(Vec3::from(landings[1].point))
+        <= tolerance;
     let first_parameter = cutter.parameter_at(landings[0].point);
     let second_parameter = cutter.parameter_at(landings[1].point);
     let (low, high, low_parameter, high_parameter) =
@@ -269,6 +348,9 @@ pub fn split_face(
         }))
     };
     let (start_landing, end_landing, start_parameter, end_parameter) = match closed_period(cutter) {
+        Some(period) if same_vertex_landing => {
+            (low, high, low_parameter, low_parameter + period)
+        }
         Some(period) => {
             let direct = inside(0.5 * (low_parameter + high_parameter))?;
             let wrapped = inside(0.5 * (high_parameter + low_parameter + period))?;
@@ -301,7 +383,7 @@ pub fn split_face(
     // Mutate the boundary only after proving this is a new cut.
     let first = vertex_at(body, &landings[0], tolerance)?;
     let second = vertex_at(body, &landings[1], tolerance)?;
-    if first == second {
+    if first == second && !same_vertex_landing {
         return None;
     }
     let ends = [first, second];
@@ -326,12 +408,16 @@ pub fn split_face(
         body.coedge_vertices(coedge)
             .is_some_and(|(from, _)| from == vertex)
     };
-    let at_first = ring
-        .iter()
-        .position(|c| begins_at(body, *c, first))?;
-    let at_second = ring
-        .iter()
-        .position(|c| begins_at(body, *c, second))?;
+    let landing_index = |landing: &Landing, vertex: VertexKey| {
+        let at = ring.iter().position(|coedge| *coedge == landing.coedge)?;
+        if begins_at(body, ring[at], vertex) {
+            return Some(at);
+        }
+        let next = (at + 1) % ring.len();
+        begins_at(body, ring[next], vertex).then_some(next)
+    };
+    let at_first = landing_index(&landings[0], first)?;
+    let at_second = landing_index(&landings[1], second)?;
     // The stretch of the ring from one index round to the other, not
     // including where it stops.
     let arc = |from: usize, to: usize| -> Vec<CoedgeKey> {
@@ -356,7 +442,7 @@ pub fn split_face(
     let sense = |from: VertexKey| start == from;
     let near_closer = body.coedges.insert(Coedge {
         edge: cut,
-        forward: sense(second),
+        forward: if same_vertex_landing { true } else { sense(second) },
         pcurve: None,
         owner: ring_key,
         provenance: Provenance::Synthesized,
@@ -389,7 +475,7 @@ pub fn split_face(
     });
     let far_closer = body.coedges.insert(Coedge {
         edge: cut,
-        forward: sense(first),
+        forward: if same_vertex_landing { false } else { sense(first) },
         pcurve: None,
         owner: other_ring,
         provenance: Provenance::Synthesized,
@@ -424,7 +510,7 @@ fn periodic_images(
     periods: [Option<f64>; 2],
 ) -> Vec<crate::geom2d::Curve> {
     let turns = |period: Option<f64>| match period {
-        Some(period) => vec![-period, 0.0, period],
+        Some(period) => (-2..=2).map(|turn| period * f64::from(turn)).collect(),
         None => vec![0.0],
     };
     let mut out = Vec::new();
@@ -440,7 +526,7 @@ fn periodic_images(
 
 fn periodic_points(point: [f64; 2], periods: [Option<f64>; 2]) -> Vec<[f64; 2]> {
     let turns = |period: Option<f64>| match period {
-        Some(period) => vec![-period, 0.0, period],
+        Some(period) => (-2..=2).map(|turn| period * f64::from(turn)).collect(),
         None => vec![0.0],
     };
     let mut out = Vec::new();
@@ -464,6 +550,7 @@ fn parameter_in_span(curve: &Curve3, point: [f64; 3], start: f64, end: f64) -> f
 /// Where the cut met the boundary.
 struct Landing {
     edge: EdgeKey,
+    coedge: CoedgeKey,
     point: [f64; 3],
 }
 
