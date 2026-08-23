@@ -486,7 +486,7 @@ pub(crate) fn contains_parameter(
         Some(period) => vec![-period, 0.0, period],
         None => vec![0.0],
     };
-    turns(periods[0]).into_iter().any(|u| {
+    let enclosed = turns(periods[0]).into_iter().any(|u| {
         turns(periods[1]).into_iter().any(|v| {
             crate::geom2d::contains(
                 boundary,
@@ -494,7 +494,62 @@ pub(crate) fn contains_parameter(
                 tolerance,
             )
         })
+    });
+    if enclosed {
+        return true;
+    }
+    // Two full-turn loops bound a band without forming a plane polygon.
+    periodic_band_levels(surface, boundary, tolerance.linear()).is_some_and(|levels| {
+        point[1] >= levels[0] - tolerance.linear()
+            && point[1] <= levels[1] + tolerance.linear()
     })
+}
+
+/// An interior point between two full-turn boundary loops.
+pub(crate) fn periodic_band_point(
+    surface: &Surface,
+    boundary: &[Curve],
+    tolerance: f64,
+) -> Option<[f64; 3]> {
+    let levels = periodic_band_levels(surface, boundary, tolerance)?;
+    let u = boundary.first()?.point_at(0.5)[0];
+    Some(surface.point_at(u, 0.5 * (levels[0] + levels[1])))
+}
+
+fn periodic_band_levels(
+    surface: &Surface,
+    boundary: &[Curve],
+    tolerance: f64,
+) -> Option<[f64; 2]> {
+    let period = periods(surface)[0]?;
+    let mut levels: Vec<(f64, f64)> = Vec::new();
+    for curve in boundary {
+        let Curve::Line(line) = curve else {
+            return None;
+        };
+        if (line.end[1] - line.start[1]).abs() > tolerance {
+            return None;
+        }
+        let level = 0.5 * (line.start[1] + line.end[1]);
+        let span = (line.end[0] - line.start[0]).abs();
+        if let Some((_, covered)) = levels
+            .iter_mut()
+            .find(|(existing, _)| (*existing - level).abs() <= tolerance)
+        {
+            *covered += span;
+        } else {
+            levels.push((level, span));
+        }
+    }
+    if levels.len() != 2
+        || levels
+            .iter()
+            .any(|(_, covered)| *covered < period - tolerance)
+    {
+        return None;
+    }
+    levels.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Some([levels[0].0, levels[1].0])
 }
 
 /// A line of constant `u`, unbounded in `v` — a generator, which the face's

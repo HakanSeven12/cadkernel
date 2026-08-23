@@ -157,6 +157,28 @@ pub fn body_bounds(body: &Body) -> Option<Aabb> {
     bounds
 }
 
+/// Scale-aware tolerance for operations spanning one or more bodies.
+pub fn operation_tolerance(bodies: &[&Body]) -> f64 {
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    let mut coordinate_scale = 1.0_f64;
+    for point in bodies
+        .iter()
+        .flat_map(|body| body.vertices.iter().map(|(_, vertex)| vertex.point))
+    {
+        for axis in 0..3 {
+            low[axis] = low[axis].min(point[axis]);
+            high[axis] = high[axis].max(point[axis]);
+            coordinate_scale = coordinate_scale.max(point[axis].abs());
+        }
+    }
+    let extent = (0..3)
+        .map(|axis| high[axis] - low[axis])
+        .filter(|value| value.is_finite())
+        .fold(1.0_f64, f64::max);
+    extent * 1e-8 + f64::EPSILON * coordinate_scale * 64.0
+}
+
 /// Whether a patch of this surface stays within the box its own edges do.
 ///
 /// A plane does. So does a cylinder or a cone, whose curvature runs one way

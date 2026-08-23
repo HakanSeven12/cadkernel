@@ -35,7 +35,8 @@
 //! times two constructions is ten rules to get right and one place for each
 //! to be wrong; a signed distance answers all of them at once.
 
-use super::geometry::{Circle3, Cone, Curve3, Cylinder, Line3, Sphere, Surface, Torus};
+use super::geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
+use super::nurbs_builder::RationalCurve2;
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, FaceKey, Loop, LoopKey, Lump, Shell, ShellKey,
     SurfaceKey, Vertex, VertexKey,
@@ -146,7 +147,7 @@ pub fn extrude(plane: Plane, profile: &[Curve2], direction: [f64; 3]) -> Option<
     for index in 0..profile.len() {
         let next = (index + 1) % profile.len();
         let piece = &profile[index];
-        let surface = wall_surface(&mut body, &plane, piece, along)?;
+        let (surface, spline) = wall_surface(&mut body, &plane, piece, along)?;
         let out = piece_outward(&plane, piece, senses[index], handed > 0.0);
         let on = plane.point_at(piece.point_at(0.5));
         let forward = face_sense(body.surfaces.get(surface)?, on, out)?;
@@ -156,12 +157,142 @@ pub fn extrude(plane: Plane, profile: &[Curve2], direction: [f64; 3]) -> Option<
             (top_edges[index], !senses[index]),
             (rails[index], false),
         ];
-        add_wall(&mut body, shell, surface, forward, &reorder(circuit, outward))?;
+        if spline {
+            let start = if senses[index] { 0.0 } else { 1.0 };
+            let end = 1.0 - start;
+            let pcurves = vec![
+                ([start, 0.0], [end, 0.0]),
+                ([end, 0.0], [end, 1.0]),
+                ([end, 1.0], [start, 1.0]),
+                ([start, 1.0], [start, 0.0]),
+            ];
+            let (circuit, pcurves) = reorder_with_pcurves(circuit, pcurves, outward);
+            add_wall_with_pcurves(&mut body, shell, surface, forward, &circuit, &pcurves)?;
+        } else {
+            add_wall(&mut body, shell, surface, forward, &reorder(circuit, outward))?;
+        }
     }
 
     body.lumps.get_mut(lump)?.shells = vec![shell];
     body.roots = vec![lump];
     body.validate().is_empty().then_some(body)
+}
+
+/// Extrudes an outer loop and removes each following loop as a hole.
+pub fn extrude_region(
+    plane: Plane,
+    profiles: &[Vec<Curve2>],
+    direction: [f64; 3],
+) -> Option<Body> {
+    let mut profiles = profiles.iter();
+    let mut result = extrude(plane, profiles.next()?, direction)?;
+    for hole in profiles {
+        let cutter = extrude(plane, hole, direction)?;
+        let tolerance = super::operation_tolerance(&[&result, &cutter]);
+        result = super::boolean::combine(
+            result,
+            cutter,
+            super::boolean::Operation::Difference,
+            tolerance,
+        )
+        .ok()?;
+    }
+    (!result.roots.is_empty() && result.validate().is_empty()).then_some(result)
+}
+
+/// Sweeps a profile along a connected chain of straight and circular pieces.
+pub fn sweep_along(
+    mut profile_plane: Plane,
+    profile: &[Curve2],
+    path_plane: Plane,
+    path: &[Curve2],
+) -> Option<Body> {
+    let senses = path_senses(path)?;
+    let mut result: Option<Body> = None;
+    let mut previous_tangent: Option<Vec3> = None;
+    for (piece, forward) in path.iter().zip(senses) {
+        let start_tangent = path_tangent(&path_plane, piece, forward, false)?;
+        if let Some(previous) = previous_tangent {
+            let axis = Vec3::from(path_plane.normal()?);
+            let angle = axis.dot(previous.cross(start_tangent)).atan2(previous.dot(start_tangent));
+            if angle.abs() > 1e-10 {
+                let joint = path_plane.point_at(piece.point_at(if forward { 0.0 } else { 1.0 }));
+                profile_plane = turned_plane(profile_plane, Vec3::from(joint), axis, angle);
+            }
+        }
+        let segment = match piece {
+            Curve2::Line(line) => {
+                let start = path_plane.point_at(if forward { line.start } else { line.end });
+                let end = path_plane.point_at(if forward { line.end } else { line.start });
+                let direction = Vec3::from(end) - Vec3::from(start);
+                let body = extrude(profile_plane, profile, direction.to_array())?;
+                profile_plane.origin = (Vec3::from(profile_plane.origin) + direction).to_array();
+                body
+            }
+            Curve2::Arc(arc) => {
+                let pivot = path_plane.point_at(arc.centre);
+                let axis = path_plane.normal()?;
+                let angle = arc.sweep() * if forward { 1.0 } else { -1.0 };
+                let turn = Turn::new(&profile_plane, profile, pivot, axis, angle)?;
+                let body = revolve(profile_plane, profile, pivot, axis, angle)?;
+                profile_plane = turn.far_plane(&profile_plane);
+                body
+            }
+            _ => return None,
+        };
+        previous_tangent = Some(path_tangent(&path_plane, piece, forward, true)?);
+        result = Some(match result {
+            None => segment,
+            Some(previous) => {
+                let tolerance = super::operation_tolerance(&[&previous, &segment]);
+                super::boolean::combine(
+                    previous,
+                    segment,
+                    super::boolean::Operation::Union,
+                    tolerance,
+                )
+                .ok()?
+            }
+        });
+    }
+    result.filter(|body| !body.roots.is_empty() && body.validate().is_empty())
+}
+
+fn path_tangent(plane: &Plane, piece: &Curve2, forward: bool, at_end: bool) -> Option<Vec3> {
+    let parameter = if at_end == forward { 1.0 } else { 0.0 };
+    let tangent = Vec3::from(plane.vector_at(piece.tangent_at(parameter)));
+    (tangent * if forward { 1.0 } else { -1.0 }).normalize()
+}
+
+fn turned_plane(plane: Plane, pivot: Vec3, axis: Vec3, angle: f64) -> Plane {
+    let rotate = |vector: Vec3| {
+        let (sin, cos) = angle.sin_cos();
+        vector * cos + axis.cross(vector) * sin + axis * axis.dot(vector) * (1.0 - cos)
+    };
+    Plane::from_axes(
+        (pivot + rotate(Vec3::from(plane.origin) - pivot)).to_array(),
+        rotate(Vec3::from(plane.x_axis)).to_array(),
+        rotate(Vec3::from(plane.y_axis)).to_array(),
+    )
+}
+
+fn path_senses(path: &[Curve2]) -> Option<Vec<bool>> {
+    if path.is_empty() {
+        return None;
+    }
+    [true, false].into_iter().find_map(|first| {
+        let mut senses = vec![first];
+        let mut head = path[0].point_at(if first { 1.0 } else { 0.0 });
+        for piece in &path[1..] {
+            let forward = meets(head, piece.point_at(0.0));
+            if !forward && !meets(head, piece.point_at(1.0)) {
+                return None;
+            }
+            head = piece.point_at(if forward { 1.0 } else { 0.0 });
+            senses.push(forward);
+        }
+        Some(senses)
+    })
 }
 
 /// Whether each piece of a closed profile is written the way the loop runs.
@@ -173,7 +304,7 @@ pub fn extrude(plane: Plane, profile: &[Curve2], direction: [f64; 3]) -> Option<
 ///
 /// `None` when the chain does not close either way, or has fewer than three
 /// pieces — neither describes an outline with an inside.
-fn profile_senses(profile: &[Curve2]) -> Option<Vec<bool>> {
+pub(super) fn profile_senses(profile: &[Curve2]) -> Option<Vec<bool>> {
     if profile.len() < 3 {
         return None;
     }
@@ -253,8 +384,31 @@ fn lift_piece(plane: &Plane, piece: &Curve2) -> Option<(Curve3, f64, f64)> {
                 start + arc.sweep(),
             ))
         }
-        // A spline or an ellipse sweeps into a surface with no analytic form,
-        // so the wall could only be approximated. Refusing says so.
+        Curve2::Ellipse(arc) => {
+            let centre = plane.point_at(arc.ellipse.centre);
+            let frame = Plane::orthonormal(
+                centre,
+                plane.vector_at(arc.ellipse.major_axis),
+                plane.normal()?,
+            )?;
+            Some((
+                Curve3::Ellipse(Ellipse3 {
+                    plane: frame,
+                    major_radius: arc.ellipse.major_radius,
+                    minor_radius: arc.ellipse.minor_radius,
+                }),
+                arc.start_parameter,
+                arc.start_parameter + arc.sweep(),
+            ))
+        }
+        Curve2::Nurbs(curve) => Some((
+            Curve3::PlanarSpline {
+                plane: *plane,
+                curve: curve.clone(),
+            },
+            0.0,
+            1.0,
+        )),
         _ => None,
     }
 }
@@ -265,29 +419,40 @@ fn wall_surface(
     plane: &Plane,
     piece: &Curve2,
     along: Vec3,
-) -> Option<SurfaceKey> {
-    let surface = match piece {
+) -> Option<(SurfaceKey, bool)> {
+    let (surface, spline) = match piece {
         Curve2::Line(line) => {
             let start = Vec3::from(plane.point_at(line.start));
             let end = Vec3::from(plane.point_at(line.end));
             // The wall's own frame: along the run, and up the sweep.
             let normal = (end - start).cross(along).normalize()?;
-            Surface::Plane(Plane::orthonormal(
-                start.to_array(),
-                (end - start).to_array(),
-                normal.to_array(),
-            )?)
+            (
+                Surface::Plane(Plane::orthonormal(
+                    start.to_array(),
+                    (end - start).to_array(),
+                    normal.to_array(),
+                )?),
+                false,
+            )
         }
         Curve2::Arc(arc) => {
             let centre = plane.point_at(arc.centre);
-            Surface::Cylinder(Cylinder {
-                base: Plane::orthonormal(centre, plane.x_axis, along.to_array())?,
-                radius: arc.radius,
-            })
+            (
+                Surface::Cylinder(Cylinder {
+                    base: Plane::orthonormal(centre, plane.x_axis, along.to_array())?,
+                    radius: arc.radius,
+                }),
+                false,
+            )
+        }
+        Curve2::Ellipse(_) | Curve2::Nurbs(_) => {
+            let base = RationalCurve2::from_curve(piece)?.lifted(plane);
+            let top = base.translated(along);
+            (Surface::Nurbs(base.ruled_to(&top)?), true)
         }
         _ => return None,
     };
-    Some(body.surfaces.insert(surface))
+    Some((body.surfaces.insert(surface), spline))
 }
 
 /// Whether a face on `surface` runs with it or against it.
@@ -302,6 +467,12 @@ fn wall_surface(
 /// not rest on `on` sitting exactly on the surface — which, at survey
 /// coordinates, it will not.
 fn face_sense(surface: &Surface, on: [f64; 3], out: Vec3) -> Option<bool> {
+    if let Surface::Nurbs(spline) = surface {
+        let ((u0, u1), (v0, v1)) = spline.domain();
+        let normal = Vec3::from(surface.normal_at((u0 + u1) * 0.5, (v0 + v1) * 0.5)?);
+        let slope = normal.dot(out);
+        return (slope != 0.0 && slope.is_finite()).then_some(slope > 0.0);
+    }
     let step = out.normalize()? * 1e-6;
     let ahead = (Vec3::from(on) + step).to_array();
     let behind = (Vec3::from(on) - step).to_array();
@@ -337,6 +508,24 @@ fn reorder(circuit: Vec<(EdgeKey, bool)>, outward: bool) -> Vec<(EdgeKey, bool)>
         step.1 = !step.1;
     }
     turned
+}
+
+fn reorder_with_pcurves(
+    mut circuit: Vec<(EdgeKey, bool)>,
+    mut pcurves: Vec<([f64; 2], [f64; 2])>,
+    outward: bool,
+) -> (Vec<(EdgeKey, bool)>, Vec<([f64; 2], [f64; 2])>) {
+    if !outward {
+        circuit.reverse();
+        pcurves.reverse();
+        for step in &mut circuit {
+            step.1 = !step.1;
+        }
+        for (start, end) in &mut pcurves {
+            std::mem::swap(start, end);
+        }
+    }
+    (circuit, pcurves)
 }
 
 fn add_vertex(body: &mut Body, point: [f64; 3]) -> VertexKey {
@@ -428,6 +617,44 @@ fn add_wall(
     Some(face)
 }
 
+fn add_wall_with_pcurves(
+    body: &mut Body,
+    shell: ShellKey,
+    surface: SurfaceKey,
+    forward: bool,
+    edges: &[(EdgeKey, bool)],
+    pcurves: &[([f64; 2], [f64; 2])],
+) -> Option<FaceKey> {
+    if edges.len() != pcurves.len() {
+        return None;
+    }
+    let face = add_face(body, shell, surface, forward);
+    let ring = body.loops.insert(Loop {
+        coedges: Vec::new(),
+        owner: face,
+        provenance: Provenance::Synthesized,
+    });
+    let mut coedges = Vec::with_capacity(edges.len());
+    for ((edge, sense), (start, end)) in edges.iter().zip(pcurves) {
+        let coedge = body.coedges.insert(Coedge {
+            edge: *edge,
+            forward: *sense,
+            pcurve: Some(Curve2::Line(crate::geom2d::Line {
+                start: *start,
+                end: *end,
+            })),
+            owner: ring,
+            provenance: Provenance::Synthesized,
+        });
+        body.edges.get_mut(*edge)?.coedges.push(coedge);
+        coedges.push(coedge);
+    }
+    body.loops.get_mut(ring)?.coedges = coedges;
+    body.faces.get_mut(face)?.loops = vec![ring];
+    body.shells.get_mut(shell)?.faces.push(face);
+    Some(face)
+}
+
 /// A face with no loops on it yet.
 fn add_face(body: &mut Body, shell: ShellKey, surface: SurfaceKey, forward: bool) -> FaceKey {
     body.faces.insert(Face {
@@ -449,6 +676,40 @@ fn add_ring(body: &mut Body, face: FaceKey, edges: &[(EdgeKey, bool)]) -> Option
     let mut coedges = Vec::with_capacity(edges.len());
     for (edge, forward) in edges {
         coedges.push(add_coedge(body, ring, *edge, *forward)?);
+    }
+    body.loops.get_mut(ring)?.coedges = coedges;
+    body.faces.get_mut(face)?.loops.push(ring);
+    Some(ring)
+}
+
+fn add_ring_with_pcurves(
+    body: &mut Body,
+    face: FaceKey,
+    edges: &[(EdgeKey, bool)],
+    pcurves: &[([f64; 2], [f64; 2])],
+) -> Option<LoopKey> {
+    if edges.len() != pcurves.len() {
+        return None;
+    }
+    let ring = body.loops.insert(Loop {
+        coedges: Vec::new(),
+        owner: face,
+        provenance: Provenance::Synthesized,
+    });
+    let mut coedges = Vec::with_capacity(edges.len());
+    for ((edge, forward), (start, end)) in edges.iter().zip(pcurves) {
+        let coedge = body.coedges.insert(Coedge {
+            edge: *edge,
+            forward: *forward,
+            pcurve: Some(Curve2::Line(crate::geom2d::Line {
+                start: *start,
+                end: *end,
+            })),
+            owner: ring,
+            provenance: Provenance::Synthesized,
+        });
+        body.edges.get_mut(*edge)?.coedges.push(coedge);
+        coedges.push(coedge);
     }
     body.loops.get_mut(ring)?.coedges = coedges;
     body.faces.get_mut(face)?.loops.push(ring);
@@ -610,6 +871,46 @@ impl Turn {
                     None
                 }
             }
+            Curve2::Ellipse(_) | Curve2::Nurbs(_) => {
+                let profile = RationalCurve2::from_curve(piece)?;
+                let angular = RationalCurve2::unit_arc(self.angle)?;
+                let around = self.axis.cross(self.radial);
+                let mut points = Vec::with_capacity(profile.points.len());
+                let mut weights = Vec::with_capacity(profile.points.len());
+                for (point, profile_weight) in profile.points.iter().zip(&profile.weights) {
+                    let station = self.station(plane, *point);
+                    points.push(
+                        angular
+                            .points
+                            .iter()
+                            .map(|control| {
+                                (self.pivot
+                                    + self.axis * station.height
+                                    + self.radial * (station.radius * control[0])
+                                    + around * (station.radius * control[1]))
+                                    .to_array()
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    weights.push(
+                        angular
+                            .weights
+                            .iter()
+                            .map(|angular_weight| profile_weight * angular_weight)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                let surface = crate::space::NurbsSurface3::new_strict(
+                    profile.degree,
+                    angular.degree,
+                    points,
+                    profile.knots,
+                    angular.knots,
+                    weights,
+                )?
+                .with_periodicity(false, self.full);
+                Some((Surface::Nurbs(surface), false))
+            }
             _ => None,
         }
     }
@@ -741,8 +1042,13 @@ impl Turn {
         let mut furthest: f64 = 0.0;
         let mut reach = (0.0_f64, 0.0_f64);
         for piece in profile {
-            for step in 0..=8 {
-                let station = turn.station(plane, piece.point_at(step as f64 / 8.0));
+            let steps = if matches!(piece, Curve2::Ellipse(_) | Curve2::Nurbs(_)) {
+                64
+            } else {
+                8
+            };
+            for step in 0..=steps {
+                let station = turn.station(plane, piece.point_at(step as f64 / steps as f64));
                 furthest = furthest.max(station.radius.abs()).max(station.height.abs());
                 reach = (reach.0.min(station.radius), reach.1.max(station.radius));
             }
@@ -852,6 +1158,7 @@ fn revolve_part(
             continue;
         };
         let next = (index + 1) % profile.len();
+        let spline = matches!(surface, Surface::Nurbs(_));
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], handed > 0.0);
         let on = plane.point_at(piece.point_at(0.5));
@@ -864,7 +1171,20 @@ fn revolve_part(
         if let Some(rail) = rails[index] {
             circuit.push((rail, false));
         }
-        add_wall(body, shell, surface, forward, &reorder(circuit, outward))?;
+        if spline {
+            let start = if senses[index] { 0.0 } else { 1.0 };
+            let end = 1.0 - start;
+            let pcurves = vec![
+                ([start, 0.0], [end, 0.0]),
+                ([end, 0.0], [end, 1.0]),
+                ([end, 1.0], [start, 1.0]),
+                ([start, 1.0], [start, 0.0]),
+            ];
+            let (circuit, pcurves) = reorder_with_pcurves(circuit, pcurves, outward);
+            add_wall_with_pcurves(body, shell, surface, forward, &circuit, &pcurves)?;
+        } else {
+            add_wall(body, shell, surface, forward, &reorder(circuit, outward))?;
+        }
     }
     Some(())
 }
@@ -970,6 +1290,7 @@ fn revolve_whole(
             continue;
         };
         let next = (index + 1) % count;
+        let spline = matches!(surface, Surface::Nurbs(_));
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], handed > 0.0);
         let on = plane.point_at(piece.point_at(0.5));
@@ -1001,7 +1322,23 @@ fn revolve_whole(
                 circuit.push((rim, false));
             }
             circuit.push((seam, !senses[index]));
-            add_ring(body, face, &reorder(circuit, outward))?;
+            if spline {
+                let start = if senses[index] { 0.0 } else { 1.0 };
+                let end = 1.0 - start;
+                let mut pcurves = Vec::new();
+                if rims[index].is_some() {
+                    pcurves.push(([start, 0.0], [start, 1.0]));
+                }
+                pcurves.push(([start, 1.0], [end, 1.0]));
+                if rims[next].is_some() {
+                    pcurves.push(([end, 1.0], [end, 0.0]));
+                }
+                pcurves.push(([end, 0.0], [start, 0.0]));
+                let (circuit, pcurves) = reorder_with_pcurves(circuit, pcurves, outward);
+                add_ring_with_pcurves(body, face, &circuit, &pcurves)?;
+            } else {
+                add_ring(body, face, &reorder(circuit, outward))?;
+            }
         }
         body.shells.get_mut(shell)?.faces.push(face);
     }

@@ -28,13 +28,16 @@
 
 pub mod arena;
 pub mod boolean;
+pub mod blend;
 pub mod bounds;
 pub mod classify;
 pub mod geometry;
 pub mod imprint;
 pub mod intersect;
+pub mod loft;
 pub mod make;
 pub mod mesh;
+mod nurbs_builder;
 pub mod pcurve;
 pub mod place;
 pub mod split;
@@ -42,15 +45,17 @@ pub mod sweep;
 pub mod topology;
 
 pub use arena::{Arena, Key};
-pub use bounds::{body_bounds, face_bounds, Aabb};
+pub use bounds::{body_bounds, face_bounds, operation_tolerance, Aabb};
 pub use geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
 pub use boolean::{combine, Operation};
+pub use blend::{chamfer, fillet, presspull};
 pub use classify::{contains_point, Containment};
 pub use mesh::{body as mesh_body, Mesh};
 pub use place::{edge_points, edge_polylines, transform, Placement};
-pub use sweep::{extrude, revolve};
+pub use sweep::{extrude, extrude_region, revolve, sweep_along};
 pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};
+pub use loft::loft;
 pub use topology::{
     Body, Coedge, CoedgeKey, CurveKey, Edge, EdgeKey, Face, FaceKey, Flaw, Loop, LoopKey, Lump,
     LumpKey, Shell, ShellKey, SurfaceKey, Vertex, VertexKey,

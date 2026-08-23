@@ -20,7 +20,7 @@
 use super::bounds::{face_bounds, Aabb};
 use super::geometry::Curve3;
 use super::intersect::{surfaces, Meeting};
-use super::split::split_face;
+use super::split::{split_edge, split_face};
 use super::topology::{Body, FaceKey};
 use crate::space::Vec3;
 
@@ -62,10 +62,64 @@ pub fn imprint(a: &mut Body, b: &mut Body, tolerance: f64) -> Result<Imprint, Sn
         cuts += cut_along(a, &meeting.curves, tolerance)?;
         cuts += cut_along(b, &meeting.curves, tolerance)?;
     }
+    // Stitching needs matching edge partitions on both bodies.
+    align_edge_vertices(a, b, tolerance);
+    align_edge_vertices(b, a, tolerance);
     Ok(Imprint {
         cuts,
         meetings: count,
     })
+}
+
+fn align_edge_vertices(source: &Body, target: &mut Body, tolerance: f64) {
+    let points: Vec<[f64; 3]> = source.vertices.iter().map(|(_, vertex)| vertex.point).collect();
+    for point in points {
+        let edges: Vec<_> = target.edge_keys().collect();
+        for key in edges {
+            let Some(edge) = target.edges.get(key) else {
+                continue;
+            };
+            if edge.coedges.is_empty() {
+                continue;
+            }
+            let splittable = edge.coedges.iter().all(|coedge| {
+                target.coedges.get(*coedge).is_some_and(|coedge| {
+                    matches!(
+                        coedge.pcurve.as_ref(),
+                        None
+                            | Some(&crate::geom2d::Curve::Line(_))
+                            | Some(&crate::geom2d::Curve::Circle(_))
+                            | Some(&crate::geom2d::Curve::Arc(_))
+                            | Some(&crate::geom2d::Curve::Ellipse(_))
+                            | Some(&crate::geom2d::Curve::Nurbs(_))
+                    )
+                })
+            });
+            if !splittable {
+                continue;
+            }
+            let Some(curve) = target.curves.get(edge.curve) else {
+                continue;
+            };
+            let mut parameter = curve.parameter_at(point);
+            if matches!(curve, Curve3::Circle(_) | Curve3::Ellipse(_)) {
+                let middle = 0.5 * (edge.start_parameter + edge.end_parameter);
+                parameter += std::f64::consts::TAU
+                    * ((middle - parameter) / std::f64::consts::TAU).round();
+            }
+            let span = edge.end_parameter - edge.start_parameter;
+            if span == 0.0 {
+                continue;
+            }
+            let across = (parameter - edge.start_parameter) / span;
+            if !(1e-9..=1.0 - 1e-9).contains(&across)
+                || Vec3::from(curve.point_at(parameter)).distance(Vec3::from(point)) > tolerance
+            {
+                continue;
+            }
+            split_edge(target, key, parameter);
+        }
+    }
 }
 
 /// Whether two faces share any area rather than merely a plane.

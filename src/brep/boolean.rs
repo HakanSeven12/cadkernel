@@ -323,8 +323,11 @@ fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Option<[f64; 3]
         samples
             .iter()
             .find_map(|point| usable([(centre[0] + point[0]) * 0.5, (centre[1] + point[1]) * 0.5]))
-    })?;
-    Some(surface.point_at(chosen[0], chosen[1]))
+    });
+    if let Some(chosen) = chosen {
+        return Some(surface.point_at(chosen[0], chosen[1]));
+    }
+    pcurve::periodic_band_point(surface, &boundary, tolerance)
 }
 
 /// Copies a face and everything bounding it into the result.

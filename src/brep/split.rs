@@ -54,6 +54,30 @@ pub fn split_edge(body: &mut Body, edge: EdgeKey, parameter: f64) -> Option<(Edg
         return None;
     }
 
+    // Resolve every pcurve before changing the shared topology.
+    let mut coedges = Vec::with_capacity(original.coedges.len());
+    for key in &original.coedges {
+        let existing = body.coedges.get(*key)?.clone();
+        let (near_pcurve, far_pcurve) = match existing.pcurve.as_ref() {
+            Some(curve) => {
+                let at = if existing.forward { across } else { 1.0 - across };
+                let (first, second) = split_pcurve(curve, at)?;
+                if existing.forward {
+                    (Some(first), Some(second))
+                } else {
+                    (Some(second), Some(first))
+                }
+            }
+            None => (None, None),
+        };
+        body.loops
+            .get(existing.owner)?
+            .coedges
+            .iter()
+            .position(|candidate| candidate == key)?;
+        coedges.push((*key, existing, near_pcurve, far_pcurve));
+    }
+
     let point = body.curves.get(original.curve)?.point_at(parameter);
     let middle = body.vertices.insert(Vertex {
         point,
@@ -76,20 +100,7 @@ pub fn split_edge(body: &mut Body, edge: EdgeKey, parameter: f64) -> Option<(Edg
         near.provenance.soil();
     }
 
-    for coedge in &original.coedges {
-        let existing = body.coedges.get(*coedge)?.clone();
-        let (near_pcurve, far_pcurve) = match existing.pcurve.as_ref() {
-            Some(curve) => {
-                let at = if existing.forward { across } else { 1.0 - across };
-                let (first, second) = split_pcurve(curve, at)?;
-                if existing.forward {
-                    (Some(first), Some(second))
-                } else {
-                    (Some(second), Some(first))
-                }
-            }
-            None => (None, None),
-        };
+    for (coedge, existing, near_pcurve, far_pcurve) in coedges {
         let twin = body.coedges.insert(Coedge {
             edge: far,
             forward: existing.forward,
@@ -100,7 +111,7 @@ pub fn split_edge(body: &mut Body, edge: EdgeKey, parameter: f64) -> Option<(Edg
         body.edges.get_mut(far)?.coedges.push(twin);
 
         let ring = body.loops.get_mut(existing.owner)?;
-        let at = ring.coedges.iter().position(|key| *key == *coedge)?;
+        let at = ring.coedges.iter().position(|key| *key == coedge)?;
         // A coedge running with the curve meets the near half first, so the
         // far half follows it. One running against the curve meets the far
         // half first, so the new coedge goes in ahead of it.
@@ -111,7 +122,7 @@ pub fn split_edge(body: &mut Body, edge: EdgeKey, parameter: f64) -> Option<(Edg
         if let Some(face) = body.faces.get_mut(face) {
             face.provenance.soil();
         }
-        if let Some(coedge) = body.coedges.get_mut(*coedge) {
+        if let Some(coedge) = body.coedges.get_mut(coedge) {
             coedge.pcurve = near_pcurve;
             coedge.provenance.soil();
         }
@@ -124,7 +135,7 @@ fn split_pcurve(
     curve: &crate::geom2d::Curve,
     at: f64,
 ) -> Option<(crate::geom2d::Curve, crate::geom2d::Curve)> {
-    use crate::geom2d::{Curve, Line};
+    use crate::geom2d::{Arc, Curve, EllipseArc, Line};
     Some(match curve {
         Curve::Line(line) => {
             let middle = [
@@ -134,6 +145,53 @@ fn split_pcurve(
             (
                 Curve::Line(Line { start: line.start, end: middle }),
                 Curve::Line(Line { start: middle, end: line.end }),
+            )
+        }
+        Curve::Circle(circle) => {
+            let middle = TAU * at;
+            (
+                Curve::Arc(Arc {
+                    centre: circle.centre,
+                    radius: circle.radius,
+                    start_angle: 0.0,
+                    end_angle: middle,
+                }),
+                Curve::Arc(Arc {
+                    centre: circle.centre,
+                    radius: circle.radius,
+                    start_angle: middle,
+                    end_angle: TAU,
+                }),
+            )
+        }
+        Curve::Arc(arc) => {
+            let end = arc.start_angle + arc.sweep();
+            let middle = arc.start_angle + arc.sweep() * at;
+            (
+                Curve::Arc(Arc {
+                    end_angle: middle,
+                    ..*arc
+                }),
+                Curve::Arc(Arc {
+                    start_angle: middle,
+                    end_angle: end,
+                    ..*arc
+                }),
+            )
+        }
+        Curve::Ellipse(arc) => {
+            let end = arc.start_parameter + arc.sweep();
+            let middle = arc.start_parameter + arc.sweep() * at;
+            (
+                Curve::Ellipse(EllipseArc {
+                    end_parameter: middle,
+                    ..*arc
+                }),
+                Curve::Ellipse(EllipseArc {
+                    start_parameter: middle,
+                    end_parameter: end,
+                    ..*arc
+                }),
             )
         }
         Curve::Nurbs(curve) => {
@@ -167,26 +225,9 @@ pub fn split_edge_at(body: &mut Body, edge: EdgeKey, point: [f64; 3]) -> Option<
 /// The first keeps the original key. Both lie on the same surface — a cut
 /// divides a face without moving it — and both belong to the same shell.
 ///
-/// # What is handled
-///
-/// A cut that enters the face's boundary once and leaves once, which is the
-/// case a boolean produces at every face an intersection curve passes
-/// through. A cut that crosses more often would leave more than two pieces,
-/// and one that closes inside the face makes a hole rather than a division;
-/// both answer `None` rather than returning one of the pieces and dropping
-/// the others.
-///
-/// `None` also when the cutter does not lie on the face's surface, when the
-/// surface's parameter space cannot be written down — see
-/// [`pcurve::project`] — and when the face already has holes, which needs the
-/// inner loops assigned to the right half and is a case of its own.
-///
-/// # Where the crossings come from
-///
-/// In the surface's parameter space, where the cut and the boundary are both
-/// plane curves and the crossing is a plane intersection. Doing it in space
-/// would mean intersecting two curves that share no natural parameter and
-/// meet at a tangent as often as not.
+/// Handles boundary crossings, closed interior cuts, and closed sections of
+/// periodic faces. Returns `None` when the cut cannot be represented exactly.
+/// Crossings are solved in the surface's parameter space.
 pub fn split_face(
     body: &mut Body,
     face: FaceKey,
@@ -194,10 +235,6 @@ pub fn split_face(
     tolerance: f64,
 ) -> Option<[FaceKey; 2]> {
     let node = body.faces.get(face)?.clone();
-    if node.loops.len() != 1 {
-        return None;
-    }
-    let ring_key = node.loops[0];
     let surface = body.surfaces.get(node.surface)?.clone();
     let flat_cutter = pcurve::project(&surface, cutter, tolerance)?;
     let boundary_parts = pcurve::face_boundary_parts(body, face, tolerance)?;
@@ -248,8 +285,41 @@ pub fn split_face(
             }
         }
     }
+    let inside = |parameter: f64| {
+        let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
+        Some(periodic_points([u, v], periods).into_iter().any(|point| {
+            crate::geom2d::contains(
+                &original_boundary,
+                point,
+                Tolerance::new(tolerance),
+            )
+        }))
+    };
+    let strictly_inside = |parameter: f64| {
+        let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
+        Some(periodic_points([u, v], periods).into_iter().any(|point| {
+            crate::geom2d::contains(
+                &original_boundary,
+                point,
+                Tolerance::new(tolerance),
+            ) && original_boundary
+                .iter()
+                .all(|edge| distance_to(edge, point) > tolerance)
+        }))
+    };
     if landings.is_empty() {
         let period = closed_period(cutter)?;
+        if node.loops.len() > 1 {
+            return split_closed_between_loops(
+                body,
+                face,
+                &node,
+                cutter,
+                &flat_cutter,
+                &boundary_parts,
+                period,
+            );
+        }
         let point = cutter.point_at(0.0);
         let (u, v) = surface.parameters_at(point)?;
         let strictly_inside = periodic_points([u, v], periods).into_iter().any(|point| {
@@ -322,6 +392,38 @@ pub fn split_face(
         body.edges.get_mut(cut)?.coedges = vec![hole, inner];
         return Some([face, other]);
     }
+    if node.loops.len() != 1 {
+        return None;
+    }
+    let ring_key = node.loops[0];
+    let mut selected_span = None;
+    if landings.len() > 2 {
+        // Split one interior span; the caller retries both resulting faces.
+        landings.sort_by(|a, b| {
+            cutter
+                .parameter_at(a.point)
+                .total_cmp(&cutter.parameter_at(b.point))
+        });
+        let period = closed_period(cutter);
+        let count = landings.len();
+        let pair_count = if period.is_some() { count } else { count - 1 };
+        let pair = (0..pair_count).find_map(|index| {
+            let next = (index + 1) % count;
+            let first = cutter.parameter_at(landings[index].point);
+            let mut second = cutter.parameter_at(landings[next].point);
+            if next == 0 {
+                second += period?;
+            }
+            strictly_inside(0.5 * (first + second))?
+                .then_some((
+                    [landings[index].clone(), landings[next].clone()],
+                    (first, second),
+                ))
+        });
+        let (pair, span) = pair?;
+        landings = pair.to_vec();
+        selected_span = Some(span);
+    }
     if landings.len() != 2 {
         return None;
     }
@@ -337,21 +439,15 @@ pub fn split_face(
         } else {
             (1, 0, second_parameter, first_parameter)
         };
-    let inside = |parameter: f64| {
-        let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
-        Some(periodic_points([u, v], periods).into_iter().any(|point| {
-            crate::geom2d::contains(
-                &original_boundary,
-                point,
-                Tolerance::new(tolerance),
-            )
-        }))
-    };
-    let (start_landing, end_landing, start_parameter, end_parameter) = match closed_period(cutter) {
-        Some(period) if same_vertex_landing => {
+    let (start_landing, end_landing, start_parameter, end_parameter) = match (
+        selected_span,
+        closed_period(cutter),
+    ) {
+        (Some((start, end)), _) => (0, 1, start, end),
+        (None, Some(period)) if same_vertex_landing => {
             (low, high, low_parameter, low_parameter + period)
         }
-        Some(period) => {
+        (None, Some(period)) => {
             let direct = inside(0.5 * (low_parameter + high_parameter))?;
             let wrapped = inside(0.5 * (high_parameter + low_parameter + period))?;
             match (direct, wrapped) {
@@ -360,7 +456,7 @@ pub fn split_face(
                 _ => return None,
             }
         }
-        None => (low, high, low_parameter, high_parameter),
+        (None, None) => (low, high, low_parameter, high_parameter),
     };
 
     // A cut that runs along the boundary divides nothing. It happens
@@ -408,16 +504,12 @@ pub fn split_face(
         body.coedge_vertices(coedge)
             .is_some_and(|(from, _)| from == vertex)
     };
-    let landing_index = |landing: &Landing, vertex: VertexKey| {
-        let at = ring.iter().position(|coedge| *coedge == landing.coedge)?;
-        if begins_at(body, ring[at], vertex) {
-            return Some(at);
-        }
-        let next = (at + 1) % ring.len();
-        begins_at(body, ring[next], vertex).then_some(next)
+    let landing_index = |vertex: VertexKey| {
+        ring.iter()
+            .position(|coedge| begins_at(body, *coedge, vertex))
     };
-    let at_first = landing_index(&landings[0], first)?;
-    let at_second = landing_index(&landings[1], second)?;
+    let at_first = landing_index(first)?;
+    let at_second = landing_index(second)?;
     // The stretch of the ring from one index round to the other, not
     // including where it stops.
     let arc = |from: usize, to: usize| -> Vec<CoedgeKey> {
@@ -493,6 +585,127 @@ pub fn split_face(
     Some([face, other])
 }
 
+/// Divides a periodic band along a closed section.
+fn split_closed_between_loops(
+    body: &mut Body,
+    face: FaceKey,
+    node: &Face,
+    cutter: &Curve3,
+    flat_cutter: &crate::geom2d::Curve,
+    boundary_parts: &[(CoedgeKey, crate::geom2d::Curve)],
+    period: f64,
+) -> Option<[FaceKey; 2]> {
+    let crate::geom2d::Curve::Line(line) = flat_cutter else {
+        return None;
+    };
+    let direction = Vec3::new(line.end[0] - line.start[0], line.end[1] - line.start[1], 0.0);
+    if direction.length() <= f64::EPSILON {
+        return None;
+    }
+
+    let mut negative = Vec::new();
+    let mut positive = Vec::new();
+    let mut negative_along = 0.0;
+    let mut positive_along = 0.0;
+    for ring in &node.loops {
+        let first = *body.loops.get(*ring)?.coedges.first()?;
+        let boundary = boundary_parts.iter().find(|(key, _)| *key == first)?.1.clone();
+        let point = boundary.point_at(0.5);
+        let tangent = Vec3::new(
+            boundary.point_at(1.0)[0] - boundary.point_at(0.0)[0],
+            boundary.point_at(1.0)[1] - boundary.point_at(0.0)[1],
+            0.0,
+        );
+        let side = direction.x * (point[1] - line.start[1])
+            - direction.y * (point[0] - line.start[0]);
+        if side < 0.0 {
+            negative.push(*ring);
+            negative_along += tangent.dot(direction);
+        } else if side > 0.0 {
+            positive.push(*ring);
+            positive_along += tangent.dot(direction);
+        } else {
+            return None;
+        }
+    }
+    if negative.is_empty() || positive.is_empty() {
+        return None;
+    }
+    let (kept, moved, cut_forward) = if negative_along >= positive_along {
+        (negative, positive, false)
+    } else {
+        (positive, negative, true)
+    };
+
+    let seam = body.vertices.insert(Vertex {
+        point: cutter.point_at(0.0),
+        provenance: Provenance::Synthesized,
+    });
+    let curve = body.curves.insert(cutter.clone());
+    let cut = body.edges.insert(Edge {
+        curve,
+        start_parameter: 0.0,
+        end_parameter: period,
+        start: seam,
+        end: seam,
+        coedges: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+
+    let kept_ring = body.loops.insert(Loop {
+        coedges: Vec::new(),
+        owner: face,
+        provenance: Provenance::Synthesized,
+    });
+    let kept_coedge = body.coedges.insert(Coedge {
+        edge: cut,
+        forward: cut_forward,
+        pcurve: None,
+        owner: kept_ring,
+        provenance: Provenance::Synthesized,
+    });
+    body.loops.get_mut(kept_ring)?.coedges = vec![kept_coedge];
+
+    let other = body.faces.insert(Face {
+        surface: node.surface,
+        forward: node.forward,
+        loops: Vec::new(),
+        owner: node.owner,
+        provenance: Provenance::Synthesized,
+    });
+    let moved_ring = body.loops.insert(Loop {
+        coedges: Vec::new(),
+        owner: other,
+        provenance: Provenance::Synthesized,
+    });
+    let moved_coedge = body.coedges.insert(Coedge {
+        edge: cut,
+        forward: !cut_forward,
+        pcurve: None,
+        owner: moved_ring,
+        provenance: Provenance::Synthesized,
+    });
+    body.loops.get_mut(moved_ring)?.coedges = vec![moved_coedge];
+    body.edges.get_mut(cut)?.coedges = vec![kept_coedge, moved_coedge];
+
+    for ring in &kept {
+        body.loops.get_mut(*ring)?.owner = face;
+    }
+    for ring in &moved {
+        body.loops.get_mut(*ring)?.owner = other;
+    }
+    let mut kept_loops = kept;
+    kept_loops.push(kept_ring);
+    let mut moved_loops = moved;
+    moved_loops.push(moved_ring);
+    let kept_face = body.faces.get_mut(face)?;
+    kept_face.loops = kept_loops;
+    kept_face.provenance.soil();
+    body.faces.get_mut(other)?.loops = moved_loops;
+    body.shells.get_mut(node.owner)?.faces.push(other);
+    Some([face, other])
+}
+
 fn closed_period(curve: &Curve3) -> Option<f64> {
     match curve {
         Curve3::Circle(_) | Curve3::Ellipse(_) => Some(TAU),
@@ -548,6 +761,7 @@ fn parameter_in_span(curve: &Curve3, point: [f64; 3], start: f64, end: f64) -> f
 }
 
 /// Where the cut met the boundary.
+#[derive(Clone)]
 struct Landing {
     edge: EdgeKey,
     coedge: CoedgeKey,

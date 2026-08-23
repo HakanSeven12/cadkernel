@@ -7,14 +7,14 @@ use crate::brep::{
     Body, CoedgeKey, Curve3, CurveKey, EdgeKey, FaceKey, LoopKey, LumpKey, ShellKey, Surface,
     SurfaceKey, VertexKey,
 };
+use crate::geom2d::Curve as Curve2;
 use crate::space::Vec3;
 use std::collections::HashMap;
 
 /// Why a body could not be written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unappendable {
-    /// A curve kind with no record form here — a spline, which needs a
-    /// `bs3_curve` subrecord written out.
+    /// A curve or pcurve has no supported SAT record form.
     Curve,
     /// A surface whose frame is degenerate, so there is no normal to write.
     Surface,
@@ -52,17 +52,38 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
         ids.vertices.insert(key, add(document, "vertex", Vec::new()));
     }
     for (key, curve) in body.curves.iter() {
-        let (kind, tokens) = curve_record(curve).ok_or(Unappendable::Curve)?;
-        ids.curves.insert(key, add(document, kind, tokens));
+        let id = add_curve(document, curve).ok_or(Unappendable::Curve)?;
+        ids.curves.insert(key, id);
     }
     for (key, surface) in body.surfaces.iter() {
-        let (kind, tokens) = surface_record(surface).ok_or(Unappendable::Surface)?;
-        ids.surfaces.insert(key, add(document, kind, tokens));
+        let id = match surface {
+            Surface::Nurbs(surface) => add_nurbs_surface(document, surface),
+            _ => {
+                let (kind, tokens) = surface_record(surface).ok_or(Unappendable::Surface)?;
+                add(document, kind, tokens)
+            }
+        };
+        ids.surfaces.insert(key, id);
     }
     for key in body.edges.keys() {
         ids.edges.insert(key, add(document, "edge", Vec::new()));
     }
-    for key in body.coedges.keys() {
+    for (key, coedge) in body.coedges.iter() {
+        if let Some(curve) = &coedge.pcurve {
+            let face = body
+                .loops
+                .get(coedge.owner)
+                .and_then(|ring| body.faces.get(ring.owner))
+                .ok_or(Unappendable::Inconsistent)?;
+            let needs_curve = matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_)));
+            match add_pcurve(document, curve) {
+                Some(id) => {
+                    ids.pcurves.insert(key, id);
+                }
+                None if needs_curve => return Err(Unappendable::Curve),
+                None => {}
+            }
+        }
         ids.coedges.insert(key, add(document, "coedge", Vec::new()));
     }
     for key in body.loops.keys() {
@@ -134,7 +155,7 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                     pointer(ids.edge(node.edge)),
                     sense(node.forward),
                     pointer(ids.loop_(key)),
-                    null(),
+                    pointer(ids.pcurve(*coedge)),
                 ],
             );
         }
@@ -239,6 +260,7 @@ struct Ids {
     surfaces: HashMap<SurfaceKey, i32>,
     edges: HashMap<EdgeKey, i32>,
     coedges: HashMap<CoedgeKey, i32>,
+    pcurves: HashMap<CoedgeKey, i32>,
     loops: HashMap<LoopKey, i32>,
     faces: HashMap<FaceKey, i32>,
     shells: HashMap<ShellKey, i32>,
@@ -260,6 +282,7 @@ impl Ids {
     lookup!(surface, surfaces, SurfaceKey);
     lookup!(edge, edges, EdgeKey);
     lookup!(coedge, coedges, CoedgeKey);
+    lookup!(pcurve, pcurves, CoedgeKey);
     lookup!(loop_, loops, LoopKey);
     lookup!(face, faces, FaceKey);
     lookup!(shell, shells, ShellKey);
@@ -288,6 +311,132 @@ fn set(document: &mut SatDocument, id: i32, tokens: Vec<SatToken>) {
     if let Some(record) = document.record_mut(id as usize) {
         record.tokens = tokens;
     }
+}
+
+fn distinct_knots(knots: &[f64]) -> Vec<(f64, i32)> {
+    let mut out: Vec<(f64, i32)> = Vec::new();
+    for knot in knots {
+        match out.last_mut() {
+            Some((value, multiplicity)) if *value == *knot => *multiplicity += 1,
+            _ => out.push((*knot, 1)),
+        }
+    }
+    out
+}
+
+fn add_nurbs_surface(document: &mut SatDocument, surface: &crate::space::NurbsSurface3) -> i32 {
+    let (u_degree, v_degree) = surface.degrees();
+    let (u_knots, v_knots) = surface.knots();
+    let controls = surface.control_points();
+    let weights = surface.weights();
+    let rational = weights
+        .iter()
+        .flatten()
+        .next()
+        .is_some_and(|first| {
+            weights
+                .iter()
+                .flatten()
+                .any(|weight| (*weight - *first).abs() > 1e-12)
+        });
+    let mut points = Vec::new();
+    let mut flat_weights = Vec::new();
+    for v in 0..controls[0].len() {
+        for u in 0..controls.len() {
+            points.push(controls[u][v]);
+            flat_weights.push(weights[u][v]);
+        }
+    }
+    let periodic = surface.periodicity();
+    document.add_spline_surface(
+        surface.v_reversed(),
+        rational,
+        u_degree as i32,
+        v_degree as i32,
+        periodic[0],
+        periodic[1],
+        &distinct_knots(u_knots),
+        &distinct_knots(v_knots),
+        &points,
+        rational.then_some(flat_weights.as_slice()),
+        0.0,
+    )
+}
+
+fn add_curve(document: &mut SatDocument, curve: &Curve3) -> Option<i32> {
+    let spline = match curve {
+        Curve3::PlanarSpline { plane, curve } => {
+            let (start, end) = curve.domain();
+            let width = end - start;
+            if !width.is_finite() || width <= 0.0 {
+                return None;
+            }
+            let knots = curve
+                .knots()
+                .iter()
+                .map(|knot| (knot - start) / width)
+                .collect();
+            crate::space::NurbsCurve3::new_strict(
+                curve.degree(),
+                curve
+                    .control_points()
+                    .iter()
+                    .map(|point| plane.point_at(*point))
+                    .collect(),
+                knots,
+                curve.weights().to_vec(),
+            )?
+            .with_periodicity(curve.is_closed())
+        }
+        Curve3::Nurbs(curve) => curve.clone(),
+        _ => {
+            let (kind, tokens) = curve_record(curve)?;
+            return Some(add(document, kind, tokens));
+        }
+    };
+    Some(document.add_spline_curve(
+        spline.is_rational(),
+        spline.degree() as i32,
+        spline.periodicity(),
+        &distinct_knots(spline.knots()),
+        spline.control_points(),
+        spline.is_rational().then_some(spline.weights()),
+        0.0,
+    ))
+}
+
+fn add_pcurve(document: &mut SatDocument, curve: &Curve2) -> Option<i32> {
+    let (degree, knots, controls, weights, rational, closed, range) = match curve {
+        Curve2::Line(line) => (
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![line.start, line.end],
+            vec![1.0, 1.0],
+            false,
+            false,
+            (0.0, 1.0),
+        ),
+        Curve2::Nurbs(curve) => (
+            curve.degree(),
+            curve.knots().to_vec(),
+            curve.control_points().to_vec(),
+            curve.weights().to_vec(),
+            curve.is_rational(),
+            curve.point_at_knot(curve.domain().0) == curve.point_at_knot(curve.domain().1),
+            curve.domain(),
+        ),
+        _ => return None,
+    };
+    Some(document.add_pcurve(
+        rational,
+        degree as i32,
+        closed,
+        &distinct_knots(&knots),
+        &controls,
+        rational.then_some(weights.as_slice()),
+        0.0,
+        range,
+    ))
 }
 
 pub(super) fn surface_record(surface: &Surface) -> Option<(&'static str, Vec<SatToken>)> {
@@ -386,10 +535,7 @@ pub(super) fn curve_record(curve: &Curve3) -> Option<(&'static str, Vec<SatToken
                 ellipse.minor_radius / ellipse.major_radius,
             ),
         ),
-        // A spline needs a bs3_curve subrecord, which is its own piece of
-        // work. Saying so beats writing a line where a curve was.
-        Curve3::PlanarSpline { .. } => return None,
-        Curve3::Nurbs(_) => return None,
+        Curve3::PlanarSpline { .. } | Curve3::Nurbs(_) => return None,
     })
 }
 
