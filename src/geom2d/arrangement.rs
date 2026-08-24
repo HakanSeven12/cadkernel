@@ -93,6 +93,24 @@ pub fn bounded_faces(segments: &[Line], tolerance: Tolerance) -> Vec<Vec<[f64; 2
     graph.trace_faces()
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TaggedLine {
+    pub line: Line,
+    pub tag: usize,
+}
+
+pub(crate) fn bounded_face_edges(
+    segments: &[TaggedLine],
+    tolerance: Tolerance,
+) -> Vec<Vec<TaggedLine>> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let tolerance = tolerance.linear();
+    let pieces = split_tagged_at_crossings(segments, tolerance);
+    TaggedGraph::weld(&pieces, tolerance).trace_faces()
+}
+
 /// The signed area a ring encloses: positive counter-clockwise.
 ///
 /// Summed about the ring's own first point rather than about the origin. At
@@ -258,6 +276,79 @@ fn split_at_crossings(segments: &[Line], tolerance: f64) -> Vec<Line> {
     pieces
 }
 
+fn split_tagged_at_crossings(segments: &[TaggedLine], tolerance: f64) -> Vec<TaggedLine> {
+    let lines: Vec<Line> = segments.iter().map(|segment| segment.line).collect();
+    let bounds: Vec<Bounds> = lines.iter().copied().map(Bounds::of).collect();
+    let vertical = sweep_on_y(&bounds, tolerance);
+    let key = |bounds: &Bounds| {
+        if vertical {
+            bounds.min.y
+        } else {
+            bounds.min.x
+        }
+    };
+    let far = |bounds: &Bounds| {
+        if vertical {
+            bounds.max.y
+        } else {
+            bounds.max.x
+        }
+    };
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by(|&a, &b| key(&bounds[a]).total_cmp(&key(&bounds[b])));
+    let mut cuts: Vec<Vec<f64>> = vec![vec![0.0, 1.0]; lines.len()];
+    let mut active: Vec<usize> = Vec::new();
+    for index in order {
+        let front = key(&bounds[index]);
+        active.retain(|&other| far(&bounds[other]) + tolerance >= front);
+        for &other in &active {
+            if !bounds[index].overlaps(bounds[other], tolerance) {
+                continue;
+            }
+            match segment_crossing(lines[index], lines[other], Tolerance::new(tolerance)) {
+                SegmentCrossing::None => {}
+                SegmentCrossing::Point { a, b } => {
+                    cuts[index].push(a.clamp(0.0, 1.0));
+                    cuts[other].push(b.clamp(0.0, 1.0));
+                }
+                SegmentCrossing::Overlap { a, b } => {
+                    cuts[index].extend(a.map(|value| value.clamp(0.0, 1.0)));
+                    cuts[other].extend(b.map(|value| value.clamp(0.0, 1.0)));
+                }
+            }
+        }
+        active.push(index);
+    }
+
+    let mut pieces = Vec::new();
+    for (index, params) in cuts.iter_mut().enumerate() {
+        let line = lines[index];
+        let start = Vec2::from(line.start);
+        let end = Vec2::from(line.end);
+        let length = start.distance(end);
+        if length <= tolerance {
+            continue;
+        }
+        let merge = (tolerance / length).min(1.0);
+        params.sort_by(f64::total_cmp);
+        params.dedup_by(|a, b| (*a - *b).abs() <= merge);
+        for pair in params.windows(2) {
+            let a = start.lerp(end, pair[0]);
+            let b = start.lerp(end, pair[1]);
+            if a.distance(b) > tolerance {
+                pieces.push(TaggedLine {
+                    line: Line {
+                        start: a.to_array(),
+                        end: b.to_array(),
+                    },
+                    tag: segments[index].tag,
+                });
+            }
+        }
+    }
+    pieces
+}
+
 /// Which axis to sweep along: the one whose intervals overlap least, since
 /// that is the one where the active list stays short.
 fn sweep_on_y(bounds: &[Bounds], tolerance: f64) -> bool {
@@ -401,6 +492,113 @@ impl Graph {
             }
         }
         faces
+    }
+}
+
+struct TaggedGraph {
+    vertices: Vec<Vec2>,
+    neighbours: Vec<Vec<usize>>,
+    edges: HashMap<(usize, usize), usize>,
+}
+
+impl TaggedGraph {
+    fn weld(pieces: &[TaggedLine], tolerance: f64) -> Self {
+        let mut vertices = Vec::new();
+        let mut buckets: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        let mut edges = HashMap::new();
+        for piece in pieces {
+            let a = weld_point(
+                Vec2::from(piece.line.start),
+                &mut vertices,
+                &mut buckets,
+                tolerance,
+            );
+            let b = weld_point(
+                Vec2::from(piece.line.end),
+                &mut vertices,
+                &mut buckets,
+                tolerance,
+            );
+            if a != b {
+                edges.entry(ordered_edge(a, b)).or_insert(piece.tag);
+            }
+        }
+        let mut neighbours = vec![Vec::new(); vertices.len()];
+        for &(a, b) in edges.keys() {
+            neighbours[a].push(b);
+            neighbours[b].push(a);
+        }
+        for (vertex, list) in neighbours.iter_mut().enumerate() {
+            let origin = vertices[vertex];
+            list.sort_by(|&a, &b| {
+                (vertices[a] - origin)
+                    .angle()
+                    .total_cmp(&(vertices[b] - origin).angle())
+            });
+            list.dedup();
+        }
+        Self {
+            vertices,
+            neighbours,
+            edges,
+        }
+    }
+
+    fn trace_faces(&self) -> Vec<Vec<TaggedLine>> {
+        let mut walked = HashSet::new();
+        let mut faces = Vec::new();
+        let limit = self.edges.len() * 2 + 1;
+        for from in 0..self.vertices.len() {
+            for &to in &self.neighbours[from] {
+                if walked.contains(&(from, to)) {
+                    continue;
+                }
+                let start = (from, to);
+                let mut current = start;
+                let mut ring = Vec::new();
+                let mut closed = false;
+                for _ in 0..limit {
+                    if !walked.insert(current) {
+                        break;
+                    }
+                    let (tail, head) = current;
+                    ring.push(TaggedLine {
+                        line: Line {
+                            start: self.vertices[tail].to_array(),
+                            end: self.vertices[head].to_array(),
+                        },
+                        tag: self.edges[&ordered_edge(tail, head)],
+                    });
+                    let around = &self.neighbours[head];
+                    let Some(incoming) = around.iter().position(|&vertex| vertex == tail) else {
+                        break;
+                    };
+                    let next = around[if incoming == 0 {
+                        around.len() - 1
+                    } else {
+                        incoming - 1
+                    }];
+                    current = (head, next);
+                    if current == start {
+                        closed = true;
+                        break;
+                    }
+                }
+                let points: Vec<[f64; 2]> = ring.iter().map(|edge| edge.line.start).collect();
+                if closed && points.len() >= 3 && signed_area(&points) > AREA_EPS {
+                    faces.push(ring);
+                }
+            }
+        }
+        faces
+    }
+}
+
+fn ordered_edge(a: usize, b: usize) -> (usize, usize) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 

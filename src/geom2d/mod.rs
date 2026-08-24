@@ -12,6 +12,7 @@ pub mod angle;
 pub mod arclength;
 pub mod area;
 pub mod arrangement;
+pub mod band;
 pub mod clip;
 pub mod centerline;
 pub mod containment;
@@ -37,6 +38,9 @@ pub mod vec;
 
 pub use angle::{angle_within_arc, arc_parameter, arc_span, normalize_angle};
 pub use arrangement::{bounded_faces, segment_crossing, signed_area, SegmentCrossing};
+pub use band::{
+    polyline_band_boundary, BandBoundaryEdge, BandStationPiece, PolylineBandBoundary,
+};
 pub use clip::{inside_pieces, inside_spans, trim_spans};
 pub use centerline::{centerline_between, CenterLineGeometry};
 pub use containment::{closest_point, contains, distance_to, nearest_of, Closest};
