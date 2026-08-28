@@ -12,6 +12,7 @@
 //! planar B-rep face.
 
 pub mod curve;
+pub mod helix;
 pub mod nurbs;
 pub mod plane;
 pub mod polygon;
@@ -21,6 +22,7 @@ pub mod vec;
 #[cfg(feature = "geom2d")]
 pub mod planar;
 
+pub use helix::{HelixCurve, HelixDirection};
 pub use nurbs::{NurbsCurve3, NurbsSurface3};
 pub use plane::{are_coplanar, coplanarity_tolerance, Plane};
 pub use spline::{clamped_uniform_knots, de_boor, Parameterization};
