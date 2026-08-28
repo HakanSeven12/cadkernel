@@ -24,6 +24,7 @@ pub struct HelixCurve {
 
 impl HelixCurve {
     const SEGMENTS_PER_TURN: f64 = 6.0;
+    const MAX_SEGMENTS: usize = 100_000;
 
     fn frame(&self) -> Option<(Vec3, Vec3, Vec3, Vec3)> {
         let center = Vec3::from(self.base_center);
@@ -45,6 +46,17 @@ impl HelixCurve {
             && self.base_radius > 0.0
             && self.top_radius >= 0.0
             && self.turns > 0.0
+    }
+
+    fn total_angle(&self) -> Option<f64> {
+        let angle = self.turns * std::f64::consts::TAU;
+        angle.is_finite().then_some(angle)
+    }
+
+    fn segment_count(&self) -> Option<usize> {
+        let count = (self.turns * Self::SEGMENTS_PER_TURN).ceil();
+        (count.is_finite() && count >= 1.0 && count <= Self::MAX_SEGMENTS as f64)
+            .then_some(count as usize)
     }
 
     fn point_and_derivative(
@@ -74,20 +86,18 @@ impl HelixCurve {
         (point, derivative)
     }
 
-    /// Builds a smooth cubic NURBS representation of this helix.
-    ///
-    /// Each turn is split into six cubic spans. The spans use the analytic
-    /// position and tangent of the helix, so adjacent spans meet smoothly and
-    /// the resulting curve stays parametric instead of becoming a polyline.
+    /// Builds a smooth cubic NURBS approximation from analytic tangents.
     pub fn nurbs(&self) -> Option<NurbsCurve3> {
         if !self.is_valid() {
             return None;
         }
         let frame = self.frame()?;
-        let total_angle = self.turns * std::f64::consts::TAU;
-        let segments = (self.turns * Self::SEGMENTS_PER_TURN).ceil().max(1.0) as usize;
+        let total_angle = self.total_angle()?;
+        let segments = self.segment_count()?;
         let angle_step = total_angle / segments as f64;
-        let mut controls = Vec::with_capacity(segments * 3 + 1);
+        let control_count = segments.checked_mul(3)?.checked_add(1)?;
+        let mut controls = Vec::new();
+        controls.try_reserve_exact(control_count).ok()?;
 
         for segment in 0..segments {
             let from = segment as f64 * angle_step;
@@ -108,7 +118,8 @@ impl HelixCurve {
             knots.extend(std::iter::repeat_n(span as f64, 3));
         }
         knots.extend(std::iter::repeat_n(segments as f64, 4));
-        NurbsCurve3::new_strict(3, controls.clone(), knots, vec![1.0; controls.len()])
+        let weights = vec![1.0; controls.len()];
+        NurbsCurve3::new_strict(3, controls, knots, weights)
     }
 
     /// Exact length of the mathematical circular or conical helix.
@@ -116,12 +127,27 @@ impl HelixCurve {
         if !self.is_valid() || self.frame().is_none() {
             return None;
         }
-        let total_angle = self.turns * std::f64::consts::TAU;
-        let radial_rate = (self.top_radius - self.base_radius) / total_angle;
+        let total_angle = self.total_angle()?;
+        let radius_delta = self.top_radius - self.base_radius;
+        let radial_rate = radius_delta / total_angle;
         let height_rate = self.height / total_angle;
         let constant = radial_rate.hypot(height_rate);
-        if radial_rate.abs() <= 1.0e-15 {
-            return Some(total_angle * self.base_radius.hypot(constant));
+        if radius_delta == 0.0 {
+            let length = total_angle * self.base_radius.hypot(constant);
+            return length.is_finite().then_some(length);
+        }
+        let radius_scale = self
+            .base_radius
+            .max(self.top_radius)
+            .max(constant)
+            .max(1.0);
+        if radius_delta.abs() <= f64::EPSILON.sqrt() * radius_scale {
+            let midpoint = 0.5 * (self.base_radius + self.top_radius);
+            let norm = midpoint.hypot(constant);
+            let correction = constant * constant * radius_delta * radius_delta
+                / (24.0 * norm * norm * norm);
+            let length = total_angle * (norm + correction);
+            return length.is_finite().then_some(length);
         }
         let primitive = |radius: f64| {
             if constant <= 1.0e-15 {
@@ -132,12 +158,14 @@ impl HelixCurve {
                         + constant * constant * (radius / constant).asinh())
             }
         };
-        Some(((primitive(self.top_radius) - primitive(self.base_radius)) / radial_rate).abs())
+        let length =
+            ((primitive(self.top_radius) - primitive(self.base_radius)) / radial_rate).abs();
+        length.is_finite().then_some(length)
     }
 
     /// Taper angle between the helix envelope and its axis.
     pub fn turn_slope(&self) -> Option<f64> {
-        self.is_valid()
+        (self.is_valid() && self.frame().is_some())
             .then(|| (self.top_radius - self.base_radius).atan2(self.height.abs()))
     }
 }
