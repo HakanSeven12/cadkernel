@@ -47,6 +47,55 @@ pub fn bezier_points(control: &[[f64; 3]], segments: usize) -> Vec<[f64; 3]> {
         .collect()
 }
 
+/// Whether two non-degenerate 3D segments share a collinear stretch.
+pub fn segments_overlap_collinearly(
+    first_start: [f64; 3],
+    first_end: [f64; 3],
+    second_start: [f64; 3],
+    second_end: [f64; 3],
+    linear_tolerance: f64,
+) -> bool {
+    if !linear_tolerance.is_finite() || linear_tolerance <= 0.0 {
+        return false;
+    }
+    let first_start = Vec3::from(first_start);
+    let first_end = Vec3::from(first_end);
+    let second_start = Vec3::from(second_start);
+    let second_end = Vec3::from(second_end);
+    if ![first_start, first_end, second_start, second_end]
+        .into_iter()
+        .all(Vec3::is_finite)
+    {
+        return false;
+    }
+
+    let first = first_end - first_start;
+    let second = second_end - second_start;
+    let first_length = first.length();
+    let second_length = second.length();
+    if first_length <= linear_tolerance || second_length <= linear_tolerance {
+        return false;
+    }
+
+    let coordinate_scale = [first_start, first_end, second_start, second_end]
+        .into_iter()
+        .fold(1.0_f64, |scale, point| {
+            scale.max(point.x.abs()).max(point.y.abs()).max(point.z.abs())
+        });
+    let tolerance = linear_tolerance.max(coordinate_scale * f64::EPSILON * 32.0);
+    if first.cross(second).length() > 1.0e-12 * first_length * second_length {
+        return false;
+    }
+    if (second_start - first_start).cross(first).length() > tolerance * first_length {
+        return false;
+    }
+
+    let direction = first / first_length;
+    let second_a = (second_start - first_start).dot(direction);
+    let second_b = (second_end - first_start).dot(direction);
+    second_a.max(second_b).min(first_length) - second_a.min(second_b).max(0.0) > tolerance
+}
+
 /// The curvature vector at `point` of the circle through the three points.
 ///
 /// Points from `point` towards that circle's centre with magnitude `1/r`,

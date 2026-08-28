@@ -97,6 +97,22 @@ impl Vec3 {
         (other - self).length_squared()
     }
 
+    /// Whether every component is finite.
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+
+    /// Distance from this point to a segment.
+    pub fn distance_to_segment(self, start: Self, end: Self) -> f64 {
+        let along = end - start;
+        let squared = along.length_squared();
+        if squared < 1e-24 {
+            return self.distance(start);
+        }
+        let parameter = ((self - start).dot(along) / squared).clamp(0.0, 1.0);
+        self.distance(start + along * parameter)
+    }
+
     /// A unit vector in the same direction.
     ///
     /// `None` when there is no direction to speak of. Returning a zero vector
