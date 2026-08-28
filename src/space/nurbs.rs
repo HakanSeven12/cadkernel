@@ -460,6 +460,60 @@ impl NurbsSurface3 {
         })
     }
 
+    /// Builds a polynomial surface from an open or periodic control net.
+    pub fn from_control_net(
+        u_degree: usize,
+        v_degree: usize,
+        mut control_points: Vec<Vec<[f64; 3]>>,
+        u_periodic: bool,
+        v_periodic: bool,
+    ) -> Option<Self> {
+        let rows = control_points.len();
+        let columns = control_points.first()?.len();
+        if u_degree == 0
+            || v_degree == 0
+            || rows <= u_degree
+            || columns <= v_degree
+            || control_points.iter().any(|row| row.len() != columns)
+            || !control_points
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|value| value.is_finite())
+        {
+            return None;
+        }
+
+        if v_periodic {
+            for row in &mut control_points {
+                row.extend_from_within(..v_degree);
+            }
+        }
+        if u_periodic {
+            control_points.extend_from_within(..u_degree);
+        }
+        let rows = control_points.len();
+        let columns = control_points[0].len();
+        let knots = |degree: usize, count: usize, periodic: bool| {
+            if periodic {
+                (0..count + degree + 1).map(|index| index as f64).collect()
+            } else {
+                clamped_uniform_knots(degree, count)
+            }
+        };
+        let mut surface = Self::new_strict(
+            u_degree,
+            v_degree,
+            control_points,
+            knots(u_degree, rows, u_periodic),
+            knots(v_degree, columns, v_periodic),
+            vec![vec![1.0; columns]; rows],
+        )?;
+        surface.u_closed = u_periodic;
+        surface.v_closed = v_periodic;
+        Some(surface)
+    }
+
     /// Builds a surface only when every supplied value is valid.
     pub fn new_strict(
         u_degree: usize,
