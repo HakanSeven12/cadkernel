@@ -618,6 +618,73 @@ impl NurbsSurface3 {
         &self.weights
     }
 
+    /// The exact surface curve at a fixed `u` (`axis = 0`) or `v` (`axis = 1`).
+    pub fn isocurve(&self, axis: usize, parameter: f64) -> Option<NurbsCurve3> {
+        let ((u0, u1), (v0, v1)) = self.domain();
+        let (degree, mut knots, mut points, mut weights, periodic) = match axis {
+            0 => {
+                let u = wrap_parameter(parameter, u0, u1, self.u_closed);
+                let mut points = Vec::with_capacity(self.control_points[0].len());
+                let mut weights = Vec::with_capacity(self.control_points[0].len());
+                for column in 0..self.control_points[0].len() {
+                    let value = de_boor_by(
+                        self.u_degree,
+                        &self.u_knots,
+                        self.control_points.len(),
+                        u,
+                        |row| self.homogeneous_control(row, column),
+                    );
+                    let weight = value[3];
+                    points.push([value[0] / weight, value[1] / weight, value[2] / weight]);
+                    weights.push(weight);
+                }
+                (
+                    self.v_degree,
+                    self.v_knots.clone(),
+                    points,
+                    weights,
+                    self.v_closed,
+                )
+            }
+            1 => {
+                let v = wrap_parameter(parameter, v0, v1, self.v_closed);
+                let v = if self.v_reversed { v0 + v1 - v } else { v };
+                let mut points = Vec::with_capacity(self.control_points.len());
+                let mut weights = Vec::with_capacity(self.control_points.len());
+                for row in 0..self.control_points.len() {
+                    let value = de_boor_by(
+                        self.v_degree,
+                        &self.v_knots,
+                        self.control_points[row].len(),
+                        v,
+                        |column| self.homogeneous_control(row, column),
+                    );
+                    let weight = value[3];
+                    points.push([value[0] / weight, value[1] / weight, value[2] / weight]);
+                    weights.push(weight);
+                }
+                (
+                    self.u_degree,
+                    self.u_knots.clone(),
+                    points,
+                    weights,
+                    self.u_closed,
+                )
+            }
+            _ => return None,
+        };
+        if axis == 0 && self.v_reversed {
+            points.reverse();
+            weights.reverse();
+            let sum = knots.get(degree)? + knots.get(points.len())?;
+            knots = knots.into_iter().rev().map(|knot| sum - knot).collect();
+        }
+        Some(
+            NurbsCurve3::new_strict(degree, points, knots, weights)?
+                .with_periodicity(periodic),
+        )
+    }
+
     fn homogeneous_control(&self, row: usize, column: usize) -> [f64; 4] {
         let point = self.control_points[row][column];
         let weight = self.weights[row][column];

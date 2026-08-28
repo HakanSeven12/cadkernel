@@ -202,6 +202,34 @@ impl Curve {
         matches!(self, Self::Line(_) | Self::Ray(_) | Self::XLine(_))
     }
 
+    pub(crate) fn rectangle_side(&self, bounds: [[f64; 2]; 2]) -> Option<usize> {
+        let endpoints = [self.point_at(0.0), self.point_at(1.0)];
+        for fixed in 0..2 {
+            let varying = 1 - fixed;
+            for side in 0..2 {
+                let fixed_value = bounds[fixed][side];
+                let on_side = match self {
+                    Self::Line(line) => [line.start, line.end]
+                        .iter()
+                        .all(|point| parameter_near(point[fixed], fixed_value)),
+                    Self::Nurbs(curve) => curve.control_points().iter().all(|point| {
+                        parameter_near(point[fixed], fixed_value)
+                            && parameter_within(point[varying], bounds[varying])
+                    }),
+                    _ => return None,
+                };
+                let covers = (parameter_near(endpoints[0][varying], bounds[varying][0])
+                    && parameter_near(endpoints[1][varying], bounds[varying][1]))
+                    || (parameter_near(endpoints[1][varying], bounds[varying][0])
+                        && parameter_near(endpoints[0][varying], bounds[varying][1]));
+                if on_side && covers {
+                    return Some(fixed * 2 + side);
+                }
+            }
+        }
+        None
+    }
+
     /// A point on the curve and the vector its parameter advances by, for the
     /// straight kinds.
     pub fn as_ray(&self) -> Option<([f64; 2], [f64; 2])> {
@@ -378,6 +406,20 @@ impl Curve {
         };
         self.tessellate_angle(max_angle)
     }
+}
+
+fn parameter_near(a: f64, b: f64) -> bool {
+    (a - b).abs() <= f64::EPSILON * 128.0 * a.abs().max(b.abs()).max(1.0)
+}
+
+fn parameter_within(value: f64, bounds: [f64; 2]) -> bool {
+    let scale = value
+        .abs()
+        .max(bounds[0].abs())
+        .max(bounds[1].abs())
+        .max(1.0);
+    value >= bounds[0] - f64::EPSILON * 128.0 * scale
+        && value <= bounds[1] + f64::EPSILON * 128.0 * scale
 }
 
 /// Segments in a polyline: one per vertex when closed, one fewer when open.

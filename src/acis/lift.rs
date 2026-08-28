@@ -4,8 +4,8 @@
 //! [`Loss`].
 
 use cadcodec::entities::acis::types::{
-    SatBody, SatConeSurface, SatDocument, SatEdge, SatEllipseCurve, SatFace, SatIntCurve, SatLoop,
-    SatLump, SatPCurve, SatPlaneSurface, SatPoint, SatPointer, SatRecord, SatShell,
+    SatBody, SatCoedge, SatConeSurface, SatDocument, SatEdge, SatEllipseCurve, SatFace, SatIntCurve,
+    SatLoop, SatLump, SatPCurve, SatPlaneSurface, SatPoint, SatPointer, SatRecord, SatShell,
     SatSphereSurface, SatSplineSurface, SatStraightCurve, SatTorusSurface, SatVertex, Sense,
 };
 use crate::brep::{
@@ -180,13 +180,20 @@ fn lift_face(
             let Some(record) = resolve(document, pointer) else {
                 break;
             };
-            let Some(source_coedge) =
-                cadcodec::entities::acis::types::SatCoedge::from_record(record)
-            else {
+            let Some(source_coedge) = SatCoedge::from_record(record) else {
                 note_broken(loss, record);
                 break;
             };
-            if let Some(edge) = edge_of(document, body, seen, loss, source_coedge.edge()) {
+            let pcurve = read_pcurve(document, source_coedge.pcurve(), reversed_v);
+            if let Some(edge) = edge_of(
+                document,
+                body,
+                seen,
+                loss,
+                &source_coedge,
+                surface,
+                pcurve.as_ref(),
+            ) {
                 let edge_forward = resolve(document, source_coedge.edge())
                     .and_then(SatEdge::from_record)
                     .is_some_and(|source_edge| {
@@ -209,7 +216,7 @@ fn lift_face(
                 let coedge = body.coedges.insert(Coedge {
                     edge,
                     forward,
-                    pcurve: read_pcurve(document, source_coedge.pcurve(), reversed_v),
+                    pcurve,
                     owner: ring,
                     provenance: clean(record),
                 });
@@ -238,8 +245,11 @@ fn edge_of(
     body: &mut Body,
     seen: &mut Seen,
     loss: &mut Loss,
-    pointer: SatPointer,
+    source_coedge: &SatCoedge<'_>,
+    surface: SurfaceKey,
+    pcurve: Option<&Curve2>,
 ) -> Option<EdgeKey> {
+    let pointer = source_coedge.edge();
     let record = resolve(document, pointer)?;
     let index = index_of(record)?;
     if let Some(key) = seen.edges.get(&index) {
@@ -249,7 +259,10 @@ fn edge_of(
         note_broken(loss, record);
         None
     })?;
-    let curve = curve_of(document, body, seen, loss, source.curve())?;
+    let fallback = pcurve
+        .and_then(|pcurve| surface_curve(body.surfaces.get(surface)?, pcurve))
+        .or_else(|| partner_surface_curve(document, source_coedge));
+    let curve = curve_of(document, body, seen, loss, source.curve(), fallback)?;
     let source_start = vertex_of(document, body, seen, loss, source.start_vertex())?;
     let source_end = vertex_of(document, body, seen, loss, source.end_vertex())?;
     let edge_forward = source.sense() == Sense::Forward;
@@ -353,13 +366,14 @@ fn curve_of(
     seen: &mut Seen,
     loss: &mut Loss,
     pointer: SatPointer,
+    fallback: Option<Curve3>,
 ) -> Option<CurveKey> {
     let record = resolve(document, pointer)?;
     let index = index_of(record)?;
     if let Some(key) = seen.curves.get(&index) {
         return Some(*key);
     }
-    let curve = read_curve(document, record).or_else(|| {
+    let curve = read_curve(document, record).or(fallback).or_else(|| {
         // Not a kind the kernel has; the edge still exists and its record is
         // carried through, but nothing here can evaluate it.
         loss.curves.push(index as usize);
@@ -368,6 +382,33 @@ fn curve_of(
     let key = body.curves.insert(curve);
     seen.curves.insert(index, key);
     Some(key)
+}
+
+fn surface_curve(surface: &Surface, pcurve: &Curve2) -> Option<Curve3> {
+    let Surface::Nurbs(surface) = surface else {
+        return None;
+    };
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let domain = [[u0, u1], [v0, v1]];
+    let side = pcurve.rectangle_side(domain)?;
+    let fixed = side / 2;
+    Some(Curve3::Nurbs(
+        surface.isocurve(fixed, domain[fixed][side % 2])?,
+    ))
+}
+
+fn partner_surface_curve(
+    document: &SatDocument,
+    source: &SatCoedge<'_>,
+) -> Option<Curve3> {
+    let partner = SatCoedge::from_record(resolve(document, source.partner())?)?;
+    let owner_loop = SatLoop::from_record(resolve(document, partner.owner_loop())?)?;
+    let face = SatFace::from_record(resolve(document, owner_loop.face())?)?;
+    let surface_record = resolve(document, face.surface())?;
+    let reversed_v = analytic_surface_reversed(surface_record);
+    let surface = read_surface(document, surface_record)?;
+    let pcurve = read_pcurve(document, partner.pcurve(), reversed_v)?;
+    surface_curve(&surface, &pcurve)
 }
 
 fn read_curve(document: &SatDocument, record: &SatRecord) -> Option<Curve3> {

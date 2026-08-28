@@ -2747,6 +2747,40 @@ fn whole_surface_domain(
     surface: &super::geometry::Surface,
 ) -> Option<[[f64; 2]; 2]> {
     let node = body.faces.get(face)?;
+    let domain = surface_domain(surface)?;
+    let valid_domain = domain
+        .iter()
+        .all(|span| span[0].is_finite() && span[1].is_finite() && span[1] > span[0]);
+    if !valid_domain {
+        return None;
+    }
+    let bounded_domain = matches!(surface, super::geometry::Surface::Nurbs(_))
+        && node.loops.as_slice().first().is_some_and(|loop_key| {
+            let Some(ring) = body.loops.get(*loop_key) else {
+                return false;
+            };
+            if node.loops.len() != 1 || ring.coedges.len() != 4 {
+                return false;
+            }
+            let mut sides = [0_u8; 4];
+            for coedge_key in &ring.coedges {
+                let Some(curve) = body
+                    .coedges
+                    .get(*coedge_key)
+                    .and_then(|coedge| coedge.pcurve.as_ref())
+                else {
+                    return false;
+                };
+                let Some(side) = curve.rectangle_side(domain) else {
+                    return false;
+                };
+                sides[side] += 1;
+            }
+            sides == [1; 4]
+        });
+    if bounded_domain {
+        return Some(domain);
+    }
     let seam_loop = matches!(
         surface,
         super::geometry::Surface::Sphere(_) | super::geometry::Surface::Torus(_)
@@ -2780,11 +2814,7 @@ fn whole_surface_domain(
     if !closed {
         return None;
     }
-    let domain = surface_domain(surface)?;
-    domain
-        .iter()
-        .all(|span| span[0].is_finite() && span[1].is_finite() && span[1] > span[0])
-        .then_some(domain)
+    Some(domain)
 }
 
 fn domain_ring(domain: [[f64; 2]; 2]) -> Vec<[f64; 2]> {
