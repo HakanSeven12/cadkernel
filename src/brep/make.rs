@@ -14,6 +14,7 @@ use super::geometry::{Circle3, Cone, Curve3, Cylinder, Line3, Sphere, Surface, T
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, Loop, Lump, Shell, Vertex, VertexKey,
 };
+use crate::geom2d::{Curve as Curve2, Ellipse, EllipseArc};
 use std::f64::consts::{FRAC_PI_2, TAU};
 use super::Provenance;
 use crate::space::{Plane, Vec3};
@@ -366,6 +367,51 @@ pub fn sphere(centre: [f64; 3], radius: f64) -> Option<Body> {
     // face wraps the whole way round in between.
     close_shell(&mut body, lump, shell, surface, true, &[(seam, true), (seam, false)])?;
     body.validate().is_empty().then_some(body)
+}
+
+/// A circular or elliptical cylinder standing on `base`.
+///
+/// The two radii are the semi-axes of both planar end faces. Circular input
+/// keeps the analytic cylinder representation; elliptical input is an exact
+/// rational loft between equal ellipse profiles.
+pub fn elliptical_cylinder(
+    base: [f64; 3],
+    x_radius: f64,
+    y_radius: f64,
+    height: f64,
+) -> Option<Body> {
+    if [x_radius, y_radius, height]
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return None;
+    }
+    let scale = x_radius.abs().max(y_radius.abs()).max(height.abs()).max(1.0);
+    if (x_radius - y_radius).abs() <= 1e-12 * scale {
+        return cylinder(base, x_radius, height);
+    }
+
+    let bottom = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
+    let top_origin = (Vec3::from(base) + Vec3::Z * height).to_array();
+    let top = Plane::orthonormal(top_origin, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
+    let profile = || {
+        (0..4)
+            .map(|index| {
+                let start = index as f64 * FRAC_PI_2;
+                Curve2::Ellipse(EllipseArc {
+                    ellipse: Ellipse {
+                        centre: [0.0, 0.0],
+                        major_radius: x_radius,
+                        minor_radius: y_radius,
+                        major_axis: [1.0, 0.0],
+                    },
+                    start_parameter: start,
+                    end_parameter: start + FRAC_PI_2,
+                })
+            })
+            .collect()
+    };
+    super::loft::loft(&[(bottom, profile()), (top, profile())])
 }
 
 /// A cone standing on `base`, `height` tall, with a base circle of `radius`
