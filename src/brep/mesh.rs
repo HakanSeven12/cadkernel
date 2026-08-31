@@ -25,7 +25,7 @@
 use super::topology::{Body, EdgeKey, FaceKey};
 use crate::geom2d::{constrained::ConstrainedMesh, triangulate};
 use crate::space::Vec3;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, TAU};
 
 type ParameterMap<T> = rustc_hash::FxHashMap<[u64; 2], T>;
@@ -114,6 +114,7 @@ pub struct BodyMesh {
     pub isolines: Vec<FacePolyline>,
     pub precision: f64,
     pub missing_faces: Vec<FaceKey>,
+    analytic_cones: Vec<AnalyticConeFace>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,7 +133,25 @@ pub struct SurfaceMesh {
 pub struct SilhouetteSource {
     sides: Vec<SilhouetteSide>,
     triangles: Vec<SilhouetteTriangle>,
+    cones: Vec<ConeSilhouette>,
     precision: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AnalyticConeFace {
+    face: FaceKey,
+    cone: ConeSilhouette,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ConeSilhouette {
+    origin: [f64; 3],
+    x_axis: [f64; 3],
+    y_axis: [f64; 3],
+    axis: [f64; 3],
+    radius: f64,
+    slope: f64,
+    v_range: [f64; 2],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,24 +170,46 @@ impl BodyMesh {
     pub fn silhouette_source(&self) -> SilhouetteSource {
         let mut groups = HashMap::new();
         let mut next = 0_u64;
+        let cone_faces: HashSet<_> = self.analytic_cones.iter().map(|cone| cone.face).collect();
+        let mut excluded_groups = HashSet::new();
         let triangle_groups = self
             .triangle_faces
             .iter()
             .map(|face| {
-                *groups.entry(*face).or_insert_with(|| {
+                let group = *groups.entry(*face).or_insert_with(|| {
                     let group = next;
                     next += 1;
                     group
-                })
+                });
+                if cone_faces.contains(face) {
+                    excluded_groups.insert(group);
+                }
+                group
             })
             .collect::<Vec<_>>();
-        silhouette_source(&self.mesh, &triangle_groups, self.precision)
+        let mut source = silhouette_source(
+            &self.mesh,
+            &triangle_groups,
+            &excluded_groups,
+            self.precision,
+        );
+        source.cones = self
+            .analytic_cones
+            .iter()
+            .map(|cone| cone.cone.clone())
+            .collect();
+        source
     }
 }
 
 impl SurfaceMesh {
     pub fn silhouette_source(&self, precision: f64) -> SilhouetteSource {
-        silhouette_source(&self.mesh, &vec![0; self.mesh.triangles.len()], precision)
+        silhouette_source(
+            &self.mesh,
+            &vec![0; self.mesh.triangles.len()],
+            &HashSet::new(),
+            precision,
+        )
     }
 }
 
@@ -219,10 +260,49 @@ pub fn silhouette(source: &SilhouetteSource, view_direction: [f64; 3]) -> Vec<[f
             out.extend([*a, *b]);
         }
     }
+    for cone in &source.cones {
+        append_cone_silhouette(&mut out, cone, contour_view);
+    }
     out
 }
 
-fn silhouette_source(mesh: &Mesh, triangle_groups: &[u64], precision: f64) -> SilhouetteSource {
+fn append_cone_silhouette(out: &mut Vec<[f64; 3]>, cone: &ConeSilhouette, view: Vec3) {
+    let x_axis = Vec3::from(cone.x_axis);
+    let y_axis = Vec3::from(cone.y_axis);
+    let axis = Vec3::from(cone.axis);
+    let sin_coefficient = -x_axis.cross(axis).dot(view);
+    let cos_coefficient = y_axis.cross(axis).dot(view);
+    let constant = (x_axis.cross(y_axis) * cone.slope).dot(view);
+    let amplitude = sin_coefficient.hypot(cos_coefficient);
+    let tolerance = amplitude.max(constant.abs()).max(1.0) * 1e-12;
+    if !amplitude.is_finite()
+        || amplitude <= tolerance
+        || constant.abs() > amplitude + tolerance
+    {
+        return;
+    }
+    let phase = sin_coefficient.atan2(cos_coefficient);
+    let offset = (-constant / amplitude).clamp(-1.0, 1.0).acos();
+    let count = if offset.abs() <= tolerance { 1 } else { 2 };
+    for parameter in [phase - offset, phase + offset].into_iter().take(count) {
+        let point_at = |v: f64| {
+            let radial = cone.radius - cone.slope * v;
+            (Vec3::from(cone.origin)
+                + x_axis * (radial * parameter.cos())
+                + y_axis * (radial * parameter.sin())
+                + axis * v)
+                .to_array()
+        };
+        out.extend(cone.v_range.map(point_at));
+    }
+}
+
+fn silhouette_source(
+    mesh: &Mesh,
+    triangle_groups: &[u64],
+    excluded_groups: &HashSet<u64>,
+    precision: f64,
+) -> SilhouetteSource {
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     struct Point([i64; 3]);
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -243,6 +323,9 @@ fn silhouette_source(mesh: &Mesh, triangle_groups: &[u64], precision: f64) -> Si
         let Some(group) = triangle_groups.get(index).copied() else {
             continue;
         };
+        if excluded_groups.contains(&group) {
+            continue;
+        }
         let positions = triangle.map(|vertex| mesh.positions[vertex]);
         let Some(normal) = (Vec3::from(positions[1]) - Vec3::from(positions[0]))
             .cross(Vec3::from(positions[2]) - Vec3::from(positions[0]))
@@ -286,6 +369,7 @@ fn silhouette_source(mesh: &Mesh, triangle_groups: &[u64], precision: f64) -> Si
     SilhouetteSource {
         sides,
         triangles,
+        cones: Vec::new(),
         precision,
     }
 }
@@ -369,6 +453,19 @@ pub fn transform_silhouette_affine(
                 + normal_vectors[1] * normal[1]
                 + normal_vectors[2] * normal[2];
             *normal = moved.normalize()?.to_array();
+        }
+    }
+    for cone in &mut out.cones {
+        let moved_origin = Vec3::from(origin)
+            + vectors[0] * cone.origin[0]
+            + vectors[1] * cone.origin[1]
+            + vectors[2] * cone.origin[2];
+        cone.origin = moved_origin.to_array();
+        for vector in [&mut cone.x_axis, &mut cone.y_axis, &mut cone.axis] {
+            *vector = (vectors[0] * vector[0]
+                + vectors[1] * vector[1]
+                + vectors[2] * vector[2])
+                .to_array();
         }
     }
     out.precision *= stretch;
@@ -604,6 +701,9 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
             &schedules,
         ) {
             Some(mesh) => {
+                if let Some(cone) = analytic_cone_face(body, face_key, &mesh) {
+                    out.analytic_cones.push(cone);
+                }
                 out.triangle_faces
                     .extend(std::iter::repeat(face_key).take(mesh.triangles.len()));
                 out.mesh.absorb(mesh);
@@ -625,6 +725,9 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
         }
     }
     for edge_key in body.edge_keys() {
+        if topological_parameter_seam(body, edge_key) {
+            continue;
+        }
         if let Some(schedule) = schedules.get(&edge_key) {
             if schedule.len() >= 2 {
                 out.edges.push(EdgeMesh {
@@ -638,6 +741,69 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
     out.missing_faces.dedup();
     out.precision = silhouette_precision(&out.mesh);
     out
+}
+
+fn topological_parameter_seam(body: &Body, edge: EdgeKey) -> bool {
+    let Some(edge) = body.edges.get(edge) else {
+        return false;
+    };
+    edge.coedges.iter().enumerate().any(|(index, first)| {
+        let Some(first) = body.coedges.get(*first) else {
+            return false;
+        };
+        edge.coedges.iter().skip(index + 1).any(|second| {
+            body.coedges.get(*second).is_some_and(|second| {
+                first.owner == second.owner && first.forward != second.forward
+            })
+        })
+    })
+}
+
+fn analytic_cone_face(body: &Body, face: FaceKey, mesh: &Mesh) -> Option<AnalyticConeFace> {
+    let node = body.faces.get(face)?;
+    let super::geometry::Surface::Cone(surface) = body.surfaces.get(node.surface)? else {
+        return None;
+    };
+    let full_revolution = node.loops.iter().any(|ring| {
+        let Some(ring) = body.loops.get(*ring) else {
+            return false;
+        };
+        ring.coedges.iter().enumerate().any(|(index, first)| {
+            let Some(first) = body.coedges.get(*first) else {
+                return false;
+            };
+            ring.coedges.iter().skip(index + 1).any(|second| {
+                body.coedges.get(*second).is_some_and(|second| {
+                    first.edge == second.edge && first.forward != second.forward
+                })
+            })
+        })
+    });
+    if !full_revolution {
+        return None;
+    }
+    let geometry = super::geometry::Surface::Cone(*surface);
+    let mut v_range = [f64::INFINITY, f64::NEG_INFINITY];
+    for point in &mesh.positions {
+        let (_, v) = geometry.parameters_at(*point)?;
+        v_range[0] = v_range[0].min(v);
+        v_range[1] = v_range[1].max(v);
+    }
+    if !v_range.iter().all(|value| value.is_finite()) || v_range[1] <= v_range[0] {
+        return None;
+    }
+    Some(AnalyticConeFace {
+        face,
+        cone: ConeSilhouette {
+            origin: surface.base.origin,
+            x_axis: surface.base.x_axis,
+            y_axis: surface.base.y_axis,
+            axis: surface.base.normal()?,
+            radius: surface.radius,
+            slope: surface.half_angle.tan(),
+            v_range,
+        },
+    })
 }
 
 fn face_isolines(
