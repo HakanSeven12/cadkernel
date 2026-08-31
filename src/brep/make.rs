@@ -15,7 +15,6 @@ use super::nurbs_builder::RationalCurve2;
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, Loop, Lump, Shell, Vertex, VertexKey,
 };
-use crate::geom2d::{Curve as Curve2, Ellipse, EllipseArc};
 use std::f64::consts::{FRAC_PI_2, TAU};
 use super::Provenance;
 use crate::geom2d::{Curve as Curve2, Ellipse, EllipseArc, Line as Line2};
