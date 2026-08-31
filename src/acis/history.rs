@@ -92,13 +92,19 @@ pub fn rebuild_body(
             value.base.transform,
         ),
         SolidHistoryOperation::Cylinder(value) => {
-            let radius = circular_radius(
-                value.major_radius,
-                value.minor_radius,
-                value.x_radius,
-            )?;
+            if [value.major_radius, value.minor_radius, value.x_radius]
+                .iter()
+                .any(|radius| !radius.is_finite() || *radius <= 0.0)
+            {
+                return Err(HistoryRebuildError::InvalidParameters);
+            }
             finish(
-                brep::make::cylinder([0.0; 3], radius, value.height),
+                brep::make::elliptical_cylinder(
+                    [0.0; 3],
+                    value.major_radius,
+                    value.minor_radius,
+                    value.height,
+                ),
                 value.base.transform,
             )
         }
