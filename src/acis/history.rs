@@ -103,13 +103,14 @@ pub fn rebuild_body(
             )
         }
         SolidHistoryOperation::Cone(value) => {
-            let radius = circular_radius(
-                value.major_radius,
-                value.minor_radius,
-                value.x_radius,
-            )?;
             finish(
-                brep::make::cone([0.0; 3], radius, value.height),
+                brep::make::frustum(
+                    [0.0; 3],
+                    value.base_x_radius,
+                    value.base_y_radius,
+                    value.top_radius,
+                    value.height,
+                ),
                 value.base.transform,
             )
         }

@@ -10,12 +10,14 @@
 //! inconsistent body is a builder that will.
 
 use super::arena::Key;
-use super::geometry::{Circle3, Cone, Curve3, Cylinder, Line3, Sphere, Surface, Torus};
+use super::geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
+use super::nurbs_builder::RationalCurve2;
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, Loop, Lump, Shell, Vertex, VertexKey,
 };
 use std::f64::consts::{FRAC_PI_2, TAU};
 use super::Provenance;
+use crate::geom2d::{Curve as Curve2, Ellipse, EllipseArc, Line as Line2};
 use crate::space::{Plane, Vec3};
 
 /// A rectangular box with one corner at `origin` and the opposite at
@@ -426,6 +428,153 @@ pub fn cone(base: [f64; 3], radius: f64, height: f64) -> Option<Body> {
     body.validate().is_empty().then_some(body)
 }
 
+/// A circular or elliptical cone/frustum standing on `base`.
+///
+/// `base_x_radius` and `base_y_radius` are the base semi-axes. `top_radius`
+/// is the top X semi-axis; its Y semi-axis keeps the base aspect ratio. A
+/// zero top radius produces a pointed cone. Circular pointed cones retain
+/// the analytic cone representation, while elliptical and truncated forms
+/// use exact rational ruled surfaces.
+pub fn frustum(
+    base: [f64; 3],
+    base_x_radius: f64,
+    base_y_radius: f64,
+    top_radius: f64,
+    height: f64,
+) -> Option<Body> {
+    if [base_x_radius, base_y_radius, height]
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+        || !top_radius.is_finite()
+        || top_radius < 0.0
+    {
+        return None;
+    }
+    let scale = base_x_radius
+        .abs()
+        .max(base_y_radius.abs())
+        .max(top_radius.abs())
+        .max(height.abs())
+        .max(1.0);
+    let circular = (base_x_radius - base_y_radius).abs() <= 1e-12 * scale;
+    if top_radius <= 1e-12 * scale {
+        return if circular {
+            cone(base, base_x_radius, height)
+        } else {
+            elliptical_cone(base, base_x_radius, base_y_radius, height)
+        };
+    }
+
+    let base_plane = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
+    let top_origin = (Vec3::from(base) + Vec3::Z * height).to_array();
+    let top_plane = Plane::orthonormal(top_origin, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
+    let top_y_radius = top_radius * base_y_radius / base_x_radius;
+    super::loft::loft(&[
+        (base_plane, ellipse_profile(base_x_radius, base_y_radius)),
+        (top_plane, ellipse_profile(top_radius, top_y_radius)),
+    ])
+}
+
+fn ellipse_profile(x_radius: f64, y_radius: f64) -> Vec<Curve2> {
+    (0..4)
+        .map(|index| {
+            let start = index as f64 * FRAC_PI_2;
+            Curve2::Ellipse(EllipseArc {
+                ellipse: Ellipse {
+                    centre: [0.0, 0.0],
+                    major_radius: x_radius,
+                    minor_radius: y_radius,
+                    major_axis: [1.0, 0.0],
+                },
+                start_parameter: start,
+                end_parameter: start + FRAC_PI_2,
+            })
+        })
+        .collect()
+}
+
+fn elliptical_cone(
+    base: [f64; 3],
+    x_radius: f64,
+    y_radius: f64,
+    height: f64,
+) -> Option<Body> {
+    let base_plane = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
+    let apex_point = (Vec3::from(base) + Vec3::Z * height).to_array();
+    let rim_point = base_plane.point_at([x_radius, 0.0]);
+    let mut body = Body::new();
+    let rim_vertex = add_vertex(&mut body, rim_point);
+    let apex = add_vertex(&mut body, apex_point);
+    let rim_curve = body.curves.insert(Curve3::Ellipse(Ellipse3 {
+        plane: base_plane,
+        major_radius: x_radius,
+        minor_radius: y_radius,
+    }));
+    let rim = body.edges.insert(Edge {
+        curve: rim_curve,
+        start_parameter: 0.0,
+        end_parameter: TAU,
+        start: rim_vertex,
+        end: rim_vertex,
+        coedges: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let seam = add_line_edge(&mut body, rim_vertex, apex)?;
+
+    let outline = Curve2::Ellipse(EllipseArc::full(Ellipse {
+        centre: [0.0, 0.0],
+        major_radius: x_radius,
+        minor_radius: y_radius,
+        major_axis: [1.0, 0.0],
+    }));
+    let base_curve = RationalCurve2::from_curve(&outline)?.lifted(&base_plane);
+    let tip_curve = super::nurbs_builder::RationalCurve3 {
+        degree: base_curve.degree,
+        knots: base_curve.knots.clone(),
+        points: vec![apex_point; base_curve.points.len()],
+        weights: base_curve.weights.clone(),
+    };
+    let wall = body
+        .surfaces
+        .insert(Surface::Nurbs(base_curve.ruled_to(&tip_curve)?));
+    let (lump, shell) = add_shell(&mut body);
+    disc(&mut body, shell, base_plane, rim, false)?;
+    close_shell_with_pcurves(
+        &mut body,
+        lump,
+        shell,
+        wall,
+        true,
+        &[
+            (
+                rim,
+                true,
+                Some(Curve2::Line(Line2 {
+                    start: [0.0, 0.0],
+                    end: [1.0, 0.0],
+                })),
+            ),
+            (
+                seam,
+                true,
+                Some(Curve2::Line(Line2 {
+                    start: [1.0, 0.0],
+                    end: [1.0, 1.0],
+                })),
+            ),
+            (
+                seam,
+                false,
+                Some(Curve2::Line(Line2 {
+                    start: [0.0, 1.0],
+                    end: [0.0, 0.0],
+                })),
+            ),
+        ],
+    )?;
+    body.validate().is_empty().then_some(body)
+}
+
 /// A torus about `centre`, its tube `minor_radius` thick at
 /// `major_radius` out.
 ///
@@ -633,6 +782,50 @@ fn close_shell(
             edge: *edge,
             forward: *sense,
             pcurve: None,
+            owner: ring,
+            provenance: Provenance::Synthesized,
+        });
+        body.edges.get_mut(*edge)?.coedges.push(coedge);
+        coedges.push(coedge);
+    }
+    body.loops.get_mut(ring)?.coedges = coedges;
+    body.faces.get_mut(face)?.loops = vec![ring];
+    body.shells.get_mut(shell)?.faces.push(face);
+    if body.lumps.get(lump)?.shells.is_empty() {
+        body.lumps.get_mut(lump)?.shells = vec![shell];
+    }
+    if body.roots.is_empty() {
+        body.roots = vec![lump];
+    }
+    Some(())
+}
+
+fn close_shell_with_pcurves(
+    body: &mut Body,
+    lump: super::topology::LumpKey,
+    shell: super::topology::ShellKey,
+    surface: super::topology::SurfaceKey,
+    forward: bool,
+    edges: &[(EdgeKey, bool, Option<Curve2>)],
+) -> Option<()> {
+    let face = body.faces.insert(Face {
+        surface,
+        forward,
+        loops: Vec::new(),
+        owner: shell,
+        provenance: Provenance::Synthesized,
+    });
+    let ring = body.loops.insert(Loop {
+        coedges: Vec::new(),
+        owner: face,
+        provenance: Provenance::Synthesized,
+    });
+    let mut coedges = Vec::with_capacity(edges.len());
+    for (edge, sense, pcurve) in edges {
+        let coedge = body.coedges.insert(Coedge {
+            edge: *edge,
+            forward: *sense,
+            pcurve: pcurve.clone(),
             owner: ring,
             provenance: Provenance::Synthesized,
         });
