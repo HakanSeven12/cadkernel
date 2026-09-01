@@ -301,7 +301,7 @@ pub fn sweep_along_deformed(
     }
     let senses = path_senses(path)?;
     let path_normal = Vec3::from(path_plane.normal()?).normalize()?;
-    let stations = deformation_stations(&path_plane, path, &senses)?;
+    let stations = deformation_stations(&path_plane, path, &senses, twist_angle)?;
     if stations.len() < 2 || (stations.last()?.point - stations[0].point).length() <= 1e-9 {
         return None;
     }
@@ -358,7 +358,7 @@ pub fn sweep_along_deformed(
             ))
         })
         .collect::<Option<Vec<_>>>()?;
-    super::loft::loft(&sections)
+    super::loft::polygon_loft_ordered(&sections)
 }
 
 struct DeformationStation {
@@ -372,12 +372,17 @@ fn deformation_stations(
     plane: &Plane,
     path: &[Curve2],
     senses: &[bool],
+    twist_angle: f64,
 ) -> Option<Vec<DeformationStation>> {
-    if path.len() != senses.len() || path.is_empty() {
+    if path.len() != senses.len() || path.is_empty() || !twist_angle.is_finite() {
         return None;
     }
     let total_length = path.iter().map(Curve2::length).sum::<f64>();
     if !total_length.is_finite() || total_length <= 1e-12 {
+        return None;
+    }
+    let angle_step = std::f64::consts::PI / 18.0;
+    if (twist_angle.abs() / angle_step).ceil() > 4096.0 {
         return None;
     }
     let first_point = path[0].point_at(if senses[0] { 0.0 } else { 1.0 });
@@ -393,13 +398,17 @@ fn deformation_stations(
         if !piece_length.is_finite() || piece_length <= 1e-12 {
             return None;
         }
-        let subdivisions = match piece {
+        let path_subdivisions = match piece {
             Curve2::Line(_) => 1,
             Curve2::Arc(value) => (value.sweep().abs() / (std::f64::consts::PI / 18.0))
                 .ceil()
                 .max(1.0) as usize,
             _ => return None,
         };
+        let twist_subdivisions = (twist_angle.abs() * piece_length / total_length / angle_step)
+            .ceil()
+            .max(1.0) as usize;
+        let subdivisions = path_subdivisions.max(twist_subdivisions);
         for step in 0..=subdivisions {
             if index > 0 && step == 0 {
                 continue;

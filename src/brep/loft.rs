@@ -16,13 +16,17 @@ pub fn loft(sections: &[(Plane, Vec<Curve>)]) -> Option<Body> {
         .iter()
         .all(|(_, profile)| profile.iter().all(|piece| matches!(piece, Curve::Line(_))))
     {
-        polygon_loft(sections)
+        polygon_loft(sections, true)
     } else {
         curved_loft(sections)
     }
 }
 
-fn polygon_loft(sections: &[(Plane, Vec<Curve>)]) -> Option<Body> {
+pub(crate) fn polygon_loft_ordered(sections: &[(Plane, Vec<Curve>)]) -> Option<Body> {
+    polygon_loft(sections, false)
+}
+
+fn polygon_loft(sections: &[(Plane, Vec<Curve>)], align_rings: bool) -> Option<Body> {
     if sections.len() < 2 {
         return None;
     }
@@ -46,8 +50,10 @@ fn polygon_loft(sections: &[(Plane, Vec<Curve>)]) -> Option<Body> {
     if rings.iter().any(|ring| ring.len() != count) {
         return None;
     }
-    for index in 1..rings.len() {
-        rings[index] = aligned_ring(&rings[index - 1], &rings[index]);
+    if align_rings {
+        for index in 1..rings.len() {
+            rings[index] = aligned_ring(&rings[index - 1], &rings[index]);
+        }
     }
 
     let centres = rings.iter().map(|ring| centre(ring)).collect::<Vec<_>>();
