@@ -15,9 +15,9 @@ use super::nurbs_builder::RationalCurve2;
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, Loop, Lump, Shell, Vertex, VertexKey,
 };
-use std::f64::consts::{FRAC_PI_2, TAU};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use super::Provenance;
-use crate::geom2d::{Curve as Curve2, Ellipse, EllipseArc, Line as Line2};
+use crate::geom2d::{Arc, Curve as Curve2, Ellipse, EllipseArc, Line as Line2};
 use crate::space::{Plane, Vec3};
 
 /// A rectangular box with one corner at `origin` and the opposite at
@@ -628,15 +628,20 @@ fn elliptical_cone(
 /// is zero rather than two, because a torus has a hole through it and no
 /// closed shell of genus one can have any other.
 ///
-/// `None` unless the tube fits: a minor radius at or past the major one
-/// closes the hole and the surface crosses itself.
+/// A tube smaller than the major radius produces the usual ring. At or past
+/// the major radius the self-intersecting half of the generating circle is
+/// trimmed at the axis, producing a closed horn or spindle solid.
 pub fn torus(centre: [f64; 3], major_radius: f64, minor_radius: f64) -> Option<Body> {
-    if major_radius.is_nan()
-        || minor_radius.is_nan()
+    if centre.iter().any(|coordinate| !coordinate.is_finite())
+        || !major_radius.is_finite()
+        || !minor_radius.is_finite()
+        || major_radius <= 0.0
         || minor_radius <= 0.0
-        || major_radius <= minor_radius
     {
         return None;
+    }
+    if major_radius <= minor_radius {
+        return closed_hole_torus(centre, major_radius, minor_radius);
     }
     let mut body = Body::new();
     let frame = Plane::orthonormal(centre, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
@@ -694,6 +699,35 @@ pub fn torus(centre: [f64; 3], major_radius: f64, minor_radius: f64) -> Option<B
         &[(ring, true), (tube, true), (ring, false), (tube, false)],
     )?;
     body.validate().is_empty().then_some(body)
+}
+
+fn closed_hole_torus(
+    centre: [f64; 3],
+    major_radius: f64,
+    minor_radius: f64,
+) -> Option<Body> {
+    let profile_plane = Plane::orthonormal(centre, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0])?;
+    let intersection_angle = (major_radius / minor_radius).clamp(0.0, 1.0).acos();
+    let half_axis_length = (minor_radius * minor_radius - major_radius * major_radius)
+        .max(0.0)
+        .sqrt();
+    let mut profile = vec![Curve2::Arc(Arc {
+        centre: [major_radius, 0.0],
+        radius: minor_radius,
+        start_angle: PI + intersection_angle,
+        end_angle: PI - intersection_angle,
+    })];
+    if half_axis_length > f64::EPSILON * minor_radius.max(1.0) {
+        profile.push(Curve2::Line(Line2 {
+            start: [0.0, half_axis_length],
+            end: [0.0, 0.0],
+        }));
+        profile.push(Curve2::Line(Line2 {
+            start: [0.0, 0.0],
+            end: [0.0, -half_axis_length],
+        }));
+    }
+    super::sweep::revolve(profile_plane, &profile, centre, [0.0, 0.0, 1.0], TAU)
 }
 
 /// A right triangular prism: a right triangle in the XZ plane at `origin`,
