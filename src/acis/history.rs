@@ -121,13 +121,14 @@ pub fn rebuild_body(
             )
         }
         SolidHistoryOperation::Pyramid(value) => {
-            if value.top_radius.abs() > 1e-9 || value.sides < 3 {
-                return Err(HistoryRebuildError::Unsupported);
+            if value.sides < 3 {
+                return Err(HistoryRebuildError::InvalidParameters);
             }
             finish(
-                brep::make::pyramid(
+                brep::make::pyramid_frustum(
                     [0.0; 3],
                     value.radius,
+                    value.top_radius,
                     value.height,
                     value.sides as usize,
                 ),
