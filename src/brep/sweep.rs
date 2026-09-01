@@ -267,6 +267,177 @@ pub fn sweep_along(
     result.filter(|body| !body.roots.is_empty() && body.validate().is_empty())
 }
 
+/// Sweeps a polygon profile while rotating and scaling it from the beginning
+/// to the end of an open planar path.
+///
+/// Zero rotation and twist with unit scale retain the analytic sweep path.
+/// Deformed profiles are rebuilt as compatible section rings, so every
+/// exposed history value changes the resulting B-rep rather than remaining
+/// display-only metadata.
+pub fn sweep_along_deformed(
+    profile_plane: Plane,
+    profile: &[Curve2],
+    path_plane: Plane,
+    path: &[Curve2],
+    profile_rotation: f64,
+    twist_angle: f64,
+    scale_factor: f64,
+) -> Option<Body> {
+    if !profile_rotation.is_finite()
+        || !twist_angle.is_finite()
+        || !scale_factor.is_finite()
+        || scale_factor <= 1e-9
+    {
+        return None;
+    }
+    if profile_rotation.abs() <= 1e-12
+        && twist_angle.abs() <= 1e-12
+        && (scale_factor - 1.0).abs() <= 1e-12
+    {
+        return sweep_along(profile_plane, profile, path_plane, path);
+    }
+    if profile.iter().any(|piece| !matches!(piece, Curve2::Line(_))) {
+        return None;
+    }
+    let senses = path_senses(path)?;
+    let path_normal = Vec3::from(path_plane.normal()?).normalize()?;
+    let stations = deformation_stations(&path_plane, path, &senses)?;
+    if stations.len() < 2 || (stations.last()?.point - stations[0].point).length() <= 1e-9 {
+        return None;
+    }
+
+    let profile_senses = profile_senses(profile)?;
+    let start = &stations[0];
+    let start_left = path_normal.cross(start.tangent).normalize()?;
+    let profile_coordinates = profile
+        .iter()
+        .zip(profile_senses)
+        .map(|(piece, forward)| {
+            let point = Vec3::from(
+                profile_plane.point_at(piece.point_at(if forward { 0.0 } else { 1.0 })),
+            );
+            let delta = point - start.point;
+            if delta.dot(start.tangent).abs() > 1e-8 * delta.length().max(1.0) {
+                return None;
+            }
+            Some([delta.dot(start_left), delta.dot(path_normal)])
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let sections = stations
+        .iter()
+        .map(|station| {
+            let left = path_normal.cross(station.tangent).normalize()?;
+            let angle = profile_rotation + twist_angle * station.fraction;
+            let section_scale = 1.0 + (scale_factor - 1.0) * station.fraction;
+            if !section_scale.is_finite() || section_scale <= 1e-9 {
+                return None;
+            }
+            let (sin, cos) = angle.sin_cos();
+            let coordinates = profile_coordinates
+                .iter()
+                .map(|coordinate| {
+                    let across = (coordinate[0] * cos - coordinate[1] * sin)
+                        * section_scale
+                        * station.miter;
+                    let height = (coordinate[0] * sin + coordinate[1] * cos) * section_scale;
+                    [across, height]
+                })
+                .collect::<Vec<_>>();
+            let pieces = (0..coordinates.len())
+                .map(|index| {
+                    Curve2::Line(crate::geom2d::Line {
+                        start: coordinates[index],
+                        end: coordinates[(index + 1) % coordinates.len()],
+                    })
+                })
+                .collect::<Vec<_>>();
+            Some((
+                Plane::from_axes(station.point.to_array(), left.to_array(), path_normal.to_array()),
+                pieces,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    super::loft::loft(&sections)
+}
+
+struct DeformationStation {
+    point: Vec3,
+    tangent: Vec3,
+    fraction: f64,
+    miter: f64,
+}
+
+fn deformation_stations(
+    plane: &Plane,
+    path: &[Curve2],
+    senses: &[bool],
+) -> Option<Vec<DeformationStation>> {
+    if path.len() != senses.len() || path.is_empty() {
+        return None;
+    }
+    let total_length = path.iter().map(Curve2::length).sum::<f64>();
+    if !total_length.is_finite() || total_length <= 1e-12 {
+        return None;
+    }
+    let first_point = path[0].point_at(if senses[0] { 0.0 } else { 1.0 });
+    let last_point = path.last()?.point_at(if *senses.last()? { 1.0 } else { 0.0 });
+    if meets(first_point, last_point) {
+        return None;
+    }
+
+    let mut stations = Vec::new();
+    let mut traversed = 0.0;
+    for (index, (piece, forward)) in path.iter().zip(senses).enumerate() {
+        let piece_length = piece.length();
+        if !piece_length.is_finite() || piece_length <= 1e-12 {
+            return None;
+        }
+        let subdivisions = match piece {
+            Curve2::Line(_) => 1,
+            Curve2::Arc(value) => (value.sweep().abs() / (std::f64::consts::PI / 18.0))
+                .ceil()
+                .max(1.0) as usize,
+            _ => return None,
+        };
+        for step in 0..=subdivisions {
+            if index > 0 && step == 0 {
+                continue;
+            }
+            let local = step as f64 / subdivisions as f64;
+            let parameter = if *forward { local } else { 1.0 - local };
+            let point = Vec3::from(plane.point_at(piece.point_at(parameter)));
+            let mut tangent = Vec3::from(plane.vector_at(piece.tangent_at(parameter)));
+            if !*forward {
+                tangent = -tangent;
+            }
+            tangent = tangent.normalize()?;
+            let mut miter = 1.0;
+            if step == subdivisions && index + 1 < path.len() {
+                let next = path_tangent(plane, &path[index + 1], senses[index + 1], false)?;
+                let bisector = (tangent + next).normalize()?;
+                let normal = Vec3::from(plane.normal()?).normalize()?;
+                let left = normal.cross(bisector).normalize()?;
+                let previous_left = normal.cross(tangent).normalize()?;
+                let cosine = left.dot(previous_left);
+                if cosine <= 1e-6 {
+                    return None;
+                }
+                tangent = bisector;
+                miter = 1.0 / cosine;
+            }
+            stations.push(DeformationStation {
+                point,
+                tangent,
+                fraction: (traversed + piece_length * local) / total_length,
+                miter,
+            });
+        }
+        traversed += piece_length;
+    }
+    Some(stations)
+}
+
 /// Builds a rectangular sweep along a straight planar chain as one footprint.
 ///
 /// Sweeping every run separately gives each run its own perpendicular end

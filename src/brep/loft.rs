@@ -51,11 +51,9 @@ fn polygon_loft(sections: &[(Plane, Vec<Curve>)]) -> Option<Body> {
     }
 
     let centres = rings.iter().map(|ring| centre(ring)).collect::<Vec<_>>();
-    let direction = centres.last().copied()? - centres[0];
-    let direction = direction.normalize()?;
     if centres
         .windows(2)
-        .any(|pair| (pair[1] - pair[0]).dot(direction) <= tolerance(&rings))
+        .any(|pair| (pair[1] - pair[0]).length() <= tolerance(&rings))
     {
         return None;
     }
@@ -95,23 +93,36 @@ fn polygon_loft(sections: &[(Plane, Vec<Curve>)]) -> Option<Body> {
         })
         .collect::<Option<Vec<_>>>()?;
 
-    let winding = polygon_normal(&rings[0])?;
-    let forward = winding.dot(direction) > 0.0;
+    let first_winding = polygon_normal(&rings[0])?;
+    let first_outward = (centres[0] - centres[1]).normalize()?;
+    let first_normal = if first_winding.dot(first_outward) >= 0.0 {
+        first_winding
+    } else {
+        -first_winding
+    };
+    let last_winding = polygon_normal(rings.last()?)?;
+    let last_index = centres.len() - 1;
+    let last_outward = (centres[last_index] - centres[last_index - 1]).normalize()?;
+    let last_normal = if last_winding.dot(last_outward) >= 0.0 {
+        last_winding
+    } else {
+        -last_winding
+    };
     add_cap(
         &mut body,
         shell,
         &rings[0],
         &rims[0],
-        -direction,
-        !forward,
+        first_normal,
+        first_winding.dot(first_normal) > 0.0,
     )?;
     add_cap(
         &mut body,
         shell,
         rings.last()?,
         rims.last()?,
-        direction,
-        forward,
+        last_normal,
+        last_winding.dot(last_normal) > 0.0,
     )?;
 
     let scale_tolerance = tolerance(&rings);

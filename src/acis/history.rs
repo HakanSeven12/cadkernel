@@ -322,9 +322,10 @@ fn path_pieces(curve: &Curve) -> Result<Vec<Curve>, HistoryRebuildError> {
 
 fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
     if !value.scale_factor.is_finite()
-        || (value.scale_factor - 1.0).abs() > 1e-9
+        || value.scale_factor <= 1e-9
         || value.draft_angle.abs() > 1e-9
-        || value.twist_angle.abs() > 1e-9
+        || !value.twist_angle.is_finite()
+        || !value.align_angle.is_finite()
     {
         return Err(HistoryRebuildError::Unsupported);
     }
@@ -347,11 +348,14 @@ fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError>
         value.path_entity_transform,
     )?;
     finish(
-        brep::sweep_along(
+        brep::sweep_along_deformed(
             profile.plane,
             &profile_pieces(&profile.curve)?,
             path.plane,
             &path_pieces(&path.curve)?,
+            value.align_angle,
+            value.twist_angle,
+            value.scale_factor,
         ),
         value.base.transform,
     )
