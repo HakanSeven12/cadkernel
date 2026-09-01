@@ -1220,7 +1220,7 @@ impl Turn {
                         }),
                         false,
                     ))
-                } else if arc.radius < centre.radius {
+                } else {
                     Some((
                         Surface::Torus(Torus {
                             frame: self.circle(centre.height)?,
@@ -1229,9 +1229,6 @@ impl Turn {
                         }),
                         false,
                     ))
-                } else {
-                    // The tube would reach past the axis and cross itself.
-                    None
                 }
             }
             Curve2::Ellipse(_) | Curve2::Nurbs(_) => {

@@ -15,9 +15,9 @@ use super::nurbs_builder::RationalCurve2;
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, Loop, Lump, Shell, Vertex, VertexKey,
 };
-use std::f64::consts::{FRAC_PI_2, TAU};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use super::Provenance;
-use crate::geom2d::{Curve as Curve2, Ellipse, EllipseArc, Line as Line2};
+use crate::geom2d::{Arc, Curve as Curve2, Ellipse, EllipseArc, Line as Line2};
 use crate::space::{Plane, Vec3};
 
 /// A rectangular box with one corner at `origin` and the opposite at
@@ -628,15 +628,20 @@ fn elliptical_cone(
 /// is zero rather than two, because a torus has a hole through it and no
 /// closed shell of genus one can have any other.
 ///
-/// `None` unless the tube fits: a minor radius at or past the major one
-/// closes the hole and the surface crosses itself.
+/// A tube smaller than the major radius produces the usual ring. At or past
+/// the major radius the self-intersecting half of the generating circle is
+/// trimmed at the axis, producing a closed horn or spindle solid.
 pub fn torus(centre: [f64; 3], major_radius: f64, minor_radius: f64) -> Option<Body> {
-    if major_radius.is_nan()
-        || minor_radius.is_nan()
+    if centre.iter().any(|coordinate| !coordinate.is_finite())
+        || !major_radius.is_finite()
+        || !minor_radius.is_finite()
+        || major_radius <= 0.0
         || minor_radius <= 0.0
-        || major_radius <= minor_radius
     {
         return None;
+    }
+    if major_radius <= minor_radius {
+        return closed_hole_torus(centre, major_radius, minor_radius);
     }
     let mut body = Body::new();
     let frame = Plane::orthonormal(centre, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
@@ -696,6 +701,35 @@ pub fn torus(centre: [f64; 3], major_radius: f64, minor_radius: f64) -> Option<B
     body.validate().is_empty().then_some(body)
 }
 
+fn closed_hole_torus(
+    centre: [f64; 3],
+    major_radius: f64,
+    minor_radius: f64,
+) -> Option<Body> {
+    let profile_plane = Plane::orthonormal(centre, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0])?;
+    let intersection_angle = (major_radius / minor_radius).clamp(0.0, 1.0).acos();
+    let half_axis_length = (minor_radius * minor_radius - major_radius * major_radius)
+        .max(0.0)
+        .sqrt();
+    let mut profile = vec![Curve2::Arc(Arc {
+        centre: [major_radius, 0.0],
+        radius: minor_radius,
+        start_angle: PI + intersection_angle,
+        end_angle: PI - intersection_angle,
+    })];
+    if half_axis_length > f64::EPSILON * minor_radius.max(1.0) {
+        profile.push(Curve2::Line(Line2 {
+            start: [0.0, half_axis_length],
+            end: [0.0, 0.0],
+        }));
+        profile.push(Curve2::Line(Line2 {
+            start: [0.0, 0.0],
+            end: [0.0, -half_axis_length],
+        }));
+    }
+    super::sweep::revolve(profile_plane, &profile, centre, [0.0, 0.0, 1.0], TAU)
+}
+
 /// A right triangular prism: a right triangle in the XZ plane at `origin`,
 /// `width` deep along Y.
 pub fn wedge(origin: [f64; 3], length: f64, width: f64, height: f64) -> Option<Body> {
@@ -719,38 +753,59 @@ pub fn wedge(origin: [f64; 3], length: f64, width: f64, height: f64) -> Option<B
     super::sweep::extrude(plane, &profile, [0.0, width, 0.0])
 }
 
-/// A pyramid on a regular polygon of `sides` corners, `radius` out from the
-/// middle of `base` and `height` tall.
-///
-/// Not a revolution — a polygon is not round — so it is built face by face:
-/// the base, and one triangle per side meeting at the apex. `V − E + F` is
-/// `(n + 1) − 2n + (n + 1) = 2` for any `n`, which is the check that the
-/// rails and the base edges are each counted once.
-///
-/// `None` for fewer than three sides, or a size that is not positive.
+/// A pointed pyramid on a regular polygon of `sides` corners.
 pub fn pyramid(base: [f64; 3], radius: f64, height: f64, sides: usize) -> Option<Body> {
-    if sides < 3 || radius.is_nan() || height.is_nan() || radius <= 0.0 || height <= 0.0 {
+    pyramid_frustum(base, radius, 0.0, height, sides)
+}
+
+/// A pyramid or polygonal frustum whose base and top are concentric regular
+/// polygons with the same number of sides and orientation.
+///
+/// A zero `top_radius` produces a pointed pyramid. A positive value produces
+/// a closed frustum with a planar top and one quadrilateral face per side.
+///
+/// `None` is returned for fewer than three sides, a non-positive base radius
+/// or height, a negative top radius, or any non-finite dimension.
+pub fn pyramid_frustum(
+    base: [f64; 3],
+    base_radius: f64,
+    top_radius: f64,
+    height: f64,
+    sides: usize,
+) -> Option<Body> {
+    if sides < 3
+        || [base_radius, top_radius, height]
+            .iter()
+            .any(|value| !value.is_finite())
+        || base_radius <= 0.0
+        || top_radius < 0.0
+        || height <= 0.0
+    {
         return None;
     }
     let mut body = Body::new();
     let ground = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
-    let corners: Vec<VertexKey> = (0..sides)
+    let base_corners: Vec<VertexKey> = (0..sides)
         .map(|index| {
             let angle = TAU * index as f64 / sides as f64;
             add_vertex(
                 &mut body,
-                ground.point_at([radius * angle.cos(), radius * angle.sin()]),
+                ground.point_at([
+                    base_radius * angle.cos(),
+                    base_radius * angle.sin(),
+                ]),
             )
         })
         .collect();
-    let apex = add_vertex(&mut body, (Vec3::from(base) + Vec3::Z * height).to_array());
 
-    let rim: Vec<EdgeKey> = (0..sides)
-        .map(|index| add_line_edge(&mut body, corners[index], corners[(index + 1) % sides]))
-        .collect::<Option<Vec<_>>>()?;
-    let rails: Vec<EdgeKey> = corners
-        .iter()
-        .map(|corner| add_line_edge(&mut body, *corner, apex))
+    let base_rim: Vec<EdgeKey> = (0..sides)
+        .map(|index| {
+            add_line_edge(
+                &mut body,
+                base_corners[index],
+                base_corners[(index + 1) % sides],
+            )
+        })
         .collect::<Option<Vec<_>>>()?;
 
     let (lump, shell) = add_shell(&mut body);
@@ -760,14 +815,89 @@ pub fn pyramid(base: [f64; 3], radius: f64, height: f64, sides: usize) -> Option
     // by the side standing on it.
     let ground_down = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, -1.0])?;
     let surface = body.surfaces.insert(Surface::Plane(ground_down));
-    let floor: Vec<(EdgeKey, bool)> = rim.iter().rev().map(|edge| (*edge, false)).collect();
+    let floor: Vec<(EdgeKey, bool)> = base_rim
+        .iter()
+        .rev()
+        .map(|edge| (*edge, false))
+        .collect();
     close_shell(&mut body, lump, shell, surface, true, &floor)?;
+
+    if top_radius <= 1e-12 {
+        let apex = add_vertex(&mut body, (Vec3::from(base) + Vec3::Z * height).to_array());
+        let rails: Vec<EdgeKey> = base_corners
+            .iter()
+            .map(|corner| add_line_edge(&mut body, *corner, apex))
+            .collect::<Option<Vec<_>>>()?;
+
+        for index in 0..sides {
+            let next = (index + 1) % sides;
+            let here = Vec3::from(body.vertices.get(base_corners[index])?.point);
+            let along = Vec3::from(body.vertices.get(base_corners[next])?.point) - here;
+            let up = Vec3::from(body.vertices.get(apex)?.point) - here;
+            let surface = body.surfaces.insert(Surface::Plane(Plane::orthonormal(
+                here.to_array(),
+                along.to_array(),
+                along.cross(up).normalize()?.to_array(),
+            )?));
+            close_shell(
+                &mut body,
+                lump,
+                shell,
+                surface,
+                true,
+                &[
+                    (base_rim[index], true),
+                    (rails[next], true),
+                    (rails[index], false),
+                ],
+            )?;
+        }
+        return body.validate().is_empty().then_some(body);
+    }
+
+    let top_center = Vec3::from(base) + Vec3::Z * height;
+    let top_corners: Vec<VertexKey> = (0..sides)
+        .map(|index| {
+            let angle = TAU * index as f64 / sides as f64;
+            add_vertex(
+                &mut body,
+                (top_center
+                    + Vec3::new(
+                        top_radius * angle.cos(),
+                        top_radius * angle.sin(),
+                        0.0,
+                    ))
+                .to_array(),
+            )
+        })
+        .collect();
+    let top_rim: Vec<EdgeKey> = (0..sides)
+        .map(|index| {
+            add_line_edge(
+                &mut body,
+                top_corners[index],
+                top_corners[(index + 1) % sides],
+            )
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let rails: Vec<EdgeKey> = (0..sides)
+        .map(|index| add_line_edge(&mut body, base_corners[index], top_corners[index]))
+        .collect::<Option<Vec<_>>>()?;
+
+    let top_plane = Plane::orthonormal(
+        top_center.to_array(),
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    )?;
+    let surface = body.surfaces.insert(Surface::Plane(top_plane));
+    let ceiling: Vec<(EdgeKey, bool)> = top_rim.iter().map(|edge| (*edge, true)).collect();
+    close_shell(&mut body, lump, shell, surface, true, &ceiling)?;
 
     for index in 0..sides {
         let next = (index + 1) % sides;
-        let here = Vec3::from(body.vertices.get(corners[index])?.point);
-        let along = Vec3::from(body.vertices.get(corners[next])?.point) - here;
-        let up = Vec3::from(body.vertices.get(apex)?.point) - here;
+        let here = Vec3::from(body.vertices.get(base_corners[index])?.point);
+        let along = Vec3::from(body.vertices.get(base_corners[next])?.point) - here;
+        let up = Vec3::from(body.vertices.get(top_corners[index])?.point) - here;
         let surface = body.surfaces.insert(Surface::Plane(Plane::orthonormal(
             here.to_array(),
             along.to_array(),
@@ -779,7 +909,12 @@ pub fn pyramid(base: [f64; 3], radius: f64, height: f64, sides: usize) -> Option
             shell,
             surface,
             true,
-            &[(rim[index], true), (rails[next], true), (rails[index], false)],
+            &[
+                (base_rim[index], true),
+                (rails[next], true),
+                (top_rim[index], false),
+                (rails[index], false),
+            ],
         )?;
     }
     body.validate().is_empty().then_some(body)
