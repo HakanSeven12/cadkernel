@@ -4,9 +4,10 @@ use cadcodec::types::{Matrix3, Vector3};
 
 use crate::brep::{self, Body, Placement};
 use crate::geom2d::{
-    Arc, Circle, Curve, Ellipse, EllipseArc, Line, Polyline, PolylineVertex,
+    Arc, Circle, Curve, Ellipse, EllipseArc, Line, NurbsCurve, Parameterization, Polyline,
+    PolylineVertex,
 };
-use crate::space::{PlanarCurve, Plane, Vec3};
+use crate::space::{coplanarity_tolerance, PlanarCurve, Plane, Vec3};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryRebuildError {
@@ -116,6 +117,98 @@ fn straight_curve(
     Ok(PlanarCurve::new(plane, Curve::Line(Line { start, end })))
 }
 
+fn spline_curve(
+    value: &cadcodec::entities::Spline,
+) -> Result<PlanarCurve, HistoryRebuildError> {
+    let degree = value.degree.max(1) as usize;
+    let fit_method = !value.fit_points.is_empty() && value.control_points.len() <= degree;
+    let source = if fit_method {
+        &value.fit_points
+    } else {
+        &value.control_points
+    };
+    let first = source
+        .first()
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let normal = Vec3::from([value.normal.x, value.normal.y, value.normal.z])
+        .normalize()
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let elevation = Vec3::from([first.x, first.y, first.z]).dot(normal);
+    let plane = ocs_plane(
+        Vector3::new(normal.x, normal.y, normal.z),
+        elevation,
+    )?;
+    let source_points = source
+        .iter()
+        .map(|point| [point.x, point.y, point.z])
+        .collect::<Vec<_>>();
+    let tolerance = coplanarity_tolerance(&source_points);
+    if !tolerance.is_finite()
+        || !source_points
+            .iter()
+            .all(|point| plane.contains(*point, tolerance))
+    {
+        return Err(HistoryRebuildError::InvalidParameters);
+    }
+    let point = |value: &Vector3| {
+        plane
+            .project([value.x, value.y, value.z])
+            .ok_or(HistoryRebuildError::InvalidParameters)
+    };
+    let nurbs = if fit_method {
+        if !value.flags.periodic {
+            for tangent in [value.begin_tangent, value.end_tangent] {
+                let tangent = Vec3::from([tangent.x, tangent.y, tangent.z]);
+                if tangent.length_squared() > 1e-18
+                    && tangent.dot(normal).abs() > 1e-9 * tangent.length().max(1.0)
+                {
+                    return Err(HistoryRebuildError::InvalidParameters);
+                }
+            }
+        }
+        let mut points = value
+            .fit_points
+            .iter()
+            .map(point)
+            .collect::<Result<Vec<_>, _>>()?;
+        let parameterization = match value.knot_parameterization {
+            2 => Parameterization::Uniform,
+            1 => Parameterization::Centripetal,
+            _ => Parameterization::Chord,
+        };
+        if value.flags.periodic {
+            NurbsCurve::interpolate_periodic(&points, parameterization)
+        } else {
+            if value.flags.closed && points.first() != points.last() {
+                points.push(points[0]);
+            }
+            let tangent = |value: Vector3| {
+                let projected = plane.project_vector([value.x, value.y, value.z])?;
+                (projected[0].hypot(projected[1]) > 1e-9).then_some(projected)
+            };
+            NurbsCurve::interpolate(
+                &points,
+                tangent(value.begin_tangent),
+                tangent(value.end_tangent),
+                parameterization,
+            )
+        }
+    } else {
+        NurbsCurve::new(
+            degree,
+            value
+                .control_points
+                .iter()
+                .map(point)
+                .collect::<Result<Vec<_>, _>>()?,
+            value.knots.clone(),
+            (!value.weights.is_empty()).then(|| value.weights.clone()),
+        )
+    }
+    .ok_or(HistoryRebuildError::InvalidParameters)?;
+    Ok(PlanarCurve::new(plane, Curve::Nurbs(nurbs)))
+}
+
 fn embedded_curve(entity: &EmbeddedEntity) -> Result<PlanarCurve, HistoryRebuildError> {
     match entity {
         EmbeddedEntity::Line(value) => straight_curve(value.start, value.end),
@@ -177,6 +270,7 @@ fn embedded_curve(entity: &EmbeddedEntity) -> Result<PlanarCurve, HistoryRebuild
                 }),
             ))
         }
+        EmbeddedEntity::Spline(value) => spline_curve(value),
         EmbeddedEntity::LwPolyline(value) => {
             if value.vertices.len() < 2 {
                 return Err(HistoryRebuildError::InvalidParameters);
