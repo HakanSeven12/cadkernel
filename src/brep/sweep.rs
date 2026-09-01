@@ -208,6 +208,15 @@ pub fn sweep_along(
     path: &[Curve2],
 ) -> Option<Body> {
     let senses = path_senses(path)?;
+    if let Some(body) = mitered_rectangular_line_sweep(
+        profile_plane,
+        profile,
+        path_plane,
+        path,
+        &senses,
+    ) {
+        return Some(body);
+    }
     let mut result: Option<Body> = None;
     let mut previous_tangent: Option<Vec3> = None;
     for (piece, forward) in path.iter().zip(senses) {
@@ -256,6 +265,189 @@ pub fn sweep_along(
         });
     }
     result.filter(|body| !body.roots.is_empty() && body.validate().is_empty())
+}
+
+/// Builds a rectangular sweep along a straight planar chain as one footprint.
+///
+/// Sweeping every run separately gives each run its own perpendicular end
+/// cap. At a corner those caps overlap instead of meeting on the angle
+/// bisector, so a later union has to recover the intended wall from
+/// intersecting solids and may retain the old caps as internal seams. A
+/// rectangular profile along straight runs has an exact, simpler answer: the
+/// two signed parallel rails meet at their infinite-line intersections. Their
+/// joined outline is extruded once, producing mitered corners and no
+/// intermediate faces.
+fn mitered_rectangular_line_sweep(
+    profile_plane: Plane,
+    profile: &[Curve2],
+    path_plane: Plane,
+    path: &[Curve2],
+    senses: &[bool],
+) -> Option<Body> {
+    if profile.len() != 4
+        || profile.iter().any(|piece| !matches!(piece, Curve2::Line(_)))
+        || path.len() != senses.len()
+        || path.iter().any(|piece| !matches!(piece, Curve2::Line(_)))
+    {
+        return None;
+    }
+
+    let mut path_points = Vec::with_capacity(path.len() + 1);
+    for (index, (piece, forward)) in path.iter().zip(senses).enumerate() {
+        let Curve2::Line(line) = piece else {
+            return None;
+        };
+        let (start, end) = if *forward {
+            (line.start, line.end)
+        } else {
+            (line.end, line.start)
+        };
+        if index == 0 {
+            path_points.push(start);
+        } else if !meets(*path_points.last()?, start) {
+            return None;
+        }
+        if meets(start, end) {
+            return None;
+        }
+        path_points.push(end);
+    }
+    if path_points.len() < 2 || meets(path_points[0], *path_points.last()?) {
+        return None;
+    }
+
+    let first_direction = unit2(sub2(path_points[1], path_points[0]))?;
+    let path_normal = Vec3::from(path_plane.normal()?).normalize()?;
+    let tangent = Vec3::from(path_plane.vector_at(first_direction)).normalize()?;
+    let left = path_normal.cross(tangent).normalize()?;
+    let path_start = Vec3::from(path_plane.point_at(path_points[0]));
+    let profile_senses = profile_senses(profile)?;
+    let profile_corners = profile
+        .iter()
+        .zip(profile_senses)
+        .map(|(piece, forward)| {
+            Vec3::from(profile_plane.point_at(piece.point_at(if forward { 0.0 } else { 1.0 })))
+        })
+        .collect::<Vec<_>>();
+    let scale = profile_corners
+        .iter()
+        .map(|point| (*point - path_start).length())
+        .fold(1.0_f64, f64::max);
+    let tolerance = scale * 1e-9;
+    let mut across_min = f64::INFINITY;
+    let mut across_max = f64::NEG_INFINITY;
+    let mut height_min = f64::INFINITY;
+    let mut height_max = f64::NEG_INFINITY;
+    let mut coordinates = Vec::with_capacity(profile_corners.len());
+    for corner in profile_corners {
+        let delta = corner - path_start;
+        if delta.dot(tangent).abs() > tolerance {
+            return None;
+        }
+        let across = delta.dot(left);
+        let height = delta.dot(path_normal);
+        across_min = across_min.min(across);
+        across_max = across_max.max(across);
+        height_min = height_min.min(height);
+        height_max = height_max.max(height);
+        coordinates.push((across, height));
+    }
+    if across_max - across_min <= tolerance || height_max - height_min <= tolerance {
+        return None;
+    }
+    if coordinates.iter().any(|(across, height)| {
+        !near_either(*across, across_min, across_max, tolerance)
+            || !near_either(*height, height_min, height_max, tolerance)
+    }) {
+        return None;
+    }
+
+    let high_rail = offset_line_rail(&path_points, across_max)?;
+    let low_rail = offset_line_rail(&path_points, across_min)?;
+    let mut outline_points = high_rail;
+    outline_points.extend(low_rail.into_iter().rev());
+    let mut outline = Vec::with_capacity(outline_points.len());
+    for index in 0..outline_points.len() {
+        let start = outline_points[index];
+        let end = outline_points[(index + 1) % outline_points.len()];
+        if meets(start, end) {
+            return None;
+        }
+        outline.push(Curve2::Line(crate::geom2d::Line { start, end }));
+    }
+
+    let base_origin = Vec3::from(path_plane.origin) + path_normal * height_min;
+    let base_plane = Plane::from_axes(
+        base_origin.to_array(),
+        path_plane.x_axis,
+        path_plane.y_axis,
+    );
+    extrude(
+        base_plane,
+        &outline,
+        (path_normal * (height_max - height_min)).to_array(),
+    )
+}
+
+fn offset_line_rail(points: &[[f64; 2]], distance: f64) -> Option<Vec<[f64; 2]>> {
+    let directions = points
+        .windows(2)
+        .map(|pair| unit2(sub2(pair[1], pair[0])))
+        .collect::<Option<Vec<_>>>()?;
+    let offset_point = |point: [f64; 2], direction: [f64; 2]| {
+        [
+            point[0] - direction[1] * distance,
+            point[1] + direction[0] * distance,
+        ]
+    };
+    let mut rail = Vec::with_capacity(points.len());
+    rail.push(offset_point(points[0], directions[0]));
+    for index in 1..points.len() - 1 {
+        let previous = directions[index - 1];
+        let next = directions[index];
+        let previous_point = offset_point(points[index], previous);
+        let next_point = offset_point(points[index], next);
+        let cross = cross2(previous, next);
+        let joint = if cross.abs() <= 1e-12 {
+            if dot2(previous, next) <= 0.0 {
+                return None;
+            }
+            [
+                (previous_point[0] + next_point[0]) * 0.5,
+                (previous_point[1] + next_point[1]) * 0.5,
+            ]
+        } else {
+            let along = cross2(sub2(next_point, previous_point), next) / cross;
+            [
+                previous_point[0] + previous[0] * along,
+                previous_point[1] + previous[1] * along,
+            ]
+        };
+        rail.push(joint);
+    }
+    rail.push(offset_point(*points.last()?, *directions.last()?));
+    Some(rail)
+}
+
+fn sub2(first: [f64; 2], second: [f64; 2]) -> [f64; 2] {
+    [first[0] - second[0], first[1] - second[1]]
+}
+
+fn unit2(vector: [f64; 2]) -> Option<[f64; 2]> {
+    let length = vector[0].hypot(vector[1]);
+    (length > 1e-12).then_some([vector[0] / length, vector[1] / length])
+}
+
+fn cross2(first: [f64; 2], second: [f64; 2]) -> f64 {
+    first[0] * second[1] - first[1] * second[0]
+}
+
+fn dot2(first: [f64; 2], second: [f64; 2]) -> f64 {
+    first[0] * second[0] + first[1] * second[1]
+}
+
+fn near_either(value: f64, first: f64, second: f64, tolerance: f64) -> bool {
+    (value - first).abs() <= tolerance || (value - second).abs() <= tolerance
 }
 
 fn path_tangent(plane: &Plane, piece: &Curve2, forward: bool, at_end: bool) -> Option<Vec3> {

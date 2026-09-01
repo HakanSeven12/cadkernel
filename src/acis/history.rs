@@ -1,6 +1,12 @@
-use cadcodec::objects::SolidHistoryOperation;
+use cadcodec::entities::EmbeddedEntity;
+use cadcodec::objects::{SolidHistoryOperation, SolidHistorySweep};
+use cadcodec::types::{Matrix3, Vector3};
 
 use crate::brep::{self, Body, Placement};
+use crate::geom2d::{
+    Arc, Circle, Curve, Ellipse, EllipseArc, Line, Polyline, PolylineVertex,
+};
+use crate::space::{PlanarCurve, Plane, Vec3};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryRebuildError {
@@ -65,6 +71,290 @@ fn circular_radius(
         return Err(HistoryRebuildError::Unsupported);
     }
     Ok(major)
+}
+
+fn ocs_plane(normal: Vector3, elevation: f64) -> Result<Plane, HistoryRebuildError> {
+    let normal = Vec3::from([normal.x, normal.y, normal.z])
+        .normalize()
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let normal = Vector3::new(normal.x, normal.y, normal.z);
+    let axes = Matrix3::arbitrary_axis(normal);
+    Ok(Plane::from_axes(
+        [
+            normal.x * elevation,
+            normal.y * elevation,
+            normal.z * elevation,
+        ],
+        [axes.m[0][0], axes.m[1][0], axes.m[2][0]],
+        [axes.m[0][1], axes.m[1][1], axes.m[2][1]],
+    ))
+}
+
+fn straight_curve(
+    start: Vector3,
+    end: Vector3,
+) -> Result<PlanarCurve, HistoryRebuildError> {
+    let start = [start.x, start.y, start.z];
+    let end = [end.x, end.y, end.z];
+    let direction = Vec3::from(end) - Vec3::from(start);
+    if direction.length_squared() <= 1e-24 {
+        return Err(HistoryRebuildError::InvalidParameters);
+    }
+    let plane = if (end[2] - start[2]).abs() <= 1e-9 * direction.length().max(1.0) {
+        Plane::from_axes([0.0, 0.0, start[2]], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+    } else {
+        let normal = direction.cross(Vec3::Z).normalize().unwrap_or(Vec3::Y);
+        Plane::orthonormal(start, direction.to_array(), normal.to_array())
+            .ok_or(HistoryRebuildError::InvalidParameters)?
+    };
+    let start = plane
+        .project(start)
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let end = plane
+        .project(end)
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    Ok(PlanarCurve::new(plane, Curve::Line(Line { start, end })))
+}
+
+fn embedded_curve(entity: &EmbeddedEntity) -> Result<PlanarCurve, HistoryRebuildError> {
+    match entity {
+        EmbeddedEntity::Line(value) => straight_curve(value.start, value.end),
+        EmbeddedEntity::Circle(value) => Ok(PlanarCurve::new(
+            ocs_plane(value.normal, value.center.z)?,
+            Curve::Circle(Circle {
+                centre: [value.center.x, value.center.y],
+                radius: value.radius,
+            }),
+        )),
+        EmbeddedEntity::Arc(value) => Ok(PlanarCurve::new(
+            ocs_plane(value.normal, value.center.z)?,
+            Curve::Arc(Arc {
+                centre: [value.center.x, value.center.y],
+                radius: value.radius,
+                start_angle: value.start_angle,
+                end_angle: value.end_angle,
+            }),
+        )),
+        EmbeddedEntity::Ellipse(value) => {
+            let normal = Vec3::from([value.normal.x, value.normal.y, value.normal.z])
+                .normalize()
+                .ok_or(HistoryRebuildError::InvalidParameters)?;
+            let center = [value.center.x, value.center.y, value.center.z];
+            let elevation = Vec3::from(center).dot(normal);
+            let plane = ocs_plane(
+                Vector3::new(normal.x, normal.y, normal.z),
+                elevation,
+            )?;
+            let centre = plane
+                .project(center)
+                .ok_or(HistoryRebuildError::InvalidParameters)?;
+            let major = plane
+                .project_vector([
+                    value.major_axis.x,
+                    value.major_axis.y,
+                    value.major_axis.z,
+                ])
+                .ok_or(HistoryRebuildError::InvalidParameters)?;
+            let major_radius = major[0].hypot(major[1]);
+            if !major_radius.is_finite()
+                || major_radius <= 0.0
+                || !value.minor_axis_ratio.is_finite()
+                || value.minor_axis_ratio <= 0.0
+            {
+                return Err(HistoryRebuildError::InvalidParameters);
+            }
+            Ok(PlanarCurve::new(
+                plane,
+                Curve::Ellipse(EllipseArc {
+                    ellipse: Ellipse {
+                        centre,
+                        major_radius,
+                        minor_radius: major_radius * value.minor_axis_ratio,
+                        major_axis: [major[0] / major_radius, major[1] / major_radius],
+                    },
+                    start_parameter: value.start_parameter,
+                    end_parameter: value.end_parameter,
+                }),
+            ))
+        }
+        EmbeddedEntity::LwPolyline(value) => {
+            if value.vertices.len() < 2 {
+                return Err(HistoryRebuildError::InvalidParameters);
+            }
+            Ok(PlanarCurve::new(
+                ocs_plane(value.normal, value.elevation)?,
+                Curve::Polyline(Polyline {
+                    vertices: value
+                        .vertices
+                        .iter()
+                        .map(|vertex| PolylineVertex {
+                            position: [vertex.location.x, vertex.location.y],
+                            bulge: vertex.bulge,
+                        })
+                        .collect(),
+                    closed: value.is_closed,
+                }),
+            ))
+        }
+        _ => Err(HistoryRebuildError::Unsupported),
+    }
+}
+
+fn placed_curve(
+    mut curve: PlanarCurve,
+    transform: [f64; 16],
+) -> Result<PlanarCurve, HistoryRebuildError> {
+    let placement = placement(transform)?;
+    if placement.scale().is_none() {
+        return Err(HistoryRebuildError::InvalidTransform);
+    }
+    curve.plane = Plane::from_axes(
+        placement.point(curve.plane.origin),
+        placement.vector(curve.plane.x_axis),
+        placement.vector(curve.plane.y_axis),
+    );
+    Ok(curve)
+}
+
+fn profile_pieces(curve: &Curve) -> Result<Vec<Curve>, HistoryRebuildError> {
+    let pieces = match curve {
+        Curve::Polyline(value) if value.closed => curve.segments(),
+        Curve::Circle(value) => {
+            (0..4)
+                .map(|part| {
+                    let start = std::f64::consts::FRAC_PI_2 * part as f64;
+                    Curve::Arc(Arc {
+                        centre: value.centre,
+                        radius: value.radius,
+                        start_angle: start,
+                        end_angle: start + std::f64::consts::FRAC_PI_2,
+                    })
+                })
+                .collect()
+        }
+        Curve::Arc(value) if curve.is_closed() => {
+            let start = value.start_angle;
+            let step = value.sweep() / 4.0;
+            (0..4)
+                .map(|part| {
+                    Curve::Arc(Arc {
+                        centre: value.centre,
+                        radius: value.radius,
+                        start_angle: start + step * part as f64,
+                        end_angle: start + step * (part + 1) as f64,
+                    })
+                })
+                .collect()
+        }
+        Curve::Ellipse(value) if curve.is_closed() => {
+            let start = value.start_parameter;
+            let step = value.sweep() / 4.0;
+            (0..4)
+                .map(|part| {
+                    Curve::Ellipse(EllipseArc {
+                        ellipse: value.ellipse,
+                        start_parameter: start + step * part as f64,
+                        end_parameter: start + step * (part + 1) as f64,
+                    })
+                })
+                .collect()
+        }
+        _ => return Err(HistoryRebuildError::InvalidParameters),
+    };
+    (pieces.len() >= 3)
+        .then_some(pieces)
+        .ok_or(HistoryRebuildError::InvalidParameters)
+}
+
+fn path_pieces(curve: &Curve) -> Result<Vec<Curve>, HistoryRebuildError> {
+    let pieces = match curve {
+        Curve::Line(value) => vec![Curve::Line(*value)],
+        Curve::Arc(value) => vec![Curve::Arc(*value)],
+        Curve::Circle(value) => (0..4)
+            .map(|part| {
+                let start = std::f64::consts::FRAC_PI_2 * part as f64;
+                Curve::Arc(Arc {
+                    centre: value.centre,
+                    radius: value.radius,
+                    start_angle: start,
+                    end_angle: start + std::f64::consts::FRAC_PI_2,
+                })
+            })
+            .collect(),
+        Curve::Polyline(_) => curve.segments(),
+        Curve::Ellipse(value) => {
+            let scale = value
+                .ellipse
+                .major_radius
+                .max(value.ellipse.minor_radius)
+                .max(1.0);
+            let points = curve.tessellate_within(scale * 1e-4);
+            points
+                .windows(2)
+                .filter(|pair| pair[0] != pair[1])
+                .map(|pair| {
+                    Curve::Line(Line {
+                        start: pair[0],
+                        end: pair[1],
+                    })
+                })
+                .collect()
+        }
+        Curve::Nurbs(_) => {
+            let points = curve.tessellate_within(1e-4);
+            points
+                .windows(2)
+                .filter(|pair| pair[0] != pair[1])
+                .map(|pair| {
+                    Curve::Line(Line {
+                        start: pair[0],
+                        end: pair[1],
+                    })
+                })
+                .collect()
+        }
+        _ => return Err(HistoryRebuildError::Unsupported),
+    };
+    (!pieces.is_empty())
+        .then_some(pieces)
+        .ok_or(HistoryRebuildError::InvalidParameters)
+}
+
+fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
+    if !value.scale_factor.is_finite()
+        || (value.scale_factor - 1.0).abs() > 1e-9
+        || value.draft_angle.abs() > 1e-9
+        || value.twist_angle.abs() > 1e-9
+    {
+        return Err(HistoryRebuildError::Unsupported);
+    }
+    let profile = placed_curve(
+        embedded_curve(
+            value
+                .sweep_entity
+                .as_ref()
+                .ok_or(HistoryRebuildError::InvalidParameters)?,
+        )?,
+        value.sweep_entity_transform,
+    )?;
+    let path = placed_curve(
+        embedded_curve(
+            value
+                .path_entity
+                .as_ref()
+                .ok_or(HistoryRebuildError::InvalidParameters)?,
+        )?,
+        value.path_entity_transform,
+    )?;
+    finish(
+        brep::sweep_along(
+            profile.plane,
+            &profile_pieces(&profile.curve)?,
+            path.plane,
+            &path_pieces(&path.curve)?,
+        ),
+        value.base.transform,
+    )
 }
 
 pub fn rebuild_body(
@@ -157,6 +447,7 @@ pub fn rebuild_body(
                     other => other,
                 })
         }
+        SolidHistoryOperation::Sweep(value) => rebuild_sweep(value),
         _ => Err(HistoryRebuildError::Unsupported),
     }
 }
