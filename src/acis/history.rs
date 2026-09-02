@@ -1,5 +1,5 @@
 use cadcodec::entities::EmbeddedEntity;
-use cadcodec::objects::{SolidHistoryOperation, SolidHistorySweep};
+use cadcodec::objects::{SolidHistoryLoft, SolidHistoryOperation, SolidHistorySweep};
 use cadcodec::types::{Matrix3, Vector3};
 
 use crate::brep::{self, Body, Placement};
@@ -601,6 +601,24 @@ fn rebuild_extrusion(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildEr
     finish(body, value.base.transform)
 }
 
+fn rebuild_loft(value: &SolidHistoryLoft) -> Result<Body, HistoryRebuildError> {
+    if !value.guides.is_empty() {
+        return Err(HistoryRebuildError::Unsupported);
+    }
+    let sections = value
+        .cross_sections
+        .iter()
+        .map(|entity| {
+            let curve = embedded_curve(entity)?;
+            Ok((curve.plane, profile_pieces(&curve.curve)?))
+        })
+        .collect::<Result<Vec<_>, HistoryRebuildError>>()?;
+    if sections.len() < 2 {
+        return Err(HistoryRebuildError::InvalidParameters);
+    }
+    finish(brep::loft(&sections), value.base.transform)
+}
+
 pub fn rebuild_body(
     operation: &SolidHistoryOperation,
 ) -> Result<Body, HistoryRebuildError> {
@@ -693,6 +711,7 @@ pub fn rebuild_body(
         }
         SolidHistoryOperation::Sweep(value) => rebuild_sweep(value),
         SolidHistoryOperation::Extrusion(value) => rebuild_extrusion(value),
+        SolidHistoryOperation::Loft(value) => rebuild_loft(value),
         _ => Err(HistoryRebuildError::Unsupported),
     }
 }
