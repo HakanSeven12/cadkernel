@@ -620,7 +620,7 @@ fn rebuild_revolve(value: &SolidHistoryRevolve) -> Result<Body, HistoryRebuildEr
         ]
         .iter()
         .any(|parameter| !parameter.is_finite() || parameter.abs() > 1e-12)
-        || value.flag_290
+        || !value.flag_290
         || value.close_to_axis
     {
         return Err(HistoryRebuildError::Unsupported);
