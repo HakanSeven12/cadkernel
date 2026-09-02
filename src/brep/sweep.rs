@@ -402,6 +402,64 @@ pub fn extrude_tapered(
     super::loft::loft(&[(plane, profile.to_vec()), (far, top_profile)])
 }
 
+/// Extrudes a closed profile into a tapered lateral sheet without end caps.
+#[cfg(feature = "offset")]
+pub fn extrude_surface_tapered(
+    plane: Plane,
+    profile: &[Curve2],
+    direction: [f64; 3],
+    taper_angle: f64,
+) -> Option<Body> {
+    if taper_angle.abs() <= 1e-12 {
+        return extrude_surface(plane, profile, direction);
+    }
+    let mut body = extrude_tapered(plane, profile, direction, taper_angle)?;
+    let lump = *body.roots.first()?;
+    let shell = *body.lumps.get(lump)?.shells.first()?;
+    let caps = body
+        .shells
+        .get(shell)?
+        .faces
+        .iter()
+        .copied()
+        .take(2)
+        .collect::<Vec<_>>();
+    if caps.len() != 2
+        || caps.iter().any(|face| {
+            body.faces
+                .get(*face)
+                .and_then(|face| body.surfaces.get(face.surface))
+                .is_none_or(|surface| !matches!(surface, Surface::Plane(_)))
+        })
+    {
+        return None;
+    }
+    for face_key in caps {
+        let face = body.faces.get(face_key)?.clone();
+        for loop_key in face.loops {
+            let ring = body.loops.get(loop_key)?.clone();
+            for coedge_key in ring.coedges {
+                let edge_key = body.coedges.get(coedge_key)?.edge;
+                body.edges
+                    .get_mut(edge_key)?
+                    .coedges
+                    .retain(|candidate| *candidate != coedge_key);
+                body.coedges.remove(coedge_key)?;
+            }
+            body.loops.remove(loop_key)?;
+        }
+        body.faces.remove(face_key)?;
+        body.shells
+            .get_mut(shell)?
+            .faces
+            .retain(|candidate| *candidate != face_key);
+        if !body.faces.iter().any(|(_, face)| face.surface == face.surface) {
+            body.surfaces.remove(face.surface);
+        }
+    }
+    body.validate().is_empty().then_some(body)
+}
+
 /// Extrudes an outer loop and removes each following loop as a hole.
 pub fn extrude_region(
     plane: Plane,

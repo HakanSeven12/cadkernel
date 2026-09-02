@@ -54,7 +54,7 @@ pub use mesh::{body as mesh_body, Mesh};
 pub use place::{edge_points, edge_polylines, transform, Placement};
 pub use sweep::{extrude, extrude_region, extrude_surface, revolve, sweep_along, sweep_along_deformed};
 #[cfg(feature = "offset")]
-pub use sweep::extrude_tapered;
+pub use sweep::{extrude_surface_tapered, extrude_tapered};
 pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};
 pub use loft::loft;
