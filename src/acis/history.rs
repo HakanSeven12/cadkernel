@@ -478,7 +478,15 @@ fn rebuild_extrusion(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildEr
         if value.draft_angle.abs() > 1e-9 {
             return Err(HistoryRebuildError::Unsupported);
         }
-        let path = placed_curve(embedded_curve(path)?, value.path_entity_transform)?;
+        let mut path = placed_curve(embedded_curve(path)?, value.path_entity_transform)?;
+        let profile_center = pieces
+            .iter()
+            .map(|piece| Vec3::from(profile.plane.point_at(piece.point_at(0.0))))
+            .fold(Vec3::ZERO, |sum, point| sum + point)
+            / pieces.len() as f64;
+        let path_start = Vec3::from(path.plane.point_at(path.curve.point_at(0.0)));
+        path.plane.origin =
+            (Vec3::from(path.plane.origin) + profile_center - path_start).to_array();
         brep::sweep_along(profile.plane, &pieces, path.plane, &path_pieces(&path.curve)?)
     } else {
         let direction = [value.direction.x, value.direction.y, value.direction.z];
