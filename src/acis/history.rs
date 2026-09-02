@@ -1,5 +1,7 @@
 use cadcodec::entities::EmbeddedEntity;
-use cadcodec::objects::{SolidHistoryLoft, SolidHistoryOperation, SolidHistorySweep};
+use cadcodec::objects::{
+    SolidHistoryLoft, SolidHistoryOperation, SolidHistoryRevolve, SolidHistorySweep,
+};
 use cadcodec::types::{Matrix3, Vector3};
 
 use crate::brep::{self, Body, Placement};
@@ -601,6 +603,71 @@ fn rebuild_extrusion(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildEr
     finish(body, value.base.transform)
 }
 
+fn rotate_vector(value: Vec3, axis: Vec3, angle: f64) -> Vec3 {
+    let (sine, cosine) = angle.sin_cos();
+    value * cosine + axis.cross(value) * sine + axis * axis.dot(value) * (1.0 - cosine)
+}
+
+fn rebuild_revolve(value: &SolidHistoryRevolve) -> Result<Body, HistoryRebuildError> {
+    if !value.revolve_angle.is_finite()
+        || value.revolve_angle.abs() <= 1e-12
+        || !value.start_angle.is_finite()
+        || [
+            value.draft_angle,
+            value.twist_angle,
+            value.field_44,
+            value.field_45,
+        ]
+        .iter()
+        .any(|parameter| !parameter.is_finite() || parameter.abs() > 1e-12)
+        || value.flag_290
+        || value.close_to_axis
+    {
+        return Err(HistoryRebuildError::Unsupported);
+    }
+    let mut profile = embedded_curve(
+        value
+            .sweep_entity
+            .as_ref()
+            .ok_or(HistoryRebuildError::InvalidParameters)?,
+    )?;
+    let axis_origin = Vec3::from([
+        value.axis_point.x,
+        value.axis_point.y,
+        value.axis_point.z,
+    ]);
+    let axis = Vec3::from([
+        value.direction.x,
+        value.direction.y,
+        value.direction.z,
+    ])
+    .normalize()
+    .ok_or(HistoryRebuildError::InvalidParameters)?;
+    if !axis_origin.is_finite() || !axis.is_finite() {
+        return Err(HistoryRebuildError::InvalidParameters);
+    }
+    if value.start_angle.abs() > 1e-12 {
+        let origin = Vec3::from(profile.plane.origin);
+        profile.plane.origin =
+            (axis_origin + rotate_vector(origin - axis_origin, axis, value.start_angle))
+                .to_array();
+        profile.plane.x_axis =
+            rotate_vector(Vec3::from(profile.plane.x_axis), axis, value.start_angle).to_array();
+        profile.plane.y_axis =
+            rotate_vector(Vec3::from(profile.plane.y_axis), axis, value.start_angle).to_array();
+    }
+    finish(
+        brep::revolve(
+            profile.plane,
+            &profile_pieces(&profile.curve)?,
+            axis_origin.to_array(),
+            axis.to_array(),
+            value.revolve_angle,
+        ),
+        value.base.transform,
+    )
+}
+
 fn rebuild_loft(value: &SolidHistoryLoft) -> Result<Body, HistoryRebuildError> {
     if !value.guides.is_empty() {
         return Err(HistoryRebuildError::Unsupported);
@@ -712,6 +779,7 @@ pub fn rebuild_body(
         SolidHistoryOperation::Sweep(value) => rebuild_sweep(value),
         SolidHistoryOperation::Extrusion(value) => rebuild_extrusion(value),
         SolidHistoryOperation::Loft(value) => rebuild_loft(value),
+        SolidHistoryOperation::Revolve(value) => rebuild_revolve(value),
         _ => Err(HistoryRebuildError::Unsupported),
     }
 }
