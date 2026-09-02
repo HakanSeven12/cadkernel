@@ -455,6 +455,48 @@ fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError>
     )
 }
 
+fn rebuild_extrusion(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
+    if !value.scale_factor.is_finite()
+        || value.scale_factor <= 1e-9
+        || !value.draft_angle.is_finite()
+        || !value.twist_angle.is_finite()
+        || value.twist_angle.abs() > 1e-9
+    {
+        return Err(HistoryRebuildError::Unsupported);
+    }
+    let profile = placed_curve(
+        embedded_curve(
+            value
+                .sweep_entity
+                .as_ref()
+                .ok_or(HistoryRebuildError::InvalidParameters)?,
+        )?,
+        value.sweep_entity_transform,
+    )?;
+    let pieces = profile_pieces(&profile.curve)?;
+    let body = if let Some(path) = value.path_entity.as_ref() {
+        if value.draft_angle.abs() > 1e-9 {
+            return Err(HistoryRebuildError::Unsupported);
+        }
+        let path = placed_curve(embedded_curve(path)?, value.path_entity_transform)?;
+        brep::sweep_along(profile.plane, &pieces, path.plane, &path_pieces(&path.curve)?)
+    } else {
+        let direction = [value.direction.x, value.direction.y, value.direction.z];
+        #[cfg(feature = "offset")]
+        {
+            brep::extrude_tapered(profile.plane, &pieces, direction, value.draft_angle)
+        }
+        #[cfg(not(feature = "offset"))]
+        {
+            if value.draft_angle.abs() > 1e-9 {
+                return Err(HistoryRebuildError::Unsupported);
+            }
+            brep::extrude(profile.plane, &pieces, direction)
+        }
+    };
+    finish(body, value.base.transform)
+}
+
 pub fn rebuild_body(
     operation: &SolidHistoryOperation,
 ) -> Result<Body, HistoryRebuildError> {
@@ -546,6 +588,7 @@ pub fn rebuild_body(
                 })
         }
         SolidHistoryOperation::Sweep(value) => rebuild_sweep(value),
+        SolidHistoryOperation::Extrusion(value) => rebuild_extrusion(value),
         _ => Err(HistoryRebuildError::Unsupported),
     }
 }
