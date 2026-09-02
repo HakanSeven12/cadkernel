@@ -178,6 +178,501 @@ pub fn extrude(plane: Plane, profile: &[Curve2], direction: [f64; 3]) -> Option<
     body.validate().is_empty().then_some(body)
 }
 
+/// Extrudes a connected open or closed curve chain into an open sheet body.
+///
+/// Unlike [`extrude`], no end caps are added. An open source therefore makes
+/// one face per curve piece, while a closed source makes the lateral skin of
+/// an extrusion. Boundary edges intentionally have one coedge: that is the
+/// valid topology of an open shell rather than a damaged solid.
+pub fn extrude_surface(
+    plane: Plane,
+    profile: &[Curve2],
+    direction: [f64; 3],
+) -> Option<Body> {
+    let along = Vec3::from(direction);
+    if along.length() <= 1e-12 || !along.length().is_finite() {
+        return None;
+    }
+    let closed = profile_senses(profile);
+    let (senses, corners) = match closed {
+        Some(senses) => {
+            let corners = profile
+                .iter()
+                .zip(&senses)
+                .map(|(piece, forward)| piece.point_at(if *forward { 0.0 } else { 1.0 }))
+                .collect::<Vec<_>>();
+            (senses, corners)
+        }
+        None => {
+            let senses = path_senses(profile)?;
+            let mut corners = profile
+                .iter()
+                .zip(&senses)
+                .map(|(piece, forward)| piece.point_at(if *forward { 0.0 } else { 1.0 }))
+                .collect::<Vec<_>>();
+            let last = profile.last()?.point_at(if *senses.last()? { 1.0 } else { 0.0 });
+            corners.push(last);
+            (senses, corners)
+        }
+    };
+    if profile.is_empty() || corners.len() < 2 {
+        return None;
+    }
+    let is_closed = corners.len() == profile.len();
+
+    let mut body = Body::new();
+    let lump = body.lumps.insert(Lump {
+        shells: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let shell = body.shells.insert(Shell {
+        faces: Vec::new(),
+        owner: lump,
+        provenance: Provenance::Synthesized,
+    });
+    let base = corners
+        .iter()
+        .map(|point| add_vertex(&mut body, plane.point_at(*point)))
+        .collect::<Vec<_>>();
+    let top = corners
+        .iter()
+        .map(|point| add_vertex(&mut body, (Vec3::from(plane.point_at(*point)) + along).to_array()))
+        .collect::<Vec<_>>();
+    let far = Plane::from_axes(
+        (Vec3::from(plane.origin) + along).to_array(),
+        plane.x_axis,
+        plane.y_axis,
+    );
+
+    let mut base_edges = Vec::with_capacity(profile.len());
+    let mut top_edges = Vec::with_capacity(profile.len());
+    for (index, piece) in profile.iter().enumerate() {
+        let next = if is_closed { (index + 1) % corners.len() } else { index + 1 };
+        let (base_from, base_to) = if senses[index] {
+            (base[index], base[next])
+        } else {
+            (base[next], base[index])
+        };
+        let (top_from, top_to) = if senses[index] {
+            (top[index], top[next])
+        } else {
+            (top[next], top[index])
+        };
+        base_edges.push(add_profile_edge(&mut body, &plane, piece, base_from, base_to)?);
+        top_edges.push(add_profile_edge(&mut body, &far, piece, top_from, top_to)?);
+    }
+    let rails = (0..corners.len())
+        .map(|index| add_line_edge(&mut body, base[index], top[index]))
+        .collect::<Option<Vec<_>>>()?;
+
+    for (index, piece) in profile.iter().enumerate() {
+        let next = if is_closed { (index + 1) % corners.len() } else { index + 1 };
+        let (surface, spline) = wall_surface(&mut body, &plane, piece, along)?;
+        let tangent = Vec3::from(plane.vector_at(piece.tangent_at(0.5)));
+        let out = tangent * if senses[index] { 1.0 } else { -1.0 };
+        let out = out.cross(along);
+        let on = plane.point_at(piece.point_at(0.5));
+        let forward = face_sense(body.surfaces.get(surface)?, on, out)?;
+        let circuit = vec![
+            (base_edges[index], senses[index]),
+            (rails[next], true),
+            (top_edges[index], !senses[index]),
+            (rails[index], false),
+        ];
+        if spline {
+            let start = if senses[index] { 0.0 } else { 1.0 };
+            let end = 1.0 - start;
+            add_wall_with_pcurves(
+                &mut body,
+                shell,
+                surface,
+                forward,
+                &circuit,
+                &[
+                    ([start, 0.0], [end, 0.0]),
+                    ([end, 0.0], [end, 1.0]),
+                    ([end, 1.0], [start, 1.0]),
+                    ([start, 1.0], [start, 0.0]),
+                ],
+            )?;
+        } else {
+            add_wall(&mut body, shell, surface, forward, &circuit)?;
+        }
+    }
+
+    body.lumps.get_mut(lump)?.shells = vec![shell];
+    body.roots = vec![lump];
+    body.validate().is_empty().then_some(body)
+}
+
+/// Extrudes a closed line-and-arc profile with a constant taper angle.
+///
+/// A positive angle moves the far outline inward and a negative angle moves
+/// it outward. The offset distance is measured perpendicular to the profile
+/// plane, so an oblique extrusion keeps the requested wall angle.
+#[cfg(feature = "offset")]
+pub fn extrude_tapered(
+    plane: Plane,
+    profile: &[Curve2],
+    direction: [f64; 3],
+    taper_angle: f64,
+) -> Option<Body> {
+    if !taper_angle.is_finite()
+        || taper_angle.abs() >= std::f64::consts::FRAC_PI_2
+    {
+        return None;
+    }
+    if taper_angle.abs() <= 1e-12 {
+        return extrude(plane, profile, direction);
+    }
+    let senses = profile_senses(profile)?;
+    let along = Vec3::from(direction);
+    let height = along.dot(Vec3::from(plane.normal()?)).abs();
+    let offset = height * taper_angle.tan().abs();
+    if !offset.is_finite() || offset <= 1e-12 {
+        return None;
+    }
+
+    let mut vertices = Vec::with_capacity(profile.len());
+    for (piece, forward) in profile.iter().zip(&senses) {
+        let position = piece.point_at(if *forward { 0.0 } else { 1.0 });
+        let bulge = match piece {
+            Curve2::Line(_) => 0.0,
+            Curve2::Arc(arc) => {
+                let signed = arc.sweep() * if *forward { 1.0 } else { -1.0 };
+                (signed * 0.25).tan()
+            }
+            _ => return None,
+        };
+        vertices.push(crate::geom2d::PolylineVertex { position, bulge });
+    }
+    let source = crate::geom2d::Polyline {
+        vertices,
+        closed: true,
+    };
+    let signed_area = profile
+        .iter()
+        .zip(&senses)
+        .map(|(piece, forward)| piece.enclosed_area() * if *forward { 1.0 } else { -1.0 })
+        .sum::<f64>();
+    if !signed_area.is_finite() || signed_area.abs() <= 1e-12 {
+        return None;
+    }
+    let first = profile.first()?;
+    let forward = *senses.first()?;
+    let point = first.point_at(0.5);
+    let tangent = first.tangent_at(0.5);
+    let tangent = if forward {
+        tangent
+    } else {
+        [-tangent[0], -tangent[1]]
+    };
+    let inward = if signed_area > 0.0 {
+        [-tangent[1], tangent[0]]
+    } else {
+        [tangent[1], -tangent[0]]
+    };
+    let side_sign = if taper_angle > 0.0 { 1.0 } else { -1.0 };
+    let side = [
+        point[0] + inward[0] * offset * side_sign,
+        point[1] + inward[1] * offset * side_sign,
+    ];
+    let top = crate::geom2d::offset_polyline(&source, offset, side)
+        .into_iter()
+        .max_by(|a, b| {
+            let area = |polyline: &crate::geom2d::Polyline| {
+                Curve2::Polyline(polyline.clone())
+                    .segments()
+                    .iter()
+                    .map(Curve2::enclosed_area)
+                    .sum::<f64>()
+                    .abs()
+            };
+            area(a).total_cmp(&area(b))
+        })?;
+    let top_profile = Curve2::Polyline(top).segments();
+    if top_profile.len() != profile.len() {
+        return None;
+    }
+    let far = Plane::from_axes(
+        (Vec3::from(plane.origin) + along).to_array(),
+        plane.x_axis,
+        plane.y_axis,
+    );
+    super::loft::loft(&[(plane, profile.to_vec()), (far, top_profile)])
+}
+
+/// Extrudes a closed profile into a tapered lateral sheet without end caps.
+#[cfg(feature = "offset")]
+pub fn extrude_surface_tapered(
+    plane: Plane,
+    profile: &[Curve2],
+    direction: [f64; 3],
+    taper_angle: f64,
+) -> Option<Body> {
+    if !taper_angle.is_finite()
+        || taper_angle.abs() >= std::f64::consts::FRAC_PI_2
+    {
+        return None;
+    }
+    if taper_angle.abs() <= 1e-12 {
+        return extrude_surface(plane, profile, direction);
+    }
+    if profile_senses(profile).is_none() {
+        return extrude_open_surface_tapered(plane, profile, direction, taper_angle);
+    }
+    let mut body = extrude_tapered(plane, profile, direction, taper_angle)?;
+    let lump = *body.roots.first()?;
+    let shell = *body.lumps.get(lump)?.shells.first()?;
+    let caps = body
+        .shells
+        .get(shell)?
+        .faces
+        .iter()
+        .copied()
+        .take(2)
+        .collect::<Vec<_>>();
+    if caps.len() != 2
+        || caps.iter().any(|face| {
+            body.faces
+                .get(*face)
+                .and_then(|face| body.surfaces.get(face.surface))
+                .is_none_or(|surface| !matches!(surface, Surface::Plane(_)))
+        })
+    {
+        return None;
+    }
+    for face_key in caps {
+        let face = body.faces.get(face_key)?.clone();
+        for loop_key in face.loops {
+            let ring = body.loops.get(loop_key)?.clone();
+            for coedge_key in ring.coedges {
+                let edge_key = body.coedges.get(coedge_key)?.edge;
+                body.edges
+                    .get_mut(edge_key)?
+                    .coedges
+                    .retain(|candidate| *candidate != coedge_key);
+                body.coedges.remove(coedge_key)?;
+            }
+            body.loops.remove(loop_key)?;
+        }
+        body.faces.remove(face_key)?;
+        body.shells
+            .get_mut(shell)?
+            .faces
+            .retain(|candidate| *candidate != face_key);
+        if !body.faces.iter().any(|(_, face)| face.surface == face.surface) {
+            body.surfaces.remove(face.surface);
+        }
+    }
+    body.validate().is_empty().then_some(body)
+}
+
+#[cfg(feature = "offset")]
+fn extrude_open_surface_tapered(
+    plane: Plane,
+    profile: &[Curve2],
+    direction: [f64; 3],
+    taper_angle: f64,
+) -> Option<Body> {
+    let senses = path_senses(profile)?;
+    let along = Vec3::from(direction);
+    let height = along.dot(Vec3::from(plane.normal()?)).abs();
+    let offset = height * taper_angle.tan().abs();
+    if !offset.is_finite() || offset <= 1e-12 {
+        return None;
+    }
+    let mut vertices = Vec::with_capacity(profile.len() + 1);
+    for (piece, forward) in profile.iter().zip(&senses) {
+        let position = piece.point_at(if *forward { 0.0 } else { 1.0 });
+        let bulge = match piece {
+            Curve2::Line(_) => 0.0,
+            Curve2::Arc(arc) => {
+                let signed = arc.sweep() * if *forward { 1.0 } else { -1.0 };
+                (signed * 0.25).tan()
+            }
+            _ => return None,
+        };
+        vertices.push(crate::geom2d::PolylineVertex { position, bulge });
+    }
+    vertices.push(crate::geom2d::PolylineVertex {
+        position: profile
+            .last()?
+            .point_at(if *senses.last()? { 1.0 } else { 0.0 }),
+        bulge: 0.0,
+    });
+    let source = crate::geom2d::Polyline {
+        vertices,
+        closed: false,
+    };
+    let first = profile.first()?;
+    let forward = *senses.first()?;
+    let point = first.point_at(0.5);
+    let tangent = first.tangent_at(0.5);
+    let tangent = if forward {
+        tangent
+    } else {
+        [-tangent[0], -tangent[1]]
+    };
+    let tangent_length = tangent[0].hypot(tangent[1]);
+    if tangent_length <= 1e-12 {
+        return None;
+    }
+    let left = [-tangent[1] / tangent_length, tangent[0] / tangent_length];
+    let side_sign = if taper_angle > 0.0 { 1.0 } else { -1.0 };
+    let side = [
+        point[0] + left[0] * offset * side_sign,
+        point[1] + left[1] * offset * side_sign,
+    ];
+    let top = crate::geom2d::offset_polyline(&source, offset, side)
+        .into_iter()
+        .filter(|polyline| !polyline.closed)
+        .max_by(|first, second| {
+            let length = |polyline: &crate::geom2d::Polyline| {
+                Curve2::Polyline(polyline.clone())
+                    .segments()
+                    .iter()
+                    .map(Curve2::length)
+                    .sum::<f64>()
+            };
+            length(first).total_cmp(&length(second))
+        })?;
+    let top_profile = Curve2::Polyline(top).segments();
+    if top_profile.len() != profile.len() {
+        return None;
+    }
+    let far = Plane::from_axes(
+        (Vec3::from(plane.origin) + along).to_array(),
+        plane.x_axis,
+        plane.y_axis,
+    );
+    ruled_open_surface(plane, profile, far, &top_profile)
+}
+
+fn ruled_open_surface(
+    base_plane: Plane,
+    base_profile: &[Curve2],
+    top_plane: Plane,
+    top_profile: &[Curve2],
+) -> Option<Body> {
+    if base_profile.is_empty() || base_profile.len() != top_profile.len() {
+        return None;
+    }
+    let base_senses = path_senses(base_profile)?;
+    let top_senses = path_senses(top_profile)?;
+    let chain_points = |profile: &[Curve2], senses: &[bool]| {
+        let mut points = profile
+            .iter()
+            .zip(senses)
+            .map(|(piece, forward)| piece.point_at(if *forward { 0.0 } else { 1.0 }))
+            .collect::<Vec<_>>();
+        points.push(
+            profile
+                .last()?
+                .point_at(if *senses.last()? { 1.0 } else { 0.0 }),
+        );
+        Some(points)
+    };
+    let base_points = chain_points(base_profile, &base_senses)?;
+    let top_points = chain_points(top_profile, &top_senses)?;
+
+    let mut body = Body::new();
+    let lump = body.lumps.insert(Lump {
+        shells: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let shell = body.shells.insert(Shell {
+        faces: Vec::new(),
+        owner: lump,
+        provenance: Provenance::Synthesized,
+    });
+    let base_vertices = base_points
+        .iter()
+        .map(|point| add_vertex(&mut body, base_plane.point_at(*point)))
+        .collect::<Vec<_>>();
+    let top_vertices = top_points
+        .iter()
+        .map(|point| add_vertex(&mut body, top_plane.point_at(*point)))
+        .collect::<Vec<_>>();
+    let mut base_edges = Vec::with_capacity(base_profile.len());
+    let mut top_edges = Vec::with_capacity(top_profile.len());
+    for index in 0..base_profile.len() {
+        let (base_from, base_to) = if base_senses[index] {
+            (base_vertices[index], base_vertices[index + 1])
+        } else {
+            (base_vertices[index + 1], base_vertices[index])
+        };
+        let (top_from, top_to) = if top_senses[index] {
+            (top_vertices[index], top_vertices[index + 1])
+        } else {
+            (top_vertices[index + 1], top_vertices[index])
+        };
+        base_edges.push(add_profile_edge(
+            &mut body,
+            &base_plane,
+            &base_profile[index],
+            base_from,
+            base_to,
+        )?);
+        top_edges.push(add_profile_edge(
+            &mut body,
+            &top_plane,
+            &top_profile[index],
+            top_from,
+            top_to,
+        )?);
+    }
+    let rails = (0..base_vertices.len())
+        .map(|index| add_line_edge(&mut body, base_vertices[index], top_vertices[index]))
+        .collect::<Option<Vec<_>>>()?;
+
+    for index in 0..base_profile.len() {
+        let base = RationalCurve2::from_curve(&base_profile[index])?;
+        let base = if base_senses[index] {
+            base
+        } else {
+            base.reversed()
+        }
+        .lifted(&base_plane);
+        let top = RationalCurve2::from_curve(&top_profile[index])?;
+        let top = if top_senses[index] {
+            top
+        } else {
+            top.reversed()
+        }
+        .lifted(&top_plane);
+        if !base.compatible_with(&top) {
+            return None;
+        }
+        let surface = Surface::Nurbs(base.ruled_to(&top)?);
+        let on = surface.point_at(0.5, 0.5);
+        let expected = Vec3::from(surface.normal_at(0.5, 0.5)?);
+        let surface = body.surfaces.insert(surface);
+        let forward = face_sense(body.surfaces.get(surface)?, on, expected)?;
+        add_wall_with_pcurves(
+            &mut body,
+            shell,
+            surface,
+            forward,
+            &[
+                (base_edges[index], base_senses[index]),
+                (rails[index + 1], true),
+                (top_edges[index], !top_senses[index]),
+                (rails[index], false),
+            ],
+            &[
+                ([0.0, 0.0], [1.0, 0.0]),
+                ([1.0, 0.0], [1.0, 1.0]),
+                ([1.0, 1.0], [0.0, 1.0]),
+                ([0.0, 1.0], [0.0, 0.0]),
+            ],
+        )?;
+    }
+    body.lumps.get_mut(lump)?.shells = vec![shell];
+    body.roots = vec![lump];
+    body.validate().is_empty().then_some(body)
+}
+
 /// Extrudes an outer loop and removes each following loop as a hole.
 pub fn extrude_region(
     plane: Plane,
@@ -263,6 +758,76 @@ pub fn sweep_along(
                 .ok()?
             }
         });
+    }
+    result.filter(|body| !body.roots.is_empty() && body.validate().is_empty())
+}
+
+/// Sweeps a closed profile along a connected three-dimensional line path.
+///
+/// The path start is translated to the profile centre. At each non-collinear
+/// corner the profile frame follows the minimal turn between the adjacent
+/// segments, extending the planar path behaviour without projecting a 3D
+/// polyline onto an arbitrary plane.
+pub fn sweep_along_polyline3d(
+    mut profile_plane: Plane,
+    profile: &[Curve2],
+    path: &[[f64; 3]],
+) -> Option<Body> {
+    if path.len() < 2 || profile_senses(profile).is_none() {
+        return None;
+    }
+    let profile_center = profile
+        .iter()
+        .map(|piece| Vec3::from(profile_plane.point_at(piece.point_at(0.0))))
+        .fold(Vec3::ZERO, |sum, point| sum + point)
+        / profile.len() as f64;
+    let shift = profile_center - Vec3::from(path[0]);
+    let points = path
+        .iter()
+        .map(|point| Vec3::from(*point) + shift)
+        .collect::<Vec<_>>();
+    if points.iter().any(|point| !point.length().is_finite()) {
+        return None;
+    }
+
+    let mut result: Option<Body> = None;
+    let mut previous_direction: Option<Vec3> = None;
+    for (index, pair) in points.windows(2).enumerate() {
+        let direction = pair[1] - pair[0];
+        let tangent = direction.normalize()?;
+        if let Some(previous) = previous_direction {
+            let cross = previous.cross(tangent);
+            let cross_length = cross.length();
+            let dot = previous.dot(tangent).clamp(-1.0, 1.0);
+            if cross_length <= 1e-12 {
+                if dot <= 0.0 {
+                    return None;
+                }
+            } else {
+                profile_plane = turned_plane(
+                    profile_plane,
+                    points[index],
+                    cross / cross_length,
+                    cross_length.atan2(dot),
+                );
+            }
+        }
+        let segment = extrude(profile_plane, profile, direction.to_array())?;
+        profile_plane.origin = (Vec3::from(profile_plane.origin) + direction).to_array();
+        result = Some(match result {
+            None => segment,
+            Some(previous) => {
+                let tolerance = super::operation_tolerance(&[&previous, &segment]);
+                super::boolean::combine(
+                    previous,
+                    segment,
+                    super::boolean::Operation::Union,
+                    tolerance,
+                )
+                .ok()?
+            }
+        });
+        previous_direction = Some(tangent);
     }
     result.filter(|body| !body.roots.is_empty() && body.validate().is_empty())
 }
@@ -1755,6 +2320,23 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[cfg(feature = "offset")]
+    #[test]
+    fn an_open_surface_rejects_invalid_taper_angles() {
+        let profile = [Curve2::Line(Line {
+            start: [0.0, 0.0],
+            end: [10.0, 0.0],
+        })];
+        for angle in [
+            std::f64::consts::FRAC_PI_2,
+            -std::f64::consts::FRAC_PI_2,
+            f64::NAN,
+        ] {
+            assert!(extrude_surface_tapered(Plane::XY, &profile, [0.0, 0.0, 5.0], angle)
+                .is_none());
+        }
     }
 
     #[test]

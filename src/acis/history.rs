@@ -417,7 +417,7 @@ fn path_pieces(curve: &Curve) -> Result<Vec<Curve>, HistoryRebuildError> {
 fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
     if !value.scale_factor.is_finite()
         || value.scale_factor <= 1e-9
-        || value.draft_angle.abs() > 1e-9
+        || !value.draft_angle.is_finite()
         || !value.twist_angle.is_finite()
         || !value.align_angle.is_finite()
     {
@@ -432,27 +432,173 @@ fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError>
         )?,
         value.sweep_entity_transform,
     )?;
-    let path = placed_curve(
-        embedded_curve(
-            value
-                .path_entity
-                .as_ref()
-                .ok_or(HistoryRebuildError::InvalidParameters)?,
-        )?,
+    let profile_pieces = profile_pieces(&profile.curve)?;
+    let path_entity = value
+        .path_entity
+        .as_ref()
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    if let Some(points) = embedded_line_path_3d(path_entity) {
+        if value.align_angle.abs() > 1e-12
+            || value.twist_angle.abs() > 1e-12
+            || (value.scale_factor - 1.0).abs() > 1e-12
+        {
+            return Err(HistoryRebuildError::Unsupported);
+        }
+        let placement = placement(value.path_entity_transform)?;
+        let points = points
+            .into_iter()
+            .map(|point| placement.point(point))
+            .collect::<Vec<_>>();
+        let body = if value.draft_angle.abs() > 1e-12 {
+            if points.len() != 2 {
+                return Err(HistoryRebuildError::Unsupported);
+            }
+            #[cfg(feature = "offset")]
+            {
+                brep::extrude_tapered(
+                    profile.plane,
+                    &profile_pieces,
+                    (Vec3::from(points[1]) - Vec3::from(points[0])).to_array(),
+                    value.draft_angle,
+                )
+            }
+            #[cfg(not(feature = "offset"))]
+            {
+                return Err(HistoryRebuildError::Unsupported);
+            }
+        } else {
+            brep::sweep_along_polyline3d(profile.plane, &profile_pieces, &points)
+        };
+        return finish(body, value.base.transform);
+    }
+    let mut path = placed_curve(
+        embedded_curve(path_entity)?,
         value.path_entity_transform,
     )?;
+    let path_pieces = path_pieces(&path.curve)?;
+    let profile_center = profile_pieces
+        .iter()
+        .map(|piece| Vec3::from(profile.plane.point_at(piece.point_at(0.0))))
+        .fold(Vec3::ZERO, |sum, point| sum + point)
+        / profile_pieces.len() as f64;
+    let path_start = Vec3::from(path.plane.point_at(path.curve.point_at(0.0)));
+    path.plane.origin = (Vec3::from(path.plane.origin) + profile_center - path_start).to_array();
+    if value.draft_angle.abs() > 1e-12 {
+        if value.align_angle.abs() > 1e-12
+            || value.twist_angle.abs() > 1e-12
+            || (value.scale_factor - 1.0).abs() > 1e-12
+            || path_pieces.len() != 1
+        {
+            return Err(HistoryRebuildError::Unsupported);
+        }
+        let Curve::Line(line) = path_pieces[0] else {
+            return Err(HistoryRebuildError::Unsupported);
+        };
+        let direction = Vec3::from(path.plane.point_at(line.end))
+            - Vec3::from(path.plane.point_at(line.start));
+        #[cfg(feature = "offset")]
+        {
+            return finish(
+                brep::extrude_tapered(
+                    profile.plane,
+                    &profile_pieces,
+                    direction.to_array(),
+                    value.draft_angle,
+                ),
+                value.base.transform,
+            );
+        }
+        #[cfg(not(feature = "offset"))]
+        {
+            return Err(HistoryRebuildError::Unsupported);
+        }
+    }
     finish(
         brep::sweep_along_deformed(
             profile.plane,
-            &profile_pieces(&profile.curve)?,
+            &profile_pieces,
             path.plane,
-            &path_pieces(&path.curve)?,
+            &path_pieces,
             value.align_angle,
             value.twist_angle,
             value.scale_factor,
         ),
         value.base.transform,
     )
+}
+
+fn embedded_line_path_3d(entity: &EmbeddedEntity) -> Option<Vec<[f64; 3]>> {
+    let EmbeddedEntity::Spline(value) = entity else {
+        return None;
+    };
+    if value.degree != 1
+        || value.flags.closed
+        || value.control_points.len() < 2
+        || !value.weights.is_empty()
+    {
+        return None;
+    }
+    let points = value
+        .control_points
+        .iter()
+        .map(|point| [point.x, point.y, point.z])
+        .collect::<Vec<_>>();
+    points
+        .windows(2)
+        .all(|pair| (Vec3::from(pair[1]) - Vec3::from(pair[0])).length() > 1e-12)
+        .then_some(points)
+}
+
+fn rebuild_extrusion(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
+    if !value.scale_factor.is_finite()
+        || (value.scale_factor - 1.0).abs() > 1e-9
+        || !value.draft_angle.is_finite()
+        || !value.twist_angle.is_finite()
+        || value.twist_angle.abs() > 1e-9
+        || !value.align_angle.is_finite()
+        || value.align_angle.abs() > 1e-9
+    {
+        return Err(HistoryRebuildError::Unsupported);
+    }
+    let profile = placed_curve(
+        embedded_curve(
+            value
+                .sweep_entity
+                .as_ref()
+                .ok_or(HistoryRebuildError::InvalidParameters)?,
+        )?,
+        value.sweep_entity_transform,
+    )?;
+    let pieces = profile_pieces(&profile.curve)?;
+    let body = if let Some(path) = value.path_entity.as_ref() {
+        if value.draft_angle.abs() > 1e-9 {
+            return Err(HistoryRebuildError::Unsupported);
+        }
+        let mut path = placed_curve(embedded_curve(path)?, value.path_entity_transform)?;
+        let profile_center = pieces
+            .iter()
+            .map(|piece| Vec3::from(profile.plane.point_at(piece.point_at(0.0))))
+            .fold(Vec3::ZERO, |sum, point| sum + point)
+            / pieces.len() as f64;
+        let path_start = Vec3::from(path.plane.point_at(path.curve.point_at(0.0)));
+        path.plane.origin =
+            (Vec3::from(path.plane.origin) + profile_center - path_start).to_array();
+        brep::sweep_along(profile.plane, &pieces, path.plane, &path_pieces(&path.curve)?)
+    } else {
+        let direction = [value.direction.x, value.direction.y, value.direction.z];
+        #[cfg(feature = "offset")]
+        {
+            brep::extrude_tapered(profile.plane, &pieces, direction, value.draft_angle)
+        }
+        #[cfg(not(feature = "offset"))]
+        {
+            if value.draft_angle.abs() > 1e-9 {
+                return Err(HistoryRebuildError::Unsupported);
+            }
+            brep::extrude(profile.plane, &pieces, direction)
+        }
+    };
+    finish(body, value.base.transform)
 }
 
 pub fn rebuild_body(
@@ -546,6 +692,7 @@ pub fn rebuild_body(
                 })
         }
         SolidHistoryOperation::Sweep(value) => rebuild_sweep(value),
+        SolidHistoryOperation::Extrusion(value) => rebuild_extrusion(value),
         _ => Err(HistoryRebuildError::Unsupported),
     }
 }
