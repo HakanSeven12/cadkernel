@@ -551,10 +551,12 @@ fn embedded_line_path_3d(entity: &EmbeddedEntity) -> Option<Vec<[f64; 3]>> {
 
 fn rebuild_extrusion(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
     if !value.scale_factor.is_finite()
-        || value.scale_factor <= 1e-9
+        || (value.scale_factor - 1.0).abs() > 1e-9
         || !value.draft_angle.is_finite()
         || !value.twist_angle.is_finite()
         || value.twist_angle.abs() > 1e-9
+        || !value.align_angle.is_finite()
+        || value.align_angle.abs() > 1e-9
     {
         return Err(HistoryRebuildError::Unsupported);
     }

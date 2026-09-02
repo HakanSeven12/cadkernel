@@ -410,6 +410,11 @@ pub fn extrude_surface_tapered(
     direction: [f64; 3],
     taper_angle: f64,
 ) -> Option<Body> {
+    if !taper_angle.is_finite()
+        || taper_angle.abs() >= std::f64::consts::FRAC_PI_2
+    {
+        return None;
+    }
     if taper_angle.abs() <= 1e-12 {
         return extrude_surface(plane, profile, direction);
     }
@@ -2315,6 +2320,23 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[cfg(feature = "offset")]
+    #[test]
+    fn an_open_surface_rejects_invalid_taper_angles() {
+        let profile = [Curve2::Line(Line {
+            start: [0.0, 0.0],
+            end: [10.0, 0.0],
+        })];
+        for angle in [
+            std::f64::consts::FRAC_PI_2,
+            -std::f64::consts::FRAC_PI_2,
+            f64::NAN,
+        ] {
+            assert!(extrude_surface_tapered(Plane::XY, &profile, [0.0, 0.0, 5.0], angle)
+                .is_none());
+        }
     }
 
     #[test]
