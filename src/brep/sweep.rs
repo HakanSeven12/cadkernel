@@ -1750,7 +1750,7 @@ enum PieceSurface {
 }
 
 #[derive(Clone, Copy)]
-struct TorusArcParameters {
+struct RevolvedArcParameters {
     around: f64,
     start: f64,
     end: f64,
@@ -1878,17 +1878,17 @@ impl Turn {
         )
     }
 
-    /// The rectangular torus parameters traced by one circular profile arc.
+    /// The rectangular surface parameters traced by one circular profile arc.
     ///
     /// A circle centre on the negative side of the axis is represented by a
     /// positive-major-radius torus using a negative ring. That sheet needs a
     /// half-turn longitude shift and the complementary tube angle; retaining
     /// those values as pcurves is what keeps a chord-bounded arc trimmed.
-    fn torus_arc_parameters(
+    fn revolved_arc_parameters(
         &self,
         plane: &Plane,
         arc: &crate::geom2d::Arc,
-    ) -> Option<TorusArcParameters> {
+    ) -> Option<RevolvedArcParameters> {
         let sweep = arc.sweep();
         let middle = arc.start_angle + sweep * 0.5;
         let (sin, cos) = middle.sin_cos();
@@ -1918,14 +1918,14 @@ impl Turn {
         let gamma_start = middle - direction * sweep * 0.5;
         let gamma_end = middle + direction * sweep * 0.5;
         let centre = self.station(plane, arc.centre);
-        if centre.radius < 0.0 {
-            Some(TorusArcParameters {
+        if centre.radius < -self.tolerance {
+            Some(RevolvedArcParameters {
                 around: std::f64::consts::PI,
                 start: std::f64::consts::PI - gamma_start,
                 end: std::f64::consts::PI - gamma_end,
             })
         } else {
-            Some(TorusArcParameters {
+            Some(RevolvedArcParameters {
                 around: 0.0,
                 start: gamma_start,
                 end: gamma_end,
@@ -3056,8 +3056,10 @@ fn revolve_part(
         };
         let next = (index + 1) % profile.len();
         let spline = matches!(surface, Surface::Nurbs(_));
-        let torus_arc = match (&surface, piece) {
-            (Surface::Torus(_), Curve2::Arc(arc)) => Some(turn.torus_arc_parameters(plane, arc)?),
+        let revolved_arc = match (&surface, piece) {
+            (Surface::Sphere(_) | Surface::Torus(_), Curve2::Arc(arc)) => {
+                Some(turn.revolved_arc_parameters(plane, arc)?)
+            }
             _ => None,
         };
         let surface = body.surfaces.insert(surface);
@@ -3083,7 +3085,7 @@ fn revolve_part(
             ];
             let (circuit, pcurves) = reorder_with_pcurves(circuit, pcurves, outward);
             add_wall_with_pcurves(body, shell, surface, forward, &circuit, &pcurves)?;
-        } else if let Some(parameters) = torus_arc {
+        } else if let Some(parameters) = revolved_arc {
             let (start, end) = if senses[index] {
                 (parameters.start, parameters.end)
             } else {
@@ -3197,8 +3199,10 @@ fn revolve_surface_part(
         };
         let next = if closed { (index + 1) % corners.len() } else { index + 1 };
         let spline = matches!(surface, Surface::Nurbs(_));
-        let torus_arc = match (&surface, piece) {
-            (Surface::Torus(_), Curve2::Arc(arc)) => Some(turn.torus_arc_parameters(plane, arc)?),
+        let revolved_arc = match (&surface, piece) {
+            (Surface::Sphere(_) | Surface::Torus(_), Curve2::Arc(arc)) => {
+                Some(turn.revolved_arc_parameters(plane, arc)?)
+            }
             _ => None,
         };
         let surface = body.surfaces.insert(surface);
@@ -3225,7 +3229,7 @@ fn revolve_surface_part(
                 pcurves.push(([start, 1.0], [start, 0.0]));
             }
             add_wall_with_pcurves(body, shell, surface, forward, &circuit, &pcurves)?;
-        } else if let Some(parameters) = torus_arc {
+        } else if let Some(parameters) = revolved_arc {
             let (start, end) = if senses[index] {
                 (parameters.start, parameters.end)
             } else {
@@ -3360,8 +3364,10 @@ fn revolve_whole(
         };
         let next = (index + 1) % count;
         let spline = matches!(surface, Surface::Nurbs(_));
-        let torus_arc = match (&surface, piece) {
-            (Surface::Torus(_), Curve2::Arc(arc)) => Some(turn.torus_arc_parameters(plane, arc)?),
+        let revolved_arc = match (&surface, piece) {
+            (Surface::Torus(_), Curve2::Arc(arc)) => {
+                Some(turn.revolved_arc_parameters(plane, arc)?)
+            }
             _ => None,
         };
         let surface = body.surfaces.insert(surface);
@@ -3409,7 +3415,7 @@ fn revolve_whole(
                 pcurves.push(([end, 0.0], [start, 0.0]));
                 let (circuit, pcurves) = reorder_with_pcurves(circuit, pcurves, outward);
                 add_ring_with_pcurves(body, face, &circuit, &pcurves)?;
-            } else if let Some(parameters) = torus_arc {
+            } else if let Some(parameters) = revolved_arc {
                 let (start, end) = if senses[index] {
                     (parameters.start, parameters.end)
                 } else {
@@ -3542,8 +3548,10 @@ fn revolve_surface_whole(
         };
         let next = if closed { (index + 1) % corner_count } else { index + 1 };
         let spline = matches!(surface, Surface::Nurbs(_));
-        let torus_arc = match (&surface, piece) {
-            (Surface::Torus(_), Curve2::Arc(arc)) => Some(turn.torus_arc_parameters(plane, arc)?),
+        let revolved_arc = match (&surface, piece) {
+            (Surface::Torus(_), Curve2::Arc(arc)) => {
+                Some(turn.revolved_arc_parameters(plane, arc)?)
+            }
             _ => None,
         };
         let surface = body.surfaces.insert(surface);
@@ -3588,7 +3596,7 @@ fn revolve_surface_whole(
                 }
                 pcurves.push(([end, 0.0], [start, 0.0]));
                 add_ring_with_pcurves(body, face, &circuit, &pcurves)?;
-            } else if let Some(parameters) = torus_arc {
+            } else if let Some(parameters) = revolved_arc {
                 let (start, end) = if senses[index] {
                     (parameters.start, parameters.end)
                 } else {
