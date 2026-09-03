@@ -2527,8 +2527,13 @@ pub fn revolve_region(
 ) -> Option<Body> {
     let mut profiles = profiles.iter();
     let mut result = revolve(plane, profiles.next()?, pivot, axis, angle)?;
+    let full = (TAU - angle.abs()).abs() <= 1e-9;
     for hole in profiles {
         let cutter = revolve(plane, hole, pivot, axis, angle)?;
+        if full {
+            append_void_shell(&mut result, &cutter)?;
+            continue;
+        }
         let tolerance = super::operation_tolerance(&[&result, &cutter]);
         result = super::boolean::combine(
             result,
@@ -2540,6 +2545,25 @@ pub fn revolve_region(
         split_revolve_region_shells(&mut result)?;
     }
     (!result.roots.is_empty() && result.validate().is_empty()).then_some(result)
+}
+
+/// A full revolution has no end caps for a hole to cut through. Its revolved
+/// inner loop is therefore already the exact closed void shell we need.
+fn append_void_shell(target: &mut Body, source: &Body) -> Option<()> {
+    let [owner] = target.roots.as_slice() else {
+        return None;
+    };
+    let owner = *owner;
+    let shell = target.shells.insert(Shell {
+        faces: Vec::new(),
+        owner,
+        provenance: Provenance::Synthesized,
+    });
+    for face in source.face_keys().collect::<Vec<_>>() {
+        super::boolean::copy_face(target, source, face, shell, true).ok()?;
+    }
+    target.lumps.get_mut(owner)?.shells.push(shell);
+    Some(())
 }
 
 /// Revolves every loop of a region into one multi-lump sheet body.
@@ -4024,7 +4048,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spline_profile_is_refused_rather_than_approximated() {
+    fn a_spline_profile_extrudes_as_an_exact_nurbs_wall() {
         let profile = vec![
             Curve2::Nurbs(
                 crate::geom2d::NurbsCurve::new(
@@ -4040,7 +4064,13 @@ mod tests {
                 end: [0.0, 0.0],
             }),
         ];
-        assert!(extrude(Plane::XY, &profile, [0.0, 0.0, 1.0]).is_none());
+        let solid = extrude(Plane::XY, &profile, [0.0, 0.0, 1.0])
+            .expect("an exact spline extrusion");
+        assert!(solid.validate().is_empty());
+        assert!(solid
+            .surfaces
+            .iter()
+            .any(|(_, surface)| matches!(surface, Surface::Nurbs(_))));
     }
 
     #[test]
@@ -4335,7 +4365,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spline_profile_will_not_revolve_either() {
+    fn a_spline_profile_revolves_as_an_exact_nurbs_wall() {
         let profile = vec![
             Curve2::Nurbs(
                 crate::geom2d::NurbsCurve::new(
@@ -4351,7 +4381,83 @@ mod tests {
                 end: [1.0, 0.0],
             }),
         ];
-        assert!(revolve(half_plane(), &profile, [0.0; 3], [0.0, 0.0, 1.0], TAU).is_none());
+        let solid = revolve(half_plane(), &profile, [0.0; 3], [0.0, 0.0, 1.0], TAU)
+            .expect("an exact spline revolution");
+        assert!(solid.validate().is_empty());
+        assert!(solid
+            .surfaces
+            .iter()
+            .any(|(_, surface)| matches!(surface, Surface::Nurbs(_))));
+    }
+
+    #[test]
+    fn an_open_profile_revolves_into_a_sheet() {
+        let profile = [Curve2::Line(Line {
+            start: [2.0, 0.0],
+            end: [2.0, 4.0],
+        })];
+        let sheet = revolve_surface(
+            half_plane(),
+            &profile,
+            [0.0; 3],
+            [0.0, 0.0, 1.0],
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("a cylindrical sheet");
+        assert_eq!(sheet.faces.len(), 1);
+        assert!(sheet.validate().is_empty());
+    }
+
+    #[test]
+    fn a_revolved_region_keeps_its_hole() {
+        let outer = ring(&[[2.0, 0.0], [5.0, 0.0], [5.0, 4.0], [2.0, 4.0]]);
+        let hole = ring(&[[3.0, 1.0], [4.0, 1.0], [4.0, 3.0], [3.0, 3.0]]);
+        let solid = revolve_region(
+            half_plane(),
+            &[outer, hole],
+            [0.0; 3],
+            [0.0, 0.0, 1.0],
+            TAU,
+        )
+        .expect("a revolved region with a void");
+        assert!(solid.validate().is_empty());
+        assert_eq!(solid.roots.len(), 1);
+        let shells = &solid.lumps.get(solid.roots[0]).unwrap().shells;
+        assert_eq!(shells.len(), 2, "an exterior and a void shell");
+        let expected = std::f64::consts::PI * ((25.0 - 4.0) * 4.0 - (16.0 - 9.0) * 2.0);
+        assert!(measures(volume(&solid), expected), "{}", volume(&solid));
+    }
+
+    #[test]
+    fn a_partial_revolved_region_opens_its_hole_through_both_caps() {
+        let outer = ring(&[[2.0, 0.0], [5.0, 0.0], [5.0, 4.0], [2.0, 4.0]]);
+        let hole = ring(&[[3.0, 1.0], [4.0, 1.0], [4.0, 3.0], [3.0, 3.0]]);
+        let solid = revolve_region(
+            half_plane(),
+            &[outer, hole],
+            [0.0; 3],
+            [0.0, 0.0, 1.0],
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("a partial revolved region with an open hole");
+        assert!(solid.validate().is_empty());
+        assert_eq!(solid.roots.len(), 1);
+    }
+
+    #[test]
+    fn every_loop_of_a_surface_region_remains_a_separate_sheet() {
+        let outer = ring(&[[2.0, 0.0], [5.0, 0.0], [5.0, 4.0], [2.0, 4.0]]);
+        let hole = ring(&[[3.0, 1.0], [4.0, 1.0], [4.0, 3.0], [3.0, 3.0]]);
+        let sheets = revolve_surface_region(
+            half_plane(),
+            &[outer, hole],
+            [0.0; 3],
+            [0.0, 0.0, 1.0],
+            TAU,
+        )
+        .expect("two revolved sheets");
+        assert!(sheets.validate().is_empty());
+        assert_eq!(sheets.roots.len(), 2);
     }
 
     #[test]
