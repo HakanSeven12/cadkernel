@@ -1739,6 +1739,68 @@ enum PieceSurface {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Default)]
+struct RadialReach {
+    negative: bool,
+    positive: bool,
+}
+
+impl RadialReach {
+    fn from_bounds(low: f64, high: f64, tolerance: f64) -> Option<Self> {
+        if !low.is_finite() || !high.is_finite() || low > high {
+            return None;
+        }
+        Some(Self {
+            negative: low < -tolerance,
+            positive: high > tolerance,
+        })
+    }
+
+    fn include(&mut self, other: Self) {
+        self.negative |= other.negative;
+        self.positive |= other.positive;
+    }
+
+    fn collapsed(self) -> bool {
+        !self.negative && !self.positive
+    }
+
+    fn straddles(self) -> bool {
+        self.negative && self.positive
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProjectionBounds {
+    low: f64,
+    high: f64,
+}
+
+impl ProjectionBounds {
+    fn new(first: f64, second: f64) -> Option<Self> {
+        if !first.is_finite() || !second.is_finite() {
+            return None;
+        }
+        Some(Self {
+            low: first.min(second),
+            high: first.max(second),
+        })
+    }
+
+    fn include(&mut self, other: Self) {
+        self.low = self.low.min(other.low);
+        self.high = self.high.max(other.high);
+    }
+
+    fn magnitude(self) -> f64 {
+        self.low.abs().max(self.high.abs())
+    }
+
+    fn span(self) -> f64 {
+        self.high - self.low
+    }
+}
+
 /// The frame a revolution turns in.
 struct Turn {
     /// A point on the axis.
@@ -1811,6 +1873,299 @@ impl Turn {
         )
     }
 
+    fn trigonometric_projection_bounds(
+        centre: f64,
+        cosine: f64,
+        sine: f64,
+        start: f64,
+        sweep: f64,
+    ) -> Option<ProjectionBounds> {
+        let end = start + sweep;
+        if !centre.is_finite()
+            || !cosine.is_finite()
+            || !sine.is_finite()
+            || !start.is_finite()
+            || !sweep.is_finite()
+            || !end.is_finite()
+            || sweep <= 0.0
+        {
+            return None;
+        }
+        let at = |parameter: f64| centre + cosine * parameter.cos() + sine * parameter.sin();
+        let mut bounds = ProjectionBounds::new(at(start), at(end))?;
+        let maximum = sine.atan2(cosine);
+        for parameter in [maximum, maximum + TAU * 0.5] {
+            let offset = (parameter - start).rem_euclid(TAU);
+            if sweep >= TAU - 1e-12 || offset <= sweep + 1e-12 {
+                let value = at(parameter);
+                bounds.include(ProjectionBounds::new(value, value)?);
+            }
+        }
+        Some(bounds)
+    }
+
+    fn trigonometric_radial_reach(
+        &self,
+        centre: f64,
+        cosine: f64,
+        sine: f64,
+        start: f64,
+        sweep: f64,
+    ) -> Option<RadialReach> {
+        let bounds = Self::trigonometric_projection_bounds(centre, cosine, sine, start, sweep)?;
+        RadialReach::from_bounds(bounds.low, bounds.high, self.tolerance)
+    }
+
+    fn valid_nurbs(curve: &crate::geom2d::NurbsCurve) -> bool {
+        let (domain_start, domain_end) = curve.domain();
+        domain_start.is_finite()
+            && domain_end.is_finite()
+            && domain_end > domain_start
+            && curve.knots().iter().all(|value| value.is_finite())
+            && curve.knots().windows(2).all(|pair| pair[0] <= pair[1])
+            && curve
+                .control_points()
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+            && curve
+                .weights()
+                .iter()
+                .all(|weight| weight.is_finite() && *weight > 0.0)
+    }
+
+    fn nurbs_control_projection_bounds(
+        plane: &Plane,
+        curve: &crate::geom2d::NurbsCurve,
+        origin: Vec3,
+        direction: Vec3,
+    ) -> Option<ProjectionBounds> {
+        let mut values = curve
+            .control_points()
+            .iter()
+            .map(|point| (Vec3::from(plane.point_at(*point)) - origin).dot(direction));
+        let first = values.next()?;
+        let mut bounds = ProjectionBounds::new(first, first)?;
+        for value in values {
+            bounds.include(ProjectionBounds::new(value, value)?);
+        }
+        Some(bounds)
+    }
+
+    /// Tightens positive-weight control-hull bounds without sampling away
+    /// narrow knot features. A refinement limit falls back to the enclosing
+    /// hull, so the result remains conservative.
+    fn nurbs_projection_bounds(
+        plane: &Plane,
+        curve: &crate::geom2d::NurbsCurve,
+        origin: Vec3,
+        direction: Vec3,
+    ) -> Option<ProjectionBounds> {
+        if !Self::valid_nurbs(curve) {
+            return None;
+        }
+
+        const MAX_DEPTH: usize = 48;
+        const MAX_SPLITS: usize = 8192;
+        let mut pending = vec![(curve.clone(), 0_usize)];
+        let mut splits = 0_usize;
+        let mut result: Option<ProjectionBounds> = None;
+        while let Some((span, depth)) = pending.pop() {
+            let hull =
+                Self::nurbs_control_projection_bounds(plane, &span, origin, direction)?;
+            let mut samples: Option<ProjectionBounds> = None;
+            for parameter in [0.0, 0.5, 1.0] {
+                let point = Vec3::from(plane.point_at(span.point_at(parameter)));
+                let value = (point - origin).dot(direction);
+                let value = ProjectionBounds::new(value, value)?;
+                match &mut samples {
+                    Some(bounds) => bounds.include(value),
+                    None => samples = Some(value),
+                }
+            }
+            let samples = samples?;
+            let slack = (samples.low - hull.low)
+                .max(hull.high - samples.high)
+                .max(0.0);
+            let refinement_scale = hull.magnitude().max(hull.span()).max(1.0);
+            let resolved = slack <= 1e-10 * refinement_scale;
+
+            if !resolved && depth < MAX_DEPTH && splits < MAX_SPLITS {
+                if let Some((first, second)) = span.split_at(0.5) {
+                    splits += 1;
+                    pending.push((second, depth + 1));
+                    pending.push((first, depth + 1));
+                    continue;
+                }
+            }
+
+            match &mut result {
+                Some(bounds) => bounds.include(hull),
+                None => result = Some(hull),
+            }
+        }
+        result
+    }
+
+    fn piece_projection_bounds(
+        plane: &Plane,
+        piece: &Curve2,
+        origin: Vec3,
+        direction: Vec3,
+    ) -> Option<ProjectionBounds> {
+        let project = |point: [f64; 2]| {
+            (Vec3::from(plane.point_at(point)) - origin).dot(direction)
+        };
+        match piece {
+            Curve2::Line(line) => ProjectionBounds::new(project(line.start), project(line.end)),
+            Curve2::Arc(arc) => Self::trigonometric_projection_bounds(
+                project(arc.centre),
+                Vec3::from(plane.vector_at([arc.radius, 0.0])).dot(direction),
+                Vec3::from(plane.vector_at([0.0, arc.radius])).dot(direction),
+                arc.start_angle,
+                arc.sweep(),
+            ),
+            Curve2::Ellipse(arc) => {
+                let ellipse = arc.ellipse;
+                let minor = ellipse.minor_axis();
+                Self::trigonometric_projection_bounds(
+                    project(ellipse.centre),
+                    Vec3::from(plane.vector_at([
+                        ellipse.major_axis[0] * ellipse.major_radius,
+                        ellipse.major_axis[1] * ellipse.major_radius,
+                    ]))
+                    .dot(direction),
+                    Vec3::from(plane.vector_at([
+                        minor[0] * ellipse.minor_radius,
+                        minor[1] * ellipse.minor_radius,
+                    ]))
+                    .dot(direction),
+                    arc.start_parameter,
+                    arc.sweep(),
+                )
+            }
+            Curve2::Nurbs(curve) => {
+                Self::nurbs_projection_bounds(plane, curve, origin, direction)
+            }
+            _ => None,
+        }
+    }
+
+    fn nurbs_control_reach(
+        &self,
+        plane: &Plane,
+        curve: &crate::geom2d::NurbsCurve,
+    ) -> Option<RadialReach> {
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        for point in curve.control_points() {
+            let radius = self.station(plane, *point).radius;
+            low = low.min(radius);
+            high = high.max(radius);
+        }
+        RadialReach::from_bounds(low, high, self.tolerance)
+    }
+
+    /// Conservative convex-hull classification refined by exact subdivision.
+    /// Positive rational weights keep each span inside its control polygon.
+    fn nurbs_radial_reach(
+        &self,
+        plane: &Plane,
+        curve: &crate::geom2d::NurbsCurve,
+    ) -> Option<RadialReach> {
+        if !Self::valid_nurbs(curve) {
+            return None;
+        }
+
+        const MAX_DEPTH: usize = 48;
+        const MAX_SPANS: usize = 8192;
+        let mut pending = vec![(curve.clone(), 0_usize)];
+        let mut visited = 0_usize;
+        let mut reach = RadialReach::default();
+        while let Some((span, depth)) = pending.pop() {
+            visited += 1;
+            let possible = self.nurbs_control_reach(plane, &span)?;
+            if possible.collapsed() {
+                continue;
+            }
+
+            let mut proven = RadialReach::default();
+            for parameter in [0.0, 0.5, 1.0] {
+                let radius = self.station(plane, span.point_at(parameter)).radius;
+                proven.include(RadialReach::from_bounds(
+                    radius,
+                    radius,
+                    self.tolerance,
+                )?);
+            }
+            reach.include(proven);
+            if reach.straddles() {
+                return Some(reach);
+            }
+
+            let unresolved = (possible.negative && !proven.negative)
+                || (possible.positive && !proven.positive);
+            if !unresolved {
+                continue;
+            }
+            if depth >= MAX_DEPTH || visited >= MAX_SPANS {
+                // The hull still permits a crossing. Refuse rather than let a
+                // narrow self-intersection through on an arbitrary sample.
+                return None;
+            }
+            let (first, second) = span.split_at(0.5)?;
+            pending.push((second, depth + 1));
+            pending.push((first, depth + 1));
+        }
+        Some(reach)
+    }
+
+    fn piece_radial_reach(&self, plane: &Plane, piece: &Curve2) -> Option<RadialReach> {
+        match piece {
+            Curve2::Line(line) => {
+                let first = self.station(plane, line.start).radius;
+                let second = self.station(plane, line.end).radius;
+                RadialReach::from_bounds(first.min(second), first.max(second), self.tolerance)
+            }
+            Curve2::Arc(arc) => {
+                let centre = self.station(plane, arc.centre).radius;
+                let cosine = Vec3::from(plane.vector_at([arc.radius, 0.0])).dot(self.radial);
+                let sine = Vec3::from(plane.vector_at([0.0, arc.radius])).dot(self.radial);
+                self.trigonometric_radial_reach(
+                    centre,
+                    cosine,
+                    sine,
+                    arc.start_angle,
+                    arc.sweep(),
+                )
+            }
+            Curve2::Ellipse(arc) => {
+                let ellipse = arc.ellipse;
+                let centre = self.station(plane, ellipse.centre).radius;
+                let minor = ellipse.minor_axis();
+                let cosine = Vec3::from(plane.vector_at([
+                    ellipse.major_axis[0] * ellipse.major_radius,
+                    ellipse.major_axis[1] * ellipse.major_radius,
+                ]))
+                .dot(self.radial);
+                let sine = Vec3::from(plane.vector_at([
+                    minor[0] * ellipse.minor_radius,
+                    minor[1] * ellipse.minor_radius,
+                ]))
+                .dot(self.radial);
+                self.trigonometric_radial_reach(
+                    centre,
+                    cosine,
+                    sine,
+                    arc.start_parameter,
+                    arc.sweep(),
+                )
+            }
+            Curve2::Nurbs(curve) => self.nurbs_radial_reach(plane, curve),
+            _ => None,
+        }
+    }
+
     /// The surface a profile piece sweeps into, and whether it is flat.
     ///
     /// This is the whole of why a revolution produces analytic geometry: a
@@ -1820,14 +2175,18 @@ impl Turn {
     /// pieces stay distinct so callers can omit only the former; `None`
     /// remains reserved for invalid geometry or a failed construction.
     fn piece_surface(&self, plane: &Plane, piece: &Curve2) -> Option<PieceSurface> {
+        if !matches!(
+            piece,
+            Curve2::Line(_) | Curve2::Arc(_) | Curve2::Ellipse(_) | Curve2::Nurbs(_)
+        ) {
+            return Some(PieceSurface::Unsupported);
+        }
+        if self.piece_radial_reach(plane, piece)?.collapsed() {
+            return Some(PieceSurface::CollapsedAxis);
+        }
         match piece {
             Curve2::Line(line) => {
                 let (a, b) = (self.station(plane, line.start), self.station(plane, line.end));
-                if a.radius <= self.tolerance && b.radius <= self.tolerance {
-                    // On the axis. It sweeps into the axis, which is not a
-                    // face — a cone has no wall where its apex is.
-                    return Some(PieceSurface::CollapsedAxis);
-                }
                 if (b.height - a.height).abs() <= self.tolerance {
                     Some(PieceSurface::Surface(
                         Surface::Plane(self.circle(a.height)?),
@@ -2462,45 +2821,68 @@ impl Turn {
             tolerance: 0.0,
         };
 
-        // Which side of the axis the profile is on, and how big it is. Both
-        // are read off the same sweep of sample points, taken densely enough
-        // that an arc bulging across the axis is caught as well as a corner
-        // sitting over it.
-        let scale_origin = Vec3::from(plane.point_at(profile.first()?.point_at(0.0)));
-        let mut radial_reach: f64 = 0.0;
-        let mut height_range = (0.0_f64, 0.0_f64);
-        let mut reach = (0.0_f64, 0.0_f64);
+        // Measure radius from the axis and height from the profile itself.
+        // This keeps tolerance independent of where the pivot lies along the
+        // axis. Every bound below encloses the whole piece without a fixed
+        // parameter grid.
+        let first = profile.iter().find(|piece| {
+            matches!(
+                piece,
+                Curve2::Line(_) | Curve2::Arc(_) | Curve2::Ellipse(_) | Curve2::Nurbs(_)
+            )
+        })?;
+        let scale_origin = Vec3::from(plane.point_at(first.point_at(0.0)));
+        let mut radial_bounds: Option<ProjectionBounds> = None;
+        let mut height_bounds: Option<ProjectionBounds> = None;
         for piece in profile {
-            let steps = if matches!(piece, Curve2::Ellipse(_) | Curve2::Nurbs(_)) {
-                64
-            } else {
-                8
-            };
-            for step in 0..=steps {
-                let uv = piece.point_at(step as f64 / steps as f64);
-                let point = plane.point_at(uv);
-                let station = turn.station(plane, uv);
-                let local_height = (Vec3::from(point) - scale_origin).dot(turn.axis);
-                radial_reach = radial_reach.max(station.radius.abs());
-                height_range = (
-                    height_range.0.min(local_height),
-                    height_range.1.max(local_height),
-                );
-                reach = (reach.0.min(station.radius), reach.1.max(station.radius));
+            if !matches!(
+                piece,
+                Curve2::Line(_) | Curve2::Arc(_) | Curve2::Ellipse(_) | Curve2::Nurbs(_)
+            ) {
+                continue;
+            }
+            let piece_radial =
+                Self::piece_projection_bounds(plane, piece, turn.pivot, turn.radial)?;
+            let piece_height =
+                Self::piece_projection_bounds(plane, piece, scale_origin, turn.axis)?;
+            match &mut radial_bounds {
+                Some(bounds) => bounds.include(piece_radial),
+                None => radial_bounds = Some(piece_radial),
+            }
+            match &mut height_bounds {
+                Some(bounds) => bounds.include(piece_height),
+                None => height_bounds = Some(piece_height),
             }
         }
-        let profile_scale = radial_reach.max(height_range.1 - height_range.0);
+        let profile_scale = radial_bounds?.magnitude().max(height_bounds?.span());
         turn.tolerance = 1e-9 * profile_scale.max(1.0);
         if profile_scale <= turn.tolerance {
             return None;
         }
-        if reach.0 < -turn.tolerance && reach.1 > turn.tolerance {
+
+        let mut reach = RadialReach::default();
+        for piece in profile {
+            if !matches!(
+                piece,
+                Curve2::Line(_) | Curve2::Arc(_) | Curve2::Ellipse(_) | Curve2::Nurbs(_)
+            ) {
+                continue;
+            }
+            reach.include(turn.piece_radial_reach(plane, piece)?);
+            if reach.straddles() {
+                break;
+            }
+        }
+        if reach.straddles() {
             // It straddles the axis, so the solid would be swept through
             // itself. Refusing says so rather than handing back a shape whose
             // inside is not a region.
             return None;
         }
-        if reach.1 <= turn.tolerance {
+        if reach.collapsed() {
+            return None;
+        }
+        if !reach.positive {
             // All on the far side. Zero angle belongs on the profile, so the
             // frame turns to meet it rather than the radii being negated.
             turn.radial = -turn.radial;
