@@ -355,6 +355,14 @@ fn profile_pieces(curve: &Curve) -> Result<Vec<Curve>, HistoryRebuildError> {
                 })
                 .collect()
         }
+        Curve::Nurbs(value) if curve.is_closed() => (0..4)
+            .map(|part| {
+                value
+                    .trimmed(part as f64 / 4.0, (part + 1) as f64 / 4.0)
+                    .map(Curve::Nurbs)
+                    .ok_or(HistoryRebuildError::InvalidParameters)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         _ => return Err(HistoryRebuildError::InvalidParameters),
     };
     (pieces.len() >= 3)

@@ -305,7 +305,7 @@ pub fn extrude_surface(
     body.validate().is_empty().then_some(body)
 }
 
-/// Extrudes a closed line-and-arc profile with a constant taper angle.
+/// Extrudes a closed profile with a constant taper angle.
 ///
 /// A positive angle moves the far outline inward and a negative angle moves
 /// it outward. The offset distance is measured perpendicular to the profile
@@ -331,6 +331,149 @@ pub fn extrude_tapered(
     let offset = height * taper_angle.tan().abs();
     if !offset.is_finite() || offset <= 1e-12 {
         return None;
+    }
+
+    // A closed ellipse is stored as four compatible ellipse arcs. Keep that
+    // exact curved representation while changing both radii by the requested
+    // wall offset; feeding it through the line-and-arc offsetter would either
+    // reject it or turn a smooth profile into a faceted polygon. Inward draft
+    // stops when either semi-axis reaches the centre instead of crossing it
+    // and widening again.
+    if let Some(ellipse) = profile.first().and_then(|piece| match piece {
+        Curve2::Ellipse(arc) => Some(arc.ellipse),
+        _ => None,
+    }) {
+        let is_single_ellipse = profile.iter().all(|piece| {
+            matches!(piece, Curve2::Ellipse(arc) if arc.ellipse == ellipse)
+        });
+        if is_single_ellipse {
+            let radius_delta = if taper_angle > 0.0 { -offset } else { offset };
+            let major_radius = ellipse.major_radius + radius_delta;
+            let minor_radius = ellipse.minor_radius + radius_delta;
+            let scale = ellipse
+                .major_radius
+                .abs()
+                .max(ellipse.minor_radius.abs())
+                .max(1.0);
+            if !major_radius.is_finite()
+                || !minor_radius.is_finite()
+                || major_radius <= scale * 1e-12
+                || minor_radius <= scale * 1e-12
+            {
+                return None;
+            }
+            let top_profile = profile
+                .iter()
+                .map(|piece| {
+                    let Curve2::Ellipse(arc) = piece else {
+                        return None;
+                    };
+                    let mut top = *arc;
+                    top.ellipse.major_radius = major_radius;
+                    top.ellipse.minor_radius = minor_radius;
+                    Some(Curve2::Ellipse(top))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let far = Plane::from_axes(
+                (Vec3::from(plane.origin) + along).to_array(),
+                plane.x_axis,
+                plane.y_axis,
+            );
+            return super::loft::loft(&[(plane, profile.to_vec()), (far, top_profile)]);
+        }
+    }
+
+    // Closed splines are divided into compatible NURBS pieces by the history
+    // reader. An affine scale about the sampled profile centroid preserves
+    // their exact degree, knots and weights, which in turn keeps every ruled
+    // wall smooth and compatible. The nearest sampled boundary point defines
+    // the inward limit, so the grip stops before the outline can pass through
+    // its centre and grow on the other side.
+    if profile.iter().all(|piece| matches!(piece, Curve2::Nurbs(_))) {
+        let mut boundary = Vec::new();
+        for (piece, forward) in profile.iter().zip(&senses) {
+            let Curve2::Nurbs(curve) = piece else {
+                return None;
+            };
+            let mut points = curve.tessellate(16);
+            if !*forward {
+                points.reverse();
+            }
+            let skip = usize::from(boundary.last() == points.first());
+            boundary.extend_from_slice(&points[skip..]);
+        }
+        if boundary.len() > 2 && boundary.first() == boundary.last() {
+            boundary.pop();
+        }
+        if boundary.len() < 3 {
+            return None;
+        }
+        let mut area_twice = 0.0;
+        let mut centroid_sum = [0.0, 0.0];
+        for index in 0..boundary.len() {
+            let current = boundary[index];
+            let next = boundary[(index + 1) % boundary.len()];
+            let cross = current[0] * next[1] - next[0] * current[1];
+            area_twice += cross;
+            centroid_sum[0] += (current[0] + next[0]) * cross;
+            centroid_sum[1] += (current[1] + next[1]) * cross;
+        }
+        if !area_twice.is_finite() || area_twice.abs() <= 1e-12 {
+            return None;
+        }
+        let centre = [
+            centroid_sum[0] / (3.0 * area_twice),
+            centroid_sum[1] / (3.0 * area_twice),
+        ];
+        if !centre.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        let nearest = boundary
+            .iter()
+            .map(|point| (point[0] - centre[0]).hypot(point[1] - centre[1]))
+            .fold(f64::INFINITY, f64::min);
+        if !nearest.is_finite() || nearest <= 1e-12 {
+            return None;
+        }
+        let scale = if taper_angle > 0.0 {
+            1.0 - offset / nearest
+        } else {
+            1.0 + offset / nearest
+        };
+        if !scale.is_finite() || scale <= 1e-12 {
+            return None;
+        }
+        let top_profile = profile
+            .iter()
+            .map(|piece| {
+                let Curve2::Nurbs(curve) = piece else {
+                    return None;
+                };
+                let points = curve
+                    .control_points()
+                    .iter()
+                    .map(|point| {
+                        [
+                            centre[0] + (point[0] - centre[0]) * scale,
+                            centre[1] + (point[1] - centre[1]) * scale,
+                        ]
+                    })
+                    .collect();
+                crate::geom2d::NurbsCurve::new_strict(
+                    curve.degree(),
+                    points,
+                    curve.knots().to_vec(),
+                    curve.weights().to_vec(),
+                )
+                .map(Curve2::Nurbs)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let far = Plane::from_axes(
+            (Vec3::from(plane.origin) + along).to_array(),
+            plane.x_axis,
+            plane.y_axis,
+        );
+        return super::loft::loft(&[(plane, profile.to_vec()), (far, top_profile)]);
     }
 
     let mut vertices = Vec::with_capacity(profile.len());
@@ -367,6 +510,14 @@ pub fn extrude_tapered(
     } else {
         [-tangent[0], -tangent[1]]
     };
+    let tangent_length = tangent[0].hypot(tangent[1]);
+    if !tangent_length.is_finite() || tangent_length <= 1e-12 {
+        return None;
+    }
+    let tangent = [
+        tangent[0] / tangent_length,
+        tangent[1] / tangent_length,
+    ];
     let inward = if signed_area > 0.0 {
         [-tangent[1], tangent[0]]
     } else {
@@ -393,6 +544,39 @@ pub fn extrude_tapered(
     let top_profile = Curve2::Polyline(top).segments();
     if top_profile.len() != profile.len() {
         return None;
+    }
+    // A closed inward offset can survive numerically after the outline has
+    // collapsed: the offset library then returns a loop on the far side of
+    // the medial axis. That loop grows again as the requested inset grows,
+    // which makes an interactive draft grip reverse from narrowing to
+    // widening. A valid parallel outline remains exactly `offset` away from
+    // its source and encloses less area. Do not compare winding here:
+    // `profile_senses` may legitimately choose the reverse traversal while
+    // the offset polyline keeps its source storage order.
+    if taper_angle > 0.0 {
+        let coordinate_scale = source
+            .vertices
+            .iter()
+            .flat_map(|vertex| vertex.position)
+            .map(f64::abs)
+            .fold(offset.max(1.0), f64::max);
+        let tolerance = crate::geom2d::Tolerance::new(
+            (offset * 1e-5).max(coordinate_scale * 1e-10).max(1e-9),
+        );
+        if top_profile.iter().any(|piece| {
+            let point = piece.point_at(0.5);
+            let distance = profile
+                .iter()
+                .map(|source_piece| crate::geom2d::distance_to(source_piece, point))
+                .fold(f64::INFINITY, f64::min);
+            !distance.is_finite() || (distance - offset).abs() > tolerance.linear()
+        }) {
+            return None;
+        }
+        let top_area = top_profile.iter().map(Curve2::enclosed_area).sum::<f64>();
+        if !top_area.is_finite() || top_area.abs() >= signed_area.abs() {
+            return None;
+        }
     }
     let far = Plane::from_axes(
         (Vec3::from(plane.origin) + along).to_array(),
