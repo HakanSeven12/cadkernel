@@ -38,13 +38,13 @@
 use super::geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
 use super::nurbs_builder::RationalCurve2;
 use super::topology::{
-    Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, FaceKey, Loop, LoopKey, Lump, Shell, ShellKey,
-    SurfaceKey, Vertex, VertexKey,
+    Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, FaceKey, Loop, LoopKey, Lump, LumpKey, Shell,
+    ShellKey, SurfaceKey, Vertex, VertexKey,
 };
 use super::Provenance;
 use crate::geom2d::Curve as Curve2;
 use crate::space::{Plane, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::f64::consts::TAU;
 
 /// Extrudes a closed profile along `direction`.
@@ -1286,10 +1286,11 @@ fn path_senses(path: &[Curve2]) -> Option<Vec<bool>> {
 /// judged against, so both of its directions are tried and whichever closes
 /// the loop is the answer.
 ///
-/// `None` when the chain does not close either way, or has fewer than three
-/// pieces — neither describes an outline with an inside.
+/// `None` when the chain does not close either way. Whether the closed chain
+/// encloses an area is a separate question: one full conic can be a valid
+/// outline, while three backtracking lines can enclose nothing.
 pub(super) fn profile_senses(profile: &[Curve2]) -> Option<Vec<bool>> {
-    if profile.len() < 3 {
+    if profile.is_empty() {
         return None;
     }
     [true, false].into_iter().find_map(|first| {
@@ -1731,6 +1732,13 @@ struct Station {
     height: f64,
 }
 
+#[derive(Clone)]
+enum PieceSurface {
+    CollapsedAxis,
+    Surface(Surface, bool),
+    Unsupported,
+}
+
 /// The frame a revolution turns in.
 struct Turn {
     /// A point on the axis.
@@ -1791,27 +1799,42 @@ impl Turn {
         )
     }
 
+    /// Face orientation sampled halfway through the turn. NURBS normals are
+    /// evaluated at their parameter-domain midpoint, so their comparison
+    /// direction and point must be at that same angular station.
+    fn face_sense(&self, surface: &Surface, on: [f64; 3], out: Vec3) -> Option<bool> {
+        let halfway = self.angle * 0.5;
+        face_sense(
+            surface,
+            self.moved(on, halfway),
+            self.turned(out, halfway),
+        )
+    }
+
     /// The surface a profile piece sweeps into, and whether it is flat.
     ///
     /// This is the whole of why a revolution produces analytic geometry: a
     /// line parallel to the axis traces a cylinder, one across it a plane,
     /// one at a slant a cone, and an arc a sphere or a torus depending on
-    /// whether its centre is on the axis. `None` means the piece lies on the
-    /// axis and sweeps into nothing at all — or is a kind with no analytic
-    /// answer, which is refused rather than approximated.
-    fn piece_surface(&self, plane: &Plane, piece: &Curve2) -> Option<(Surface, bool)> {
+    /// whether its centre is on the axis. Axis-collapsed and unsupported
+    /// pieces stay distinct so callers can omit only the former; `None`
+    /// remains reserved for invalid geometry or a failed construction.
+    fn piece_surface(&self, plane: &Plane, piece: &Curve2) -> Option<PieceSurface> {
         match piece {
             Curve2::Line(line) => {
                 let (a, b) = (self.station(plane, line.start), self.station(plane, line.end));
                 if a.radius <= self.tolerance && b.radius <= self.tolerance {
                     // On the axis. It sweeps into the axis, which is not a
                     // face — a cone has no wall where its apex is.
-                    return None;
+                    return Some(PieceSurface::CollapsedAxis);
                 }
                 if (b.height - a.height).abs() <= self.tolerance {
-                    Some((Surface::Plane(self.circle(a.height)?), true))
+                    Some(PieceSurface::Surface(
+                        Surface::Plane(self.circle(a.height)?),
+                        true,
+                    ))
                 } else if (b.radius - a.radius).abs() <= self.tolerance {
-                    Some((
+                    Some(PieceSurface::Surface(
                         Surface::Cylinder(Cylinder {
                             base: self.circle(a.height)?,
                             radius: a.radius,
@@ -1819,7 +1842,7 @@ impl Turn {
                         false,
                     ))
                 } else {
-                    Some((
+                    Some(PieceSurface::Surface(
                         Surface::Cone(Cone {
                             base: self.circle(a.height)?,
                             radius: a.radius,
@@ -1833,8 +1856,8 @@ impl Turn {
             }
             Curve2::Arc(arc) => {
                 let centre = self.station(plane, arc.centre);
-                if centre.radius <= self.tolerance {
-                    Some((
+                if centre.radius.abs() <= self.tolerance {
+                    Some(PieceSurface::Surface(
                         Surface::Sphere(Sphere {
                             frame: self.circle(centre.height)?,
                             radius: arc.radius,
@@ -1842,10 +1865,10 @@ impl Turn {
                         false,
                     ))
                 } else {
-                    Some((
+                    Some(PieceSurface::Surface(
                         Surface::Torus(Torus {
                             frame: self.circle(centre.height)?,
-                            major_radius: centre.radius,
+                            major_radius: centre.radius.abs(),
                             minor_radius: arc.radius,
                         }),
                         false,
@@ -1890,9 +1913,9 @@ impl Turn {
                     weights,
                 )?
                 .with_periodicity(false, self.full);
-                Some((Surface::Nurbs(surface), false))
+                Some(PieceSurface::Surface(Surface::Nurbs(surface), false))
             }
-            _ => None,
+            _ => Some(PieceSurface::Unsupported),
         }
     }
 }
@@ -2059,8 +2082,7 @@ pub fn revolve_surface(
         )?;
     }
 
-    body.lumps.get_mut(lump)?.shells = vec![shell];
-    body.roots = vec![lump];
+    split_revolve_surface_components(&mut body, lump, shell)?;
     body.validate().is_empty().then_some(body)
 }
 
@@ -2084,6 +2106,7 @@ pub fn revolve_region(
             tolerance,
         )
         .ok()?;
+        split_revolve_region_shells(&mut result)?;
     }
     (!result.roots.is_empty() && result.validate().is_empty()).then_some(result)
 }
@@ -2104,6 +2127,148 @@ pub fn revolve_surface_region(
         )?;
     }
     (!result.roots.is_empty() && result.validate().is_empty()).then_some(result)
+}
+
+/// Connected face components, with adjacency defined by sharing an edge.
+///
+/// Seams name the same face twice and do not create adjacency. Preserving the
+/// input face order keeps the component containing the provisional shell's
+/// first face first as well.
+fn face_components(body: &Body, faces: &[FaceKey]) -> Option<Vec<Vec<FaceKey>>> {
+    let included = faces.iter().copied().collect::<HashSet<_>>();
+    let mut adjacent = HashMap::<FaceKey, Vec<FaceKey>>::new();
+    for (_, edge) in body.edges.iter() {
+        let mut edge_faces = Vec::new();
+        for coedge in &edge.coedges {
+            let ring = body.coedges.get(*coedge)?.owner;
+            let face = body.loops.get(ring)?.owner;
+            if included.contains(&face) && !edge_faces.contains(&face) {
+                edge_faces.push(face);
+            }
+        }
+        for first in 0..edge_faces.len() {
+            for second in first + 1..edge_faces.len() {
+                adjacent
+                    .entry(edge_faces[first])
+                    .or_default()
+                    .push(edge_faces[second]);
+                adjacent
+                    .entry(edge_faces[second])
+                    .or_default()
+                    .push(edge_faces[first]);
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut components = Vec::new();
+    for seed in faces {
+        if !seen.insert(*seed) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut pending = VecDeque::from([*seed]);
+        while let Some(face) = pending.pop_front() {
+            component.push(face);
+            for neighbour in adjacent.get(&face).into_iter().flatten() {
+                if seen.insert(*neighbour) {
+                    pending.push_back(*neighbour);
+                }
+            }
+        }
+        components.push(component);
+    }
+    Some(components)
+}
+
+fn set_shell_faces(body: &mut Body, shell: ShellKey, faces: Vec<FaceKey>) -> Option<()> {
+    body.shells.get_mut(shell)?.faces = faces.clone();
+    for face in faces {
+        body.faces.get_mut(face)?.owner = shell;
+    }
+    Some(())
+}
+
+/// A sheet component is its own connected top-level body piece.
+fn split_revolve_surface_components(
+    body: &mut Body,
+    first_lump: LumpKey,
+    first_shell: ShellKey,
+) -> Option<()> {
+    let faces = body.shells.get(first_shell)?.faces.clone();
+    let components = face_components(body, &faces)?;
+    let first = components.first()?.clone();
+
+    set_shell_faces(body, first_shell, first)?;
+    {
+        let shell = body.shells.get_mut(first_shell)?;
+        shell.owner = first_lump;
+        shell.provenance = Provenance::Synthesized;
+    }
+    {
+        let lump = body.lumps.get_mut(first_lump)?;
+        lump.shells = vec![first_shell];
+        lump.provenance = Provenance::Synthesized;
+    }
+    body.roots = vec![first_lump];
+
+    for component in components.into_iter().skip(1) {
+        let lump = body.lumps.insert(Lump {
+            shells: Vec::new(),
+            provenance: Provenance::Synthesized,
+        });
+        let shell = body.shells.insert(Shell {
+            faces: component.clone(),
+            owner: lump,
+            provenance: Provenance::Synthesized,
+        });
+        set_shell_faces(body, shell, component)?;
+        body.lumps.get_mut(lump)?.shells = vec![shell];
+        body.roots.push(lump);
+    }
+    Some(())
+}
+
+/// Boolean difference returns one provisional shell. Keep its first connected
+/// component as the exterior shell and attach later components as void shells
+/// of the same lump.
+fn split_revolve_region_shells(body: &mut Body) -> Option<()> {
+    let [first_lump] = body.roots.as_slice() else {
+        return None;
+    };
+    let first_lump = *first_lump;
+    let shells = body.lumps.get(first_lump)?.shells.clone();
+    let [first_shell] = shells.as_slice() else {
+        return None;
+    };
+    let first_shell = *first_shell;
+    let faces = body.shells.get(first_shell)?.faces.clone();
+    let components = face_components(body, &faces)?;
+    let first = components.first()?.clone();
+
+    set_shell_faces(body, first_shell, first)?;
+    {
+        let shell = body.shells.get_mut(first_shell)?;
+        shell.owner = first_lump;
+        shell.provenance = Provenance::Synthesized;
+    }
+    let mut regrouped = vec![first_shell];
+    for component in components.into_iter().skip(1) {
+        let shell = body.shells.insert(Shell {
+            faces: component.clone(),
+            owner: first_lump,
+            provenance: Provenance::Synthesized,
+        });
+        set_shell_faces(body, shell, component)?;
+        regrouped.push(shell);
+    }
+    {
+        let lump = body.lumps.get_mut(first_lump)?;
+        lump.shells = regrouped;
+        lump.provenance = Provenance::Synthesized;
+    }
+    body.roots = vec![first_lump];
+    Some(())
 }
 
 fn append_body(target: &mut Body, source: &Body) -> Option<()> {
@@ -2301,7 +2466,9 @@ impl Turn {
         // are read off the same sweep of sample points, taken densely enough
         // that an arc bulging across the axis is caught as well as a corner
         // sitting over it.
-        let mut furthest: f64 = 0.0;
+        let scale_origin = Vec3::from(plane.point_at(profile.first()?.point_at(0.0)));
+        let mut radial_reach: f64 = 0.0;
+        let mut height_range = (0.0_f64, 0.0_f64);
         let mut reach = (0.0_f64, 0.0_f64);
         for piece in profile {
             let steps = if matches!(piece, Curve2::Ellipse(_) | Curve2::Nurbs(_)) {
@@ -2310,13 +2477,21 @@ impl Turn {
                 8
             };
             for step in 0..=steps {
-                let station = turn.station(plane, piece.point_at(step as f64 / steps as f64));
-                furthest = furthest.max(station.radius.abs()).max(station.height.abs());
+                let uv = piece.point_at(step as f64 / steps as f64);
+                let point = plane.point_at(uv);
+                let station = turn.station(plane, uv);
+                let local_height = (Vec3::from(point) - scale_origin).dot(turn.axis);
+                radial_reach = radial_reach.max(station.radius.abs());
+                height_range = (
+                    height_range.0.min(local_height),
+                    height_range.1.max(local_height),
+                );
                 reach = (reach.0.min(station.radius), reach.1.max(station.radius));
             }
         }
-        turn.tolerance = 1e-9 * furthest.max(1.0);
-        if furthest <= turn.tolerance {
+        let profile_scale = radial_reach.max(height_range.1 - height_range.0);
+        turn.tolerance = 1e-9 * profile_scale.max(1.0);
+        if profile_scale <= turn.tolerance {
             return None;
         }
         if reach.0 < -turn.tolerance && reach.1 > turn.tolerance {
@@ -2375,9 +2550,13 @@ fn revolve_part(
     let mut far_edges = Vec::with_capacity(profile.len());
     for (index, piece) in profile.iter().enumerate() {
         let next = (index + 1) % profile.len();
-        if turn.piece_surface(plane, piece).is_none() {
-            far_edges.push(near_edges[index]);
-            continue;
+        match turn.piece_surface(plane, piece)? {
+            PieceSurface::CollapsedAxis => {
+                far_edges.push(near_edges[index]);
+                continue;
+            }
+            PieceSurface::Unsupported => return None,
+            PieceSurface::Surface(_, _) => {}
         }
         let (from, to) = if senses[index] {
             (far_ring[index], far_ring[next])
@@ -2416,15 +2595,17 @@ fn revolve_part(
     add_cap(body, shell, far, &far_edges, senses, turn.spin, outward)?;
 
     for (index, piece) in profile.iter().enumerate() {
-        let Some((surface, _)) = turn.piece_surface(plane, piece) else {
-            continue;
+        let surface = match turn.piece_surface(plane, piece)? {
+            PieceSurface::CollapsedAxis => continue,
+            PieceSurface::Surface(surface, _) => surface,
+            PieceSurface::Unsupported => return None,
         };
         let next = (index + 1) % profile.len();
         let spline = matches!(surface, Surface::Nurbs(_));
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], handed > 0.0);
         let on = plane.point_at(piece.point_at(0.5));
-        let forward = face_sense(body.surfaces.get(surface)?, on, out)?;
+        let forward = turn.face_sense(body.surfaces.get(surface)?, on, out)?;
         let mut circuit = vec![(near_edges[index], senses[index])];
         if let Some(rail) = rails[next] {
             circuit.push((rail, true));
@@ -2484,10 +2665,14 @@ fn revolve_surface_part(
     let mut near_edges = Vec::with_capacity(profile.len());
     let mut far_edges = Vec::with_capacity(profile.len());
     for (index, piece) in profile.iter().enumerate() {
-        if turn.piece_surface(plane, piece).is_none() {
-            near_edges.push(None);
-            far_edges.push(None);
-            continue;
+        match turn.piece_surface(plane, piece)? {
+            PieceSurface::CollapsedAxis => {
+                near_edges.push(None);
+                far_edges.push(None);
+                continue;
+            }
+            PieceSurface::Unsupported => return None,
+            PieceSurface::Surface(_, _) => {}
         }
         let next = if closed { (index + 1) % corners.len() } else { index + 1 };
         let (near_from, near_to) = if senses[index] {
@@ -2529,15 +2714,17 @@ fn revolve_surface_part(
         .collect::<Option<Vec<_>>>()?;
 
     for (index, piece) in profile.iter().enumerate() {
-        let Some((surface, _)) = turn.piece_surface(plane, piece) else {
-            continue;
+        let surface = match turn.piece_surface(plane, piece)? {
+            PieceSurface::CollapsedAxis => continue,
+            PieceSurface::Surface(surface, _) => surface,
+            PieceSurface::Unsupported => return None,
         };
         let next = if closed { (index + 1) % corners.len() } else { index + 1 };
         let spline = matches!(surface, Surface::Nurbs(_));
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], true);
         let on = plane.point_at(piece.point_at(0.5));
-        let forward = face_sense(body.surfaces.get(surface)?, on, out)?;
+        let forward = turn.face_sense(body.surfaces.get(surface)?, on, out)?;
         let mut circuit = vec![(near_edges[index]?, senses[index])];
         if let Some(rail) = rails[next] {
             circuit.push((rail, true));
@@ -2586,10 +2773,16 @@ fn revolve_whole(
     outward: bool,
 ) -> Option<()> {
     let count = profile.len();
-    let kinds: Vec<Option<(Surface, bool)>> = profile
+    let kinds = profile
         .iter()
         .map(|piece| turn.piece_surface(plane, piece))
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
+    if kinds
+        .iter()
+        .any(|kind| matches!(kind, PieceSurface::Unsupported))
+    {
+        return None;
+    }
     let previous = |index: usize| (index + count - 1) % count;
 
     // A rim exists where a corner is off the axis and a face next to it needs
@@ -2599,12 +2792,13 @@ fn revolve_whole(
     let has_rim: Vec<bool> = (0..count)
         .map(|index| {
             stations[index].radius > turn.tolerance
-                && (kinds[index].is_some() || kinds[previous(index)].is_some())
+                && (matches!(&kinds[index], PieceSurface::Surface(_, _))
+                    || matches!(&kinds[previous(index)], PieceSurface::Surface(_, _)))
         })
         .collect();
     let has_seam: Vec<bool> = kinds
         .iter()
-        .map(|kind| matches!(kind, Some((_, false))))
+        .map(|kind| matches!(kind, PieceSurface::Surface(_, false)))
         .collect();
 
     // Only the corners something ends at become vertices. A disc's centre is
@@ -2662,15 +2856,17 @@ fn revolve_whole(
         .collect::<Option<Vec<_>>>()?;
 
     for (index, piece) in profile.iter().enumerate() {
-        let Some((surface, flat)) = kinds[index].clone() else {
-            continue;
+        let (surface, flat) = match kinds[index].clone() {
+            PieceSurface::CollapsedAxis => continue,
+            PieceSurface::Surface(surface, flat) => (surface, flat),
+            PieceSurface::Unsupported => return None,
         };
         let next = (index + 1) % count;
         let spline = matches!(surface, Surface::Nurbs(_));
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], handed > 0.0);
         let on = plane.point_at(piece.point_at(0.5));
-        let forward = face_sense(body.surfaces.get(surface)?, on, out)?;
+        let forward = turn.face_sense(body.surfaces.get(surface)?, on, out)?;
         let face = add_face(body, shell, surface, forward);
 
         if flat {
@@ -2738,7 +2934,13 @@ fn revolve_surface_whole(
     let kinds = profile
         .iter()
         .map(|piece| turn.piece_surface(plane, piece))
-        .collect::<Vec<_>>();
+        .collect::<Option<Vec<_>>>()?;
+    if kinds
+        .iter()
+        .any(|kind| matches!(kind, PieceSurface::Unsupported))
+    {
+        return None;
+    }
     let before = |corner: usize| -> Option<usize> {
         if corner > 0 {
             Some(corner - 1)
@@ -2757,9 +2959,11 @@ fn revolve_surface_whole(
             None
         }
     };
-    let has_kind = |piece: Option<usize>| piece.is_some_and(|index| kinds[index].is_some());
+    let has_kind = |piece: Option<usize>| {
+        piece.is_some_and(|index| matches!(&kinds[index], PieceSurface::Surface(_, _)))
+    };
     let has_seam = |piece: Option<usize>| {
-        piece.is_some_and(|index| matches!(kinds[index], Some((_, false))))
+        piece.is_some_and(|index| matches!(&kinds[index], PieceSurface::Surface(_, false)))
     };
 
     let has_rim = (0..corner_count)
@@ -2797,7 +3001,7 @@ fn revolve_surface_whole(
         .collect::<Option<Vec<_>>>()?;
     let seams = (0..piece_count)
         .map(|index| {
-            if !matches!(kinds[index], Some((_, false))) {
+            if !matches!(&kinds[index], PieceSurface::Surface(_, false)) {
                 return Some(None);
             }
             let next = if closed { (index + 1) % corner_count } else { index + 1 };
@@ -2811,15 +3015,17 @@ fn revolve_surface_whole(
         .collect::<Option<Vec<_>>>()?;
 
     for (index, piece) in profile.iter().enumerate() {
-        let Some((surface, flat)) = kinds[index].clone() else {
-            continue;
+        let (surface, flat) = match kinds[index].clone() {
+            PieceSurface::CollapsedAxis => continue,
+            PieceSurface::Surface(surface, flat) => (surface, flat),
+            PieceSurface::Unsupported => return None,
         };
         let next = if closed { (index + 1) % corner_count } else { index + 1 };
         let spline = matches!(surface, Surface::Nurbs(_));
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], true);
         let on = plane.point_at(piece.point_at(0.5));
-        let forward = face_sense(body.surfaces.get(surface)?, on, out)?;
+        let forward = turn.face_sense(body.surfaces.get(surface)?, on, out)?;
         let face = add_face(body, shell, surface, forward);
 
         if flat {
