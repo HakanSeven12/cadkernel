@@ -53,8 +53,8 @@ pub use classify::{contains_point, Containment};
 pub use mesh::{body as mesh_body, Mesh};
 pub use place::{edge_points, edge_polylines, transform, Placement};
 pub use sweep::{
-    extrude, extrude_region, extrude_surface, revolve, sweep_along,
-    sweep_along_deformed, sweep_along_polyline3d,
+    extrude, extrude_region, extrude_surface, revolve, revolve_region, revolve_surface,
+    revolve_surface_region, sweep_along, sweep_along_deformed, sweep_along_polyline3d,
 };
 #[cfg(feature = "offset")]
 pub use sweep::{extrude_surface_tapered, extrude_tapered};

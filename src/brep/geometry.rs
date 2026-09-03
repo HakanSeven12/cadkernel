@@ -269,10 +269,26 @@ impl Surface {
                 let local = torus.frame.project(point)?;
                 let height = height_above(&torus.frame, point)?;
                 let ring = local[0].hypot(local[1]);
-                Some((
-                    local[1].atan2(local[0]),
-                    height.atan2(ring - torus.major_radius),
-                ))
+                let around = local[1].atan2(local[0]);
+                let outer = (around, height.atan2(ring - torus.major_radius));
+                // A horn or spindle torus has a second sheet whose signed
+                // ring is negative. In space that reverses the longitude by
+                // half a turn; `hypot` alone folds it onto the other sheet.
+                // Try both inverses and retain the one which actually maps
+                // back nearest to the supplied point.
+                let inner = (
+                    around + std::f64::consts::PI,
+                    height.atan2(-ring - torus.major_radius),
+                );
+                let error = |parameters: (f64, f64)| {
+                    Vec3::from(self.point_at(parameters.0, parameters.1))
+                        .distance(Vec3::from(point))
+                };
+                if error(inner) < error(outer) {
+                    Some(inner)
+                } else {
+                    Some(outer)
+                }
             }
             Self::Nurbs(_) => None,
         }
@@ -377,8 +393,12 @@ impl Surface {
             }
             Self::Torus(torus) => {
                 let (along, across) = axial_distance(&torus.frame, point);
-                let from_tube = (across - torus.major_radius).hypot(along);
-                from_tube - torus.minor_radius
+                let outer = (across - torus.major_radius).hypot(along) - torus.minor_radius;
+                let inner = (across + torus.major_radius).hypot(along) - torus.minor_radius;
+                // For a self-intersecting torus neither signed half-plane
+                // circle contains the other parametrised sheet. The nearest
+                // sheet is the one with the smaller absolute residual.
+                if inner.abs() < outer.abs() { inner } else { outer }
             }
             Self::Nurbs(_) => f64::INFINITY,
         }

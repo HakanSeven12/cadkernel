@@ -334,7 +334,7 @@ fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Option<[f64; 3]
 ///
 /// Geometry is copied rather than shared: the two inputs have their own
 /// arenas, and a key from one means nothing in the other.
-fn copy_face(
+pub(super) fn copy_face(
     result: &mut Body,
     source: &Body,
     face: FaceKey,

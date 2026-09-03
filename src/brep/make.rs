@@ -1320,9 +1320,12 @@ mod tests {
     }
 
     #[test]
-    fn a_torus_that_would_close_its_own_hole_is_refused() {
-        assert!(torus([0.0; 3], 2.0, 2.0).is_none());
-        assert!(torus([0.0; 3], 1.0, 2.0).is_none());
+    fn horn_and_spindle_tori_are_trimmed_at_the_axis() {
+        for (major, minor) in [(2.0, 2.0), (1.0, 2.0)] {
+            let solid = torus([0.0; 3], major, minor).expect("a closed torus");
+            let flaws = solid.validate();
+            assert!(flaws.is_empty(), "{major}/{minor}: {flaws:?}");
+        }
         assert!(torus([0.0; 3], 10.0, 0.0).is_none());
     }
 
