@@ -564,11 +564,10 @@ fn rightmost(ring: &[Vec2]) -> (usize, Vec2) {
 /// no edge and enclosing the wrong region — which shows up as a ring with no
 /// ear anywhere and no triangles at all.
 ///
-/// So it is the standard construction: cast a ray to the right, take the edge
-/// it hits first, and bridge to that edge's rightmost end — unless some
-/// reflex vertex stands inside the triangle the three of them make, in which
-/// case the one nearest the ray's direction is taken instead. That vertex is
-/// visible by construction rather than by test.
+/// So cast a ray to the right, insert its first crossing into the ring, and
+/// bridge straight to that point. Giving each hole its own crossing also keeps
+/// aligned holes from sharing a distant ring vertex and producing overlapping
+/// bridge slits.
 fn bridge(points: &mut Vec<Vec2>, ring: &mut Vec<usize>, hole: Vec<Vec2>) {
     let (start, from) = rightmost(&hole);
     let Some(at) = bridge_target(points, ring, from) else {
@@ -592,10 +591,9 @@ fn bridge(points: &mut Vec<Vec2>, ring: &mut Vec<usize>, hole: Vec<Vec2>) {
     *ring = spliced;
 }
 
-/// Which ring vertex to bridge a hole to.
-fn bridge_target(points: &[Vec2], ring: &[usize], from: Vec2) -> Option<usize> {
+/// Inserts the first point where a ray to the right meets the ring.
+fn bridge_target(points: &mut Vec<Vec2>, ring: &mut Vec<usize>, from: Vec2) -> Option<usize> {
     let count = ring.len();
-    // The first ring edge a ray to the right runs into.
     let mut nearest = f64::INFINITY;
     let mut hit_edge = None;
     for index in 0..count {
@@ -615,47 +613,16 @@ fn bridge_target(points: &[Vec2], ring: &[usize], from: Vec2) -> Option<usize> {
     }
     let (first, second) = hit_edge?;
     let crossing = Vec2::new(nearest, from.y);
-    // The endpoint further right is the one the bridge can reach without
-    // leaving the polygon.
-    let candidate = if points[ring[first]].x >= points[ring[second]].x {
-        first
-    } else {
-        second
-    };
-
-    // Anything reflex standing inside the triangle blocks the view of it. The
-    // one closest to straight ahead is visible instead.
-    let corner = points[ring[candidate]];
-    let mut best = candidate;
-    let mut best_angle = f64::INFINITY;
-    for index in 0..count {
-        if index == candidate {
-            continue;
-        }
-        let point = points[ring[index]];
-        if !is_reflex(points, ring, index) {
-            continue;
-        }
-        if !inside(from, crossing, corner, point) && !inside(from, corner, crossing, point) {
-            continue;
-        }
-        let angle = ((point.y - from.y) / (point - from).length().max(f64::MIN_POSITIVE))
-            .abs();
-        if angle < best_angle {
-            best_angle = angle;
-            best = index;
-        }
+    if points[ring[first]] == crossing {
+        return Some(first);
     }
-    Some(best)
-}
-
-/// Whether the ring turns clockwise at a vertex, in a counter-clockwise ring.
-fn is_reflex(points: &[Vec2], ring: &[usize], at: usize) -> bool {
-    let count = ring.len();
-    let before = points[ring[(at + count - 1) % count]];
-    let here = points[ring[at]];
-    let after = points[ring[(at + 1) % count]];
-    (here - before).cross(after - here) < 0.0
+    if points[ring[second]] == crossing {
+        return Some(second);
+    }
+    let index = points.len();
+    points.push(crossing);
+    ring.insert(first + 1, index);
+    Some(first + 1)
 }
 
 /// Cuts corners off until nothing is left.
@@ -847,6 +814,40 @@ mod tests {
         ];
         let (points, triangles) = polygon(&square(10.0), &holes);
         assert!((area(&points, &triangles) - (100.0 - 4.0 - 9.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_aligned_holes_fit_inside_a_narrow_concave_arm() {
+        let outer = vec![
+            [0.0, 0.0],
+            [12.0, 0.0],
+            [12.0, 8.0],
+            [11.0, 8.0],
+            [11.0, 2.0],
+            [2.0, 2.0],
+            [1.8, 2.1],
+            [1.8, 12.0],
+            [0.0, 12.0],
+        ];
+        let circle = |centre: [f64; 2]| {
+            (0..24)
+                .map(|step| {
+                    let angle = std::f64::consts::TAU * step as f64 / 24.0;
+                    [centre[0] + 0.08 * angle.cos(), centre[1] + 0.08 * angle.sin()]
+                })
+                .collect::<Vec<_>>()
+        };
+        let holes = vec![circle([1.68, 6.0]), circle([1.68, 9.0])];
+        let expected = signed_area_arrays(&outer).abs()
+            - holes
+                .iter()
+                .map(|hole| signed_area_arrays(hole).abs())
+                .sum::<f64>();
+
+        let (points, triangles) = polygon(&outer, &holes);
+
+        assert!(!triangles.is_empty());
+        assert!((area(&points, &triangles) - expected).abs() < 1e-9);
     }
 
     #[test]
