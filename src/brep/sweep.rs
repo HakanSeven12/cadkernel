@@ -367,6 +367,14 @@ pub fn extrude_tapered(
     } else {
         [-tangent[0], -tangent[1]]
     };
+    let tangent_length = tangent[0].hypot(tangent[1]);
+    if !tangent_length.is_finite() || tangent_length <= 1e-12 {
+        return None;
+    }
+    let tangent = [
+        tangent[0] / tangent_length,
+        tangent[1] / tangent_length,
+    ];
     let inward = if signed_area > 0.0 {
         [-tangent[1], tangent[0]]
     } else {
@@ -393,6 +401,44 @@ pub fn extrude_tapered(
     let top_profile = Curve2::Polyline(top).segments();
     if top_profile.len() != profile.len() {
         return None;
+    }
+    // A closed inward offset can survive numerically after the outline has
+    // collapsed: the offset library then returns a loop on the far side of
+    // the medial axis. That loop grows again as the requested inset grows,
+    // which makes an interactive draft grip reverse from narrowing to
+    // widening. A valid parallel outline remains exactly `offset` away from
+    // its source and encloses less area. Do not compare winding here:
+    // `profile_senses` may legitimately choose the reverse traversal while
+    // the offset polyline keeps its source storage order.
+    if taper_angle > 0.0 {
+        let coordinate_scale = source
+            .vertices
+            .iter()
+            .flat_map(|vertex| vertex.position)
+            .map(f64::abs)
+            .fold(offset.max(1.0), f64::max);
+        let tolerance = crate::geom2d::Tolerance::new(
+            (offset * 1e-5).max(coordinate_scale * 1e-10).max(1e-9),
+        );
+        if top_profile.iter().any(|piece| {
+            let point = piece.point_at(0.5);
+            let distance = profile
+                .iter()
+                .map(|source_piece| crate::geom2d::distance_to(source_piece, point))
+                .fold(f64::INFINITY, f64::min);
+            !distance.is_finite() || (distance - offset).abs() > tolerance.linear()
+        }) {
+            return None;
+        }
+        let top_senses = profile_senses(&top_profile)?;
+        let top_area = top_profile
+            .iter()
+            .zip(top_senses)
+            .map(|(piece, forward)| piece.enclosed_area() * if forward { 1.0 } else { -1.0 })
+            .sum::<f64>();
+        if !top_area.is_finite() || top_area.abs() >= signed_area.abs() {
+            return None;
+        }
     }
     let far = Plane::from_axes(
         (Vec3::from(plane.origin) + along).to_array(),
@@ -2337,6 +2383,41 @@ mod tests {
             assert!(extrude_surface_tapered(Plane::XY, &profile, [0.0, 0.0, 5.0], angle)
                 .is_none());
         }
+    }
+
+    #[cfg(feature = "offset")]
+    #[test]
+    fn a_tapered_profile_stops_before_inverting() {
+        assert!(extrude_tapered(
+            Plane::XY,
+            &square(100.0),
+            [0.0, 0.0, 1.0],
+            45.0_f64.to_radians(),
+        )
+        .is_some());
+
+        let profile = square(10.0);
+        assert!(extrude_tapered(
+            Plane::XY,
+            &profile,
+            [0.0, 0.0, 10.0],
+            20.0_f64.to_radians(),
+        )
+        .is_some());
+        assert!(extrude_tapered(
+            Plane::XY,
+            &profile,
+            [0.0, 0.0, 10.0],
+            30.0_f64.to_radians(),
+        )
+        .is_none());
+        assert!(extrude_tapered(
+            Plane::XY,
+            &profile,
+            [0.0, 0.0, 10.0],
+            -45.0_f64.to_radians(),
+        )
+        .is_some());
     }
 
     #[test]
