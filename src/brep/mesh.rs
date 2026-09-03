@@ -1389,9 +1389,7 @@ fn refine_edge(
         for unit in [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0] {
             let parameter = from + (to - from) * unit;
             let on_curve = curve.point_at(parameter);
-            let (uv, exact) = if let Some((u, v)) = surface.parameters_at(on_curve) {
-                ([u, v], false)
-            } else if let Some(pcurve) = pcurve {
+            let (uv, exact) = if let Some(pcurve) = pcurve {
                 let mut preferred = (parameter - edge.start_parameter)
                     / (edge.end_parameter - edge.start_parameter);
                 if !pcurve_forward {
@@ -1417,6 +1415,8 @@ fn refine_edge(
                         true,
                     )
                 }
+            } else if let Some((u, v)) = surface.parameters_at(on_curve) {
+                ([u, v], false)
             } else {
                 return None;
             };
@@ -1633,30 +1633,51 @@ fn chain_samples(
     let surface_periods = periods(surface);
     let mut pieces = pieces.into_iter();
     let (first, pcurve) = pieces.next()?;
+    let mut explicit = pcurve.is_some();
+    let mut all_explicit = explicit;
     let mut points = parameterize_samples(surface, &first, pcurve, tolerance)?;
     unwrap_boundary(&mut points, surface_periods);
     let mut pieces = pieces.peekable();
     while let Some((samples, pcurve)) = pieces.next() {
         let head = points.last()?.position;
+        let next_explicit = pcurve.is_some();
         let mut next = parameterize_samples(surface, &samples, pcurve, tolerance)?;
         unwrap_boundary(&mut next, surface_periods);
-        align_parameters(
-            &mut next,
-            &points,
-            surface_periods,
-            pieces.peek().is_none(),
-        );
+        // Explicit pcurves share one face parameter space. In particular,
+        // opposite sides of a periodic trimmed patch may deliberately differ
+        // by one full period while meeting at an axis singularity; folding
+        // that difference away erases the patch's parameter-space area.
+        if !explicit || !next_explicit {
+            align_parameters(
+                &mut next,
+                &points,
+                surface_periods,
+                pieces.peek().is_none(),
+            );
+        }
         if distance3(head, next[0].position) > tolerance {
             return None;
         }
-        let skip = 1;
+        let skip = if explicit
+            && next_explicit
+            && !parameter_near(points.last()?.parameters, next[0].parameters)
+        {
+            0
+        } else {
+            1
+        };
         points.extend_from_slice(&next[skip..]);
+        explicit = next_explicit;
+        all_explicit &= next_explicit;
     }
     if distance3(points.first()?.position, points.last()?.position) > tolerance {
         return None;
     }
     let first = points.first()?.parameters;
     let last = points.last()?.parameters;
+    if all_explicit && !parameter_near(first, last) {
+        return Some(points);
+    }
     let mut closing = last;
     let mut winds_period = false;
     for axis in 0..2 {
@@ -1900,10 +1921,6 @@ fn parameterize_samples(
     pcurve: Option<&crate::geom2d::Curve>,
     tolerance: f64,
 ) -> Option<Vec<BoundaryPoint>> {
-    if !matches!(surface, super::geometry::Surface::Nurbs(_)) {
-        let positions: Vec<[f64; 3]> = samples.iter().map(|sample| sample.position).collect();
-        return parameterize(surface, &positions);
-    }
     if let Some(pcurve) = pcurve {
         let last = samples.len().checked_sub(1)?;
         let first_parameter = samples.first()?.parameter;
@@ -2960,6 +2977,11 @@ fn whole_surface_domain(
                 let Some(coedge) = body.coedges.get(*coedge_key) else {
                     return false;
                 };
+                if coedge.pcurve.is_some() {
+                    // An explicit pcurve bounds a trimmed periodic patch; it
+                    // is not merely an arbitrary cut across the whole surface.
+                    return false;
+                }
                 let matching: Vec<_> = ring
                     .coedges
                     .iter()

@@ -1452,6 +1452,16 @@ fn wall_surface(
 /// not rest on `on` sitting exactly on the surface — which, at survey
 /// coordinates, it will not.
 fn face_sense(surface: &Surface, on: [f64; 3], out: Vec3) -> Option<bool> {
+    if matches!(surface, Surface::Torus(_)) {
+        // A horn or spindle torus has two parametrised sheets in the same
+        // radial half-plane. Its global signed-distance field has a medial
+        // cusp between them, so a symmetric distance probe can report zero
+        // slope even though the local surface normal is unambiguous.
+        let (u, v) = surface.parameters_at(on)?;
+        let normal = Vec3::from(surface.normal_at(u, v)?);
+        let slope = normal.dot(out);
+        return (slope != 0.0 && slope.is_finite()).then_some(slope > 0.0);
+    }
     if let Surface::Nurbs(spline) = surface {
         let ((u0, u1), (v0, v1)) = spline.domain();
         let normal = Vec3::from(surface.normal_at((u0 + u1) * 0.5, (v0 + v1) * 0.5)?);
@@ -1739,6 +1749,13 @@ enum PieceSurface {
     Unsupported,
 }
 
+#[derive(Clone, Copy)]
+struct TorusArcParameters {
+    around: f64,
+    start: f64,
+    end: f64,
+}
+
 #[derive(Clone, Copy, Default)]
 struct RadialReach {
     negative: bool,
@@ -1859,6 +1876,61 @@ impl Turn {
             self.turned(Vec3::from(plane.x_axis), self.angle).to_array(),
             self.turned(Vec3::from(plane.y_axis), self.angle).to_array(),
         )
+    }
+
+    /// The rectangular torus parameters traced by one circular profile arc.
+    ///
+    /// A circle centre on the negative side of the axis is represented by a
+    /// positive-major-radius torus using a negative ring. That sheet needs a
+    /// half-turn longitude shift and the complementary tube angle; retaining
+    /// those values as pcurves is what keeps a chord-bounded arc trimmed.
+    fn torus_arc_parameters(
+        &self,
+        plane: &Plane,
+        arc: &crate::geom2d::Arc,
+    ) -> Option<TorusArcParameters> {
+        let sweep = arc.sweep();
+        let middle = arc.start_angle + sweep * 0.5;
+        let (sin, cos) = middle.sin_cos();
+        let offset = Vec3::from(plane.vector_at([
+            arc.radius * cos,
+            arc.radius * sin,
+        ]));
+        let tangent = Vec3::from(plane.vector_at([
+            -arc.radius * sin,
+            arc.radius * cos,
+        ]));
+        let radial = offset.dot(self.radial);
+        let height = offset.dot(self.axis);
+        let radial_tangent = tangent.dot(self.radial);
+        let height_tangent = tangent.dot(self.axis);
+        let orientation = radial * height_tangent - height * radial_tangent;
+        if !sweep.is_finite()
+            || !radial.is_finite()
+            || !height.is_finite()
+            || !orientation.is_finite()
+            || orientation == 0.0
+        {
+            return None;
+        }
+        let middle = height.atan2(radial);
+        let direction = orientation.signum();
+        let gamma_start = middle - direction * sweep * 0.5;
+        let gamma_end = middle + direction * sweep * 0.5;
+        let centre = self.station(plane, arc.centre);
+        if centre.radius < 0.0 {
+            Some(TorusArcParameters {
+                around: std::f64::consts::PI,
+                start: std::f64::consts::PI - gamma_start,
+                end: std::f64::consts::PI - gamma_end,
+            })
+        } else {
+            Some(TorusArcParameters {
+                around: 0.0,
+                start: gamma_start,
+                end: gamma_end,
+            })
+        }
     }
 
     /// Face orientation sampled halfway through the turn. NURBS normals are
@@ -2984,6 +3056,10 @@ fn revolve_part(
         };
         let next = (index + 1) % profile.len();
         let spline = matches!(surface, Surface::Nurbs(_));
+        let torus_arc = match (&surface, piece) {
+            (Surface::Torus(_), Curve2::Arc(arc)) => Some(turn.torus_arc_parameters(plane, arc)?),
+            _ => None,
+        };
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], handed > 0.0);
         let on = plane.point_at(piece.point_at(0.5));
@@ -3005,6 +3081,24 @@ fn revolve_part(
                 ([end, 1.0], [start, 1.0]),
                 ([start, 1.0], [start, 0.0]),
             ];
+            let (circuit, pcurves) = reorder_with_pcurves(circuit, pcurves, outward);
+            add_wall_with_pcurves(body, shell, surface, forward, &circuit, &pcurves)?;
+        } else if let Some(parameters) = torus_arc {
+            let (start, end) = if senses[index] {
+                (parameters.start, parameters.end)
+            } else {
+                (parameters.end, parameters.start)
+            };
+            let near = parameters.around;
+            let far = near + turn.angle;
+            let mut pcurves = vec![([near, start], [near, end])];
+            if rails[next].is_some() {
+                pcurves.push(([near, end], [far, end]));
+            }
+            pcurves.push(([far, end], [far, start]));
+            if rails[index].is_some() {
+                pcurves.push(([far, start], [near, start]));
+            }
             let (circuit, pcurves) = reorder_with_pcurves(circuit, pcurves, outward);
             add_wall_with_pcurves(body, shell, surface, forward, &circuit, &pcurves)?;
         } else {
@@ -3103,6 +3197,10 @@ fn revolve_surface_part(
         };
         let next = if closed { (index + 1) % corners.len() } else { index + 1 };
         let spline = matches!(surface, Surface::Nurbs(_));
+        let torus_arc = match (&surface, piece) {
+            (Surface::Torus(_), Curve2::Arc(arc)) => Some(turn.torus_arc_parameters(plane, arc)?),
+            _ => None,
+        };
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], true);
         let on = plane.point_at(piece.point_at(0.5));
@@ -3125,6 +3223,23 @@ fn revolve_surface_part(
             pcurves.push(([end, 1.0], [start, 1.0]));
             if rails[index].is_some() {
                 pcurves.push(([start, 1.0], [start, 0.0]));
+            }
+            add_wall_with_pcurves(body, shell, surface, forward, &circuit, &pcurves)?;
+        } else if let Some(parameters) = torus_arc {
+            let (start, end) = if senses[index] {
+                (parameters.start, parameters.end)
+            } else {
+                (parameters.end, parameters.start)
+            };
+            let near = parameters.around;
+            let far = near + turn.angle;
+            let mut pcurves = vec![([near, start], [near, end])];
+            if rails[next].is_some() {
+                pcurves.push(([near, end], [far, end]));
+            }
+            pcurves.push(([far, end], [far, start]));
+            if rails[index].is_some() {
+                pcurves.push(([far, start], [near, start]));
             }
             add_wall_with_pcurves(body, shell, surface, forward, &circuit, &pcurves)?;
         } else {
@@ -3245,6 +3360,10 @@ fn revolve_whole(
         };
         let next = (index + 1) % count;
         let spline = matches!(surface, Surface::Nurbs(_));
+        let torus_arc = match (&surface, piece) {
+            (Surface::Torus(_), Curve2::Arc(arc)) => Some(turn.torus_arc_parameters(plane, arc)?),
+            _ => None,
+        };
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], handed > 0.0);
         let on = plane.point_at(piece.point_at(0.5));
@@ -3288,6 +3407,25 @@ fn revolve_whole(
                     pcurves.push(([end, 1.0], [end, 0.0]));
                 }
                 pcurves.push(([end, 0.0], [start, 0.0]));
+                let (circuit, pcurves) = reorder_with_pcurves(circuit, pcurves, outward);
+                add_ring_with_pcurves(body, face, &circuit, &pcurves)?;
+            } else if let Some(parameters) = torus_arc {
+                let (start, end) = if senses[index] {
+                    (parameters.start, parameters.end)
+                } else {
+                    (parameters.end, parameters.start)
+                };
+                let near = parameters.around;
+                let far = near + TAU;
+                let mut pcurves = Vec::new();
+                if rims[index].is_some() {
+                    pcurves.push(([near, start], [far, start]));
+                }
+                pcurves.push(([far, start], [far, end]));
+                if rims[next].is_some() {
+                    pcurves.push(([far, end], [near, end]));
+                }
+                pcurves.push(([near, end], [near, start]));
                 let (circuit, pcurves) = reorder_with_pcurves(circuit, pcurves, outward);
                 add_ring_with_pcurves(body, face, &circuit, &pcurves)?;
             } else {
@@ -3404,6 +3542,10 @@ fn revolve_surface_whole(
         };
         let next = if closed { (index + 1) % corner_count } else { index + 1 };
         let spline = matches!(surface, Surface::Nurbs(_));
+        let torus_arc = match (&surface, piece) {
+            (Surface::Torus(_), Curve2::Arc(arc)) => Some(turn.torus_arc_parameters(plane, arc)?),
+            _ => None,
+        };
         let surface = body.surfaces.insert(surface);
         let out = piece_outward(plane, piece, senses[index], true);
         let on = plane.point_at(piece.point_at(0.5));
@@ -3445,6 +3587,24 @@ fn revolve_surface_whole(
                     pcurves.push(([end, 1.0], [end, 0.0]));
                 }
                 pcurves.push(([end, 0.0], [start, 0.0]));
+                add_ring_with_pcurves(body, face, &circuit, &pcurves)?;
+            } else if let Some(parameters) = torus_arc {
+                let (start, end) = if senses[index] {
+                    (parameters.start, parameters.end)
+                } else {
+                    (parameters.end, parameters.start)
+                };
+                let near = parameters.around;
+                let far = near + TAU;
+                let mut pcurves = Vec::new();
+                if rims[index].is_some() {
+                    pcurves.push(([near, start], [far, start]));
+                }
+                pcurves.push(([far, start], [far, end]));
+                if rims[next].is_some() {
+                    pcurves.push(([far, end], [near, end]));
+                }
+                pcurves.push(([near, end], [near, start]));
                 add_ring_with_pcurves(body, face, &circuit, &pcurves)?;
             } else {
                 add_ring(body, face, &circuit)?;
