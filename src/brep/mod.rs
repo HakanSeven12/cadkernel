@@ -35,9 +35,10 @@ pub mod geometry;
 pub mod imprint;
 pub mod intersect;
 pub mod loft;
+pub mod loft_general;
 pub mod make;
 pub mod mesh;
-mod nurbs_builder;
+pub(crate) mod nurbs_builder;
 pub mod pcurve;
 pub mod place;
 pub mod split;
@@ -66,6 +67,7 @@ pub use sweep::{extrude_surface_tapered, extrude_tapered};
 pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};
 pub use loft::loft;
+pub use loft_general::{loft_with_options, LoftError, LoftOptions, LoftSection};
 pub use topology::{
     Body, Coedge, CoedgeKey, CurveKey, Edge, EdgeKey, Face, FaceKey, Flaw, Loop, LoopKey, Lump,
     LumpKey, Shell, ShellKey, SurfaceKey, Vertex, VertexKey,

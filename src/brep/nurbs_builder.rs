@@ -3,7 +3,7 @@ use crate::space::{NurbsCurve3, NurbsSurface3, Plane, Vec3};
 use std::f64::consts::FRAC_PI_2;
 
 #[derive(Clone)]
-pub(super) struct RationalCurve2 {
+pub(crate) struct RationalCurve2 {
     pub degree: usize,
     pub knots: Vec<f64>,
     pub points: Vec<[f64; 2]>,
@@ -11,7 +11,7 @@ pub(super) struct RationalCurve2 {
 }
 
 #[derive(Clone)]
-pub(super) struct RationalCurve3 {
+pub(crate) struct RationalCurve3 {
     pub degree: usize,
     pub knots: Vec<f64>,
     pub points: Vec<[f64; 3]>,

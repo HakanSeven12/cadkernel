@@ -1195,22 +1195,149 @@ fn rebuild_revolve(value: &SolidHistoryRevolve) -> Result<Body, HistoryRebuildEr
     )
 }
 
+/// Decode a section or a joined chain without losing rational curves or region holes.
+pub fn loft_section_geometry(entities: &[EmbeddedEntity]) -> Result<brep::LoftSection, String> {
+    let identity = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+    if let [EmbeddedEntity::Point(point)] = entities {
+        return Ok(brep::LoftSection::Point([point.location.x, point.location.y, point.location.z]));
+    }
+    let mut profiles = entities.iter().map(|entity| sweep_profile_geometry(entity, identity)
+        .map_err(|error| format!("Invalid loft section: {error}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if profiles.is_empty() { return Err("Select a curve for each loft section.".into()); }
+    if profiles.len() == 1 {
+        let (plane, wires, closed) = profiles.remove(0);
+        return Ok(brep::LoftSection::Profile { plane, wires, closed });
+    }
+    if profiles.iter().any(|(_, wires, closed)| *closed || wires.len() != 1) {
+        return Err("Join only connected open edges in one section.".into());
+    }
+    // A single line's arbitrary supporting plane need not contain the other
+    // selected edges. Derive the joined plane from the entire spatial chain.
+    let mut spatial = Vec::new();
+    for (plane, wires, _) in &profiles {
+        for curve in &wires[0] {
+            spatial.extend(brep::nurbs_builder::RationalCurve2::from_curve(curve)
+                .ok_or("Unsupported joined section curve")?.lifted(plane).points);
+        }
+    }
+    let origin = Vec3::from(*spatial.first().ok_or("Empty joined section")?);
+    let tolerance = coplanarity_tolerance(&spatial);
+    let axis = spatial.iter().map(|point| Vec3::from(*point)-origin)
+        .find(|axis| axis.length() > tolerance).and_then(Vec3::normalize)
+        .ok_or("Degenerate joined section")?;
+    let normal = spatial.iter().map(|point| axis.cross(Vec3::from(*point)-origin))
+        .find(|normal| normal.length() > tolerance).and_then(Vec3::normalize);
+    let plane = match normal {
+        Some(normal) => Plane::orthonormal(origin.to_array(), axis.to_array(), normal.to_array())
+            .ok_or("Invalid joined section plane")?,
+        None => Plane::from_axes(origin.to_array(), profiles[0].0.x_axis, profiles[0].0.y_axis),
+    };
+    let normal = Vec3::from(plane.normal().ok_or("Invalid section plane")?);
+    let mut curves = Vec::new();
+    for (source_plane, wires, _) in profiles {
+        for curve in &wires[0] {
+            let rational = brep::nurbs_builder::RationalCurve2::from_curve(curve)
+                .ok_or("Unsupported joined section curve")?.lifted(&source_plane);
+            let scale = rational.points.iter().map(|point| (Vec3::from(*point) - Vec3::from(plane.origin)).length())
+                .fold(1.0_f64, f64::max);
+            let mut points = Vec::new();
+            for point in rational.points {
+                if (Vec3::from(point) - Vec3::from(plane.origin)).dot(normal).abs() > scale * 1e-8 {
+                    return Err("Joined section edges must be coplanar.".into());
+                }
+                points.push(plane.project(point).ok_or("Invalid section plane")?);
+            }
+            curves.push(NurbsCurve::new_strict(rational.degree, points, rational.knots, rational.weights)
+                .ok_or("Invalid joined section curve")?);
+        }
+    }
+    let distance = |a: [f64;2], b: [f64;2]| (a[0]-b[0]).hypot(a[1]-b[1]);
+    let scale = curves.iter().map(|curve| curve.control_points().iter().map(|point| point[0].hypot(point[1]))
+        .fold(1.0_f64, f64::max)).fold(1.0_f64, f64::max);
+    let tolerance = scale * 1e-8;
+    let mut chain = vec![curves.remove(0)];
+    while !curves.is_empty() {
+        let end = chain.last().unwrap().point_at(1.0);
+        if let Some((at, reverse)) = curves.iter().enumerate().find_map(|(at, curve)| {
+            if distance(end, curve.point_at(0.0)) <= tolerance { Some((at, false)) }
+            else if distance(end, curve.point_at(1.0)) <= tolerance { Some((at, true)) }
+            else { None }
+        }) {
+            let curve = curves.remove(at);
+            chain.push(if reverse { curve.reversed() } else { curve });
+            continue;
+        }
+        let start = chain.first().unwrap().point_at(0.0);
+        if let Some((at, reverse)) = curves.iter().enumerate().find_map(|(at, curve)| {
+            if distance(start, curve.point_at(1.0)) <= tolerance { Some((at, false)) }
+            else if distance(start, curve.point_at(0.0)) <= tolerance { Some((at, true)) }
+            else { None }
+        }) {
+            let curve = curves.remove(at);
+            chain.insert(0, if reverse { curve.reversed() } else { curve });
+        } else { return Err("Joined section edges must form one connected chain.".into()); }
+    }
+    let closed = distance(chain[0].point_at(0.0), chain.last().unwrap().point_at(1.0)) <= tolerance;
+    Ok(brep::LoftSection::Profile { plane, wires: vec![chain.into_iter().map(Curve::Nurbs).collect()], closed })
+}
+
+/// Bounded, normalized three-dimensional guide/path curves.
+pub fn loft_path_geometry(entity: &EmbeddedEntity) -> Result<Vec<brep::Curve3>, String> {
+    let identity = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+    match embedded_sweep_path(entity, identity).map_err(|error| format!("Invalid loft guide or path: {error}"))? {
+        HistorySweepPath::Planar { plane, curves, .. } => curves.iter().map(|curve| {
+            let rational = brep::nurbs_builder::RationalCurve2::from_curve(curve)
+                .ok_or("Unsupported loft guide or path")?.lifted(&plane);
+            Ok(brep::Curve3::Nurbs(rational.curve().ok_or("Invalid loft guide or path")?))
+        }).collect(),
+        HistorySweepPath::Polyline3d { points, closed } => {
+            let mut points = points;
+            if closed && points.first() != points.last() { points.push(points[0]); }
+            Ok(points.windows(2).map(|pair| brep::Curve3::Line(brep::Line3 {
+                origin: pair[0], direction: (Vec3::from(pair[1])-Vec3::from(pair[0])).to_array(),
+            })).collect())
+        }
+        HistorySweepPath::Nurbs3(curve) => {
+            let (start, end) = curve.domain();
+            let knots = curve.knots().iter().map(|value| (value-start)/(end-start)).collect();
+            Ok(vec![brep::Curve3::Nurbs(NurbsCurve3::new_strict(curve.degree(), curve.control_points().to_vec(),
+                knots, curve.weights().to_vec()).ok_or("Invalid loft path spline")?)])
+        }
+    }
+}
+
+/// First creation, Properties changes and reload all use this same builder.
+pub fn rebuild_loft_with_options(value: &SolidHistoryLoft) -> Result<Body, String> {
+    let settings = value.parameters.clone().unwrap_or_else(|| cadcodec::objects::SolidHistoryLoftParameters {
+        normals: 0, ..Default::default()
+    });
+    let counts = if settings.section_counts.is_empty() { vec![1; value.cross_sections.len()] }
+        else { settings.section_counts.clone() };
+    if counts.iter().any(|count| *count == 0) || counts.iter().try_fold(0usize, |sum, count| sum.checked_add(*count))
+        != Some(value.cross_sections.len()) { return Err("Invalid loft section grouping.".into()); }
+    let mut offset = 0;
+    let mut sections = Vec::new();
+    for count in counts {
+        sections.push(loft_section_geometry(&value.cross_sections[offset..offset+count])?);
+        offset += count;
+    }
+    let guides = value.guides.iter().map(loft_path_geometry).collect::<Result<Vec<_>, _>>()?;
+    let path = settings.path_entity.as_ref().map(loft_path_geometry).transpose()?;
+    let body = brep::loft_with_options(&sections, &guides, path.as_deref(), brep::LoftOptions {
+        surface: settings.surface, normals: settings.normals,
+        start_draft_angle: settings.start_draft_angle, end_draft_angle: settings.end_draft_angle,
+        start_magnitude: settings.start_magnitude, end_magnitude: settings.end_magnitude,
+        start_continuity: settings.start_continuity, end_continuity: settings.end_continuity,
+        start_bulge: settings.start_bulge, end_bulge: settings.end_bulge,
+        closed: settings.closed, periodic: settings.periodic, align_direction: settings.align_direction,
+    }).map_err(|error| error.to_string())?;
+    brep::transform(&body, &placement(value.base.transform).map_err(|error| error.to_string())?)
+        .ok_or_else(|| "Invalid loft placement.".into())
+}
+
 fn rebuild_loft(value: &SolidHistoryLoft) -> Result<Body, HistoryRebuildError> {
-    if !value.guides.is_empty() {
-        return Err(HistoryRebuildError::Unsupported);
-    }
-    let sections = value
-        .cross_sections
-        .iter()
-        .map(|entity| {
-            let curve = embedded_curve(entity)?;
-            Ok((curve.plane, profile_pieces(&curve.curve)?))
-        })
-        .collect::<Result<Vec<_>, HistoryRebuildError>>()?;
-    if sections.len() < 2 {
-        return Err(HistoryRebuildError::InvalidParameters);
-    }
-    finish(brep::loft(&sections), value.base.transform)
+    rebuild_loft_with_options(value).map_err(|_| HistoryRebuildError::InvalidParameters)
 }
 
 pub fn rebuild_body(

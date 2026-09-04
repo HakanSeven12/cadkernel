@@ -1325,7 +1325,7 @@ fn refine_pcurve_edge(
             if distance3(position, surface.point_at(uv[0], uv[1])) > tolerance {
                 return None;
             }
-            let Some(normal) = surface.normal_at(uv[0], uv[1]) else {
+            let Some(normal) = surface_display_normal(surface, uv) else {
                 return None;
             };
             normals.push(normal);
@@ -1479,7 +1479,7 @@ fn refine_edge(
             {
                 return None;
             }
-            normals.push(surface.normal_at(uv[0], uv[1])?);
+            normals.push(surface_display_normal(surface, uv)?);
         }
         split |= angle_exceeds(
             crate::tessellation::max_direction_angle(&normals),
@@ -4208,13 +4208,54 @@ fn surface_triangle_angle_cached(
     surface_normal_angle_cached(surface, &parameters, cache)
 }
 
+/// A collapsed spline boundary has no differential normal at the pole.
+/// Retain its parameter-dependent one-sided limit for display, without
+/// accepting singularities in the interior of a surface.
+fn surface_display_normal(
+    surface: &super::geometry::Surface,
+    uv: [f64; 2],
+) -> Option<[f64; 3]> {
+    let direct = surface.normal_at(uv[0], uv[1]);
+    let super::geometry::Surface::Nurbs(nurbs) = surface else { return direct; };
+    let ((u0, u1), (v0, v1)) = nurbs.domain();
+    let on_u_boundary = parameter_value_near(uv[0], u0) || parameter_value_near(uv[0], u1);
+    let on_v_boundary = parameter_value_near(uv[1], v0) || parameter_value_near(uv[1], v1);
+    if !on_u_boundary && !on_v_boundary { return direct; }
+    // At a collapsed row, cancellation can leave a tiny, nonzero tangent
+    // with an arbitrary direction. Treat that like the exact zero tangent.
+    let collapsed = surface.tangents_at(uv[0], uv[1]).is_some_and(|(du, dv)| {
+        let u_length = Vec3::from(du).length() * (u1 - u0);
+        let v_length = Vec3::from(dv).length() * (v1 - v0);
+        (on_v_boundary && u_length <= v_length * 1e-12)
+            || (on_u_boundary && v_length <= u_length * 1e-12)
+    });
+    if direct.is_some() && !collapsed { return direct; }
+    let mut inward = uv;
+    for (axis, (low, high)) in [(u0, u1), (v0, v1)].into_iter().enumerate() {
+        let span = high - low;
+        if !span.is_finite() || span <= 0.0 { continue; }
+        let step = span * 1e-6;
+        let value = if parameter_value_near(uv[axis], low) {
+            low + step
+        } else if parameter_value_near(uv[axis], high) {
+            high - step
+        } else { continue; };
+        inward[axis] = value;
+    }
+    // At a corner, moving only along the collapsed boundary still leaves us
+    // on the pole. A tiny cancellation residual there can look like a valid
+    // normal and depend on which endpoint is the pole. Move every boundary
+    // coordinate inward before evaluating the one-sided limit.
+    if inward != uv { surface.normal_at(inward[0], inward[1]) } else { None }
+}
+
 fn surface_normal_angle(
     surface: &super::geometry::Surface,
     parameters: &[[f64; 2]],
 ) -> Option<f64> {
     let normals = parameters
         .iter()
-        .map(|uv| surface.normal_at(uv[0], uv[1]))
+        .map(|uv| surface_display_normal(surface, *uv))
         .collect::<Option<Vec<_>>>()?;
     Some(crate::tessellation::max_direction_angle(&normals))
 }
@@ -4231,7 +4272,7 @@ fn surface_normal_angle_cached(
             if let Some(normal) = cache.get(&key) {
                 return *normal;
             }
-            let normal = surface.normal_at(uv[0], uv[1]);
+            let normal = surface_display_normal(surface, *uv);
             cache.insert(key, normal);
             normal
         })
@@ -4266,14 +4307,9 @@ fn surface_path_angle(
         .iter()
         .map(|uv| surface.tangents_at(uv[0], uv[1]))
         .collect::<Option<Vec<_>>>()?;
-    let normals = frames
+    let normals = parameters
         .iter()
-        .map(|frame| {
-            Vec3::from(frame.0)
-                .cross(Vec3::from(frame.1))
-                .normalize()
-                .map(Vec3::to_array)
-        })
+        .map(|uv| surface_display_normal(surface, *uv))
         .collect::<Option<Vec<_>>>()?;
     let mut largest = crate::tessellation::max_direction_angle(&normals);
     if length <= f64::MIN_POSITIVE {
@@ -4369,7 +4405,7 @@ fn emit_scheduled_with_cache(
             .and_then(|cache| cache.get(&parameters.map(f64::to_bits)))
             .copied()
             .flatten()
-            .or_else(|| surface.normal_at(parameters[0], parameters[1]));
+            .or_else(|| surface_display_normal(surface, parameters));
         let normal = stored
             .and_then(|normal| Vec3::from(normal).normalize())
             .unwrap_or(normal);
