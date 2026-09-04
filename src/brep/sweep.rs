@@ -797,6 +797,9 @@ fn extrusion_region(
     let profiles = profiles.iter().map(|ring| super::extrusion_profile_pieces(ring)).collect::<Vec<_>>();
     valid_region_loops(&profiles)?;
     let mut result = build(profiles.first()?, false)?;
+    if profiles.len() == 1 {
+        return Some(result);
+    }
     let cap_planes = [plane, Plane::from_axes((Vec3::from(plane.origin) + Vec3::from(direction)).to_array(), plane.x_axis, plane.y_axis)];
     let caps = cap_planes.iter().map(|plane| extrusion_cap(&result, plane)).collect::<Option<Vec<_>>>()?;
     let shell = result.faces.get(caps[0])?.owner;
@@ -832,10 +835,12 @@ fn extrusion_region(
 fn extrusion_cap(body: &Body, plane: &Plane) -> Option<FaceKey> {
     let normal = Vec3::from(plane.normal()?);
     let tolerance = super::operation_tolerance(&[body]);
-    body.face_keys().find(|key| super::planar_face_profile(body, *key).is_some_and(|profile| {
-        normal.dot(Vec3::from(profile.outward)).abs() > 1.0 - 1e-9
-            && plane.distance_to(profile.plane.origin).is_some_and(|gap| gap.abs() <= tolerance)
-    }))
+    body.face_keys().find(|key| {
+        let Some(face) = body.faces.get(*key) else { return false; };
+        let Some(Surface::Plane(candidate)) = body.surfaces.get(face.surface) else { return false; };
+        candidate.normal().is_some_and(|candidate_normal| normal.dot(Vec3::from(candidate_normal)).abs() > 1.0 - 1e-9)
+            && plane.distance_to(candidate.origin).is_some_and(|gap| gap.abs() <= tolerance)
+    })
 }
 
 fn valid_region_loops(profiles: &[Vec<Curve2>]) -> Option<()> {
