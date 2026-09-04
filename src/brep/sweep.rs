@@ -2711,7 +2711,7 @@ pub fn revolve_surface_region(
 /// Seams name the same face twice and do not create adjacency. Preserving the
 /// input face order keeps the component containing the provisional shell's
 /// first face first as well.
-fn face_components(body: &Body, faces: &[FaceKey]) -> Option<Vec<Vec<FaceKey>>> {
+pub(crate) fn face_components(body: &Body, faces: &[FaceKey]) -> Option<Vec<Vec<FaceKey>>> {
     let included = faces.iter().copied().collect::<HashSet<_>>();
     let mut adjacent = HashMap::<FaceKey, Vec<FaceKey>>::new();
     for (_, edge) in body.edges.iter() {
