@@ -83,36 +83,9 @@ pub fn fillet(body: &Body, edge: EdgeKey, radius: f64) -> Option<Body> {
     Some(result)
 }
 
-/// Moves one planar face of a convex planar solid along its outward normal.
+/// Moves a planar face while extending or trimming its neighbouring surfaces.
 pub fn presspull(body: &Body, face_key: FaceKey, distance: f64) -> Option<Body> {
-    if !distance.is_finite() || distance.abs() <= f64::EPSILON {
-        return None;
-    }
-    let mut selected = false;
-    let mut halfspaces = Vec::new();
-    for (key, face) in body.faces.iter() {
-        let Surface::Plane(plane) = body.surfaces.get(face.surface)? else {
-            return None;
-        };
-        let mut normal = Vec3::from(plane.normal()?);
-        if !face.forward {
-            normal = -normal;
-        }
-        let moved = key == face_key;
-        selected |= moved;
-        let origin = Vec3::from(plane.origin) + normal * if moved { distance } else { 0.0 };
-        halfspaces.push(Halfspace {
-            origin,
-            normal,
-            offset: normal.dot(origin),
-            added: moved,
-        });
-    }
-    if !selected {
-        return None;
-    }
-    let (result, _) = convex_body(&halfspaces)?;
-    Some(result)
+    super::presspull_face(body, face_key, distance, super::PresspullMode::Offset)
 }
 
 fn circle_parameters(plane: &Plane, start: Vec3, end: Vec3) -> Option<(f64, f64)> {

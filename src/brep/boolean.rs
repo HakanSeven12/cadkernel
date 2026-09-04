@@ -82,7 +82,7 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
             // which side it is on: it is on both.
             if let Some(twin) = coincident_twin(body, other, face, tolerance) {
                 if keeps_shared_wall(body, face, other, twin, flip_b, first) {
-                    copy_face(&mut result, body, face, shell, flip)?;
+                    copy_face_with_tolerance(&mut result, body, face, shell, flip, tolerance)?;
                     kept += 1;
                 }
                 continue;
@@ -91,7 +91,7 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
                 Containment::OnBoundary => return Err(Snag::Coincident),
                 Containment::Unknown => return Err(Snag::CutRefused),
                 side if side == wanted => {
-                    copy_face(&mut result, body, face, shell, flip)?;
+                    copy_face_with_tolerance(&mut result, body, face, shell, flip, tolerance)?;
                     kept += 1;
                 }
                 _ => {}
@@ -215,6 +215,12 @@ fn coincident_twin(
 
 /// Whether two surfaces are the same one, ignoring how each is parameterised.
 fn same_surface(one: &Surface, other: &Surface, tolerance: f64) -> bool {
+    if matches!(super::intersect_surfaces(one, other, tolerance), super::Meeting::Coincident) {
+        return true;
+    }
+    if !matches!((one, other), (Surface::Plane(_), Surface::Plane(_))) {
+        return false;
+    }
     // Compared by what each says about the other's frame origin and by their
     // normals, which is enough for the planar case a shared wall is and does
     // not depend on either having picked the same u direction.
@@ -252,9 +258,12 @@ fn keeps_shared_wall(
     flip_second: bool,
     is_first: bool,
 ) -> bool {
+    let Some(point) = interior_point(body, face, 1e-9) else { return false; };
     let outward = |body: &Body, face: FaceKey, flipped: bool| -> Option<Vec3> {
         let node = body.faces.get(face)?;
-        let normal = Vec3::from(body.surfaces.get(node.surface)?.frame()?.normal()?);
+        let surface = body.surfaces.get(node.surface)?;
+        let (u, v) = surface.parameters_at(point)?;
+        let normal = Vec3::from(surface.normal_at(u, v)?);
         Some(if node.forward != flipped { normal } else { -normal })
     };
     // Each face is flipped only if it belongs to the second solid and the
@@ -320,9 +329,14 @@ fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Option<[f64; 3]
         .then_some(candidate)
     };
     let chosen = usable(centre).or_else(|| {
-        samples
-            .iter()
-            .find_map(|point| usable([(centre[0] + point[0]) * 0.5, (centre[1] + point[1]) * 0.5]))
+        samples.iter().find_map(|point| {
+            [0.5, 0.75, 0.875, 0.9375, 0.25, 0.125].into_iter().find_map(|weight| {
+                usable([
+                    centre[0] + (point[0] - centre[0]) * weight,
+                    centre[1] + (point[1] - centre[1]) * weight,
+                ])
+            })
+        })
     });
     if let Some(chosen) = chosen {
         return Some(surface.point_at(chosen[0], chosen[1]));
@@ -341,6 +355,11 @@ pub(super) fn copy_face(
     shell: super::topology::ShellKey,
     flip: bool,
 ) -> Result<(), Snag> {
+    let tolerance = super::operation_tolerance(&[result, source]);
+    copy_face_with_tolerance(result, source, face, shell, flip, tolerance)
+}
+
+fn copy_face_with_tolerance(result: &mut Body, source: &Body, face: FaceKey, shell: super::ShellKey, flip: bool, tolerance: f64) -> Result<(), Snag> {
     let node = source.faces.get(face).ok_or(Snag::CutRefused)?;
     let surface = source
         .surfaces
@@ -377,8 +396,15 @@ pub(super) fn copy_face(
                 .get(source_edge.curve)
                 .ok_or(Snag::CutRefused)?
                 .clone();
-            let start = copy_vertex(result, source, source_edge.start)?;
-            let end = copy_vertex(result, source, source_edge.end)?;
+            let start = copy_vertex(result, source, source_edge.start, tolerance)?;
+            let end = copy_vertex(result, source, source_edge.end, tolerance)?;
+            // A short straight split can collapse when its two vertices are
+            // sewn within tolerance. Keeping a zero-length coedge leaves an
+            // otherwise valid triangular patch impossible to triangulate.
+            // Closed circles still require their single seam vertex.
+            if start == end && matches!(curve, super::Curve3::Line(_)) {
+                continue;
+            }
             let middle = curve.point_at(
                 0.5 * (source_edge.start_parameter + source_edge.end_parameter),
             );
@@ -387,7 +413,7 @@ pub(super) fn copy_face(
             // their own solid meet along it here only if their copies share
             // the edge, and without that the result is a shell of loose
             // faces that still passes every local check.
-            let edge = match find_edge(result, start, end, middle) {
+            let edge = match find_edge(result, start, end, middle, tolerance) {
                 Some(existing) => existing,
                 None => {
                     let curve = result.curves.insert(curve);
@@ -478,6 +504,7 @@ fn find_edge(
     start: super::topology::VertexKey,
     end: super::topology::VertexKey,
     middle: [f64; 3],
+    tolerance: f64,
 ) -> Option<super::topology::EdgeKey> {
     result
         .edges
@@ -498,7 +525,7 @@ fn find_edge(
                     })
                     .flatten()
                     .is_some_and(|point| {
-                        Vec3::from(point).distance(Vec3::from(middle)) <= 1e-9
+                        Vec3::from(point).distance(Vec3::from(middle)) <= tolerance
                     })
         })
         .map(|(key, _)| key)
@@ -512,12 +539,13 @@ fn copy_vertex(
     result: &mut Body,
     source: &Body,
     vertex: super::topology::VertexKey,
+    tolerance: f64,
 ) -> Result<super::topology::VertexKey, Snag> {
     let point = source.vertices.get(vertex).ok_or(Snag::CutRefused)?.point;
     let existing = result
         .vertices
         .iter()
-        .find(|(_, node)| Vec3::from(node.point).distance(Vec3::from(point)) <= 1e-9)
+        .find(|(_, node)| Vec3::from(node.point).distance(Vec3::from(point)) <= tolerance)
         .map(|(key, _)| key);
     Ok(match existing {
         Some(key) => key,
