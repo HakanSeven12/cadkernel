@@ -1286,13 +1286,21 @@ pub fn loft_section_geometry(entities: &[EmbeddedEntity]) -> Result<brep::LoftSe
 pub fn loft_path_geometry(entity: &EmbeddedEntity) -> Result<Vec<brep::Curve3>, String> {
     let identity = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
     match embedded_sweep_path(entity, identity).map_err(|error| format!("Invalid loft guide or path: {error}"))? {
-        HistorySweepPath::Planar { plane, curves, .. } => {
+        HistorySweepPath::Planar { plane, curves, start } => {
             let pieces = curves.iter().map(sweep_profile_pieces)
                 .collect::<Result<Vec<_>, _>>().map_err(|error| format!("Invalid loft path pieces: {error}"))?;
+            let mut previous = Vec3::from(start);
             pieces.into_iter().flatten().map(|curve| {
-            let rational = brep::nurbs_builder::RationalCurve2::from_curve(&curve)
+            let mut rational = brep::nurbs_builder::RationalCurve2::from_curve(&curve)
                 .ok_or("Unsupported loft guide or path")?.lifted(&plane);
-            Ok(brep::Curve3::Nurbs(rational.curve().ok_or("Invalid loft guide or path")?))
+            let initial = rational.curve().ok_or("Invalid loft guide or path")?;
+            if previous.distance(Vec3::from(initial.point_at(1.0)))
+                < previous.distance(Vec3::from(initial.point_at(0.0))) {
+                rational = rational.reversed();
+            }
+            let oriented = rational.curve().ok_or("Invalid loft guide or path")?;
+            previous = Vec3::from(oriented.point_at(1.0));
+            Ok(brep::Curve3::Nurbs(oriented))
             }).collect()
         },
         HistorySweepPath::Polyline3d { points, closed } => {
