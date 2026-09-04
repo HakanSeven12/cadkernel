@@ -364,12 +364,24 @@ fn prepared(sections: &[LoftSection], options: LoftOptions) -> Result<Vec<Sectio
     // Align whole wires before compatibility subdivision. Their exact geometry
     // remains unchanged; only traversal direction and the periodic seam move.
     if options.align_direction {
-        let mut previous: Option<(Vec<Wire>, Plane, Vec3)> = None;
-        for section in &mut result {
+        // A supporting plane is unoriented: two identical profiles may store
+        // opposite normals. Orient only the transport frames along the loft
+        // progression, otherwise a harmless normal sign change reverses the
+        // world-space perimeter and folds the skin between the sections.
+        let transport_normals = result.iter().enumerate().map(|(index, section)| {
+            let normal = Vec3::from(section.plane?.normal()?);
+            let last = result.len() - 1;
+            let before = if index > 0 { index - 1 } else if options.closed { last } else { 0 };
+            let after = if index < last { index + 1 } else if options.closed { 0 } else { last };
+            let mut travel = result[after].centre - result[before].centre;
+            if travel.length() <= 1e-12 { travel = result[after].centre - section.centre; }
+            Some(if normal.dot(travel) < 0.0 { -normal } else { normal })
+        }).collect::<Vec<_>>();
+        let mut previous: Option<(Vec<Wire>, Plane, Vec3, Vec3)> = None;
+        for (index, section) in result.iter_mut().enumerate() {
             if section.point.is_some() { continue; }
-            if let Some((ref previous, old_plane, old_centre)) = previous {
-                let current_normal = Vec3::from(section.plane.unwrap().normal().unwrap());
-                let old_normal = Vec3::from(old_plane.normal().unwrap());
+            let current_normal = transport_normals[index].unwrap();
+            if let Some((ref previous, old_plane, old_centre, old_normal)) = previous {
                 for (wire, old) in section.wires.iter_mut().zip(previous) {
                     let mut best = wire.clone(); let mut best_cost = f64::INFINITY;
                     for candidate in [wire.clone(), wire.reversed()] {
@@ -388,7 +400,7 @@ fn prepared(sections: &[LoftSection], options: LoftOptions) -> Result<Vec<Sectio
                     *wire = best;
                 }
             }
-            previous = Some((section.wires.clone(), section.plane.unwrap(), section.centre));
+            previous = Some((section.wires.clone(), section.plane.unwrap(), section.centre, current_normal));
         }
     }
     Ok(result)
