@@ -1286,11 +1286,15 @@ pub fn loft_section_geometry(entities: &[EmbeddedEntity]) -> Result<brep::LoftSe
 pub fn loft_path_geometry(entity: &EmbeddedEntity) -> Result<Vec<brep::Curve3>, String> {
     let identity = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
     match embedded_sweep_path(entity, identity).map_err(|error| format!("Invalid loft guide or path: {error}"))? {
-        HistorySweepPath::Planar { plane, curves, .. } => curves.iter().map(|curve| {
-            let rational = brep::nurbs_builder::RationalCurve2::from_curve(curve)
+        HistorySweepPath::Planar { plane, curves, .. } => {
+            let pieces = curves.iter().map(sweep_profile_pieces)
+                .collect::<Result<Vec<_>, _>>().map_err(|error| format!("Invalid loft path pieces: {error}"))?;
+            pieces.into_iter().flatten().map(|curve| {
+            let rational = brep::nurbs_builder::RationalCurve2::from_curve(&curve)
                 .ok_or("Unsupported loft guide or path")?.lifted(&plane);
             Ok(brep::Curve3::Nurbs(rational.curve().ok_or("Invalid loft guide or path")?))
-        }).collect(),
+            }).collect()
+        },
         HistorySweepPath::Polyline3d { points, closed } => {
             let mut points = points;
             if closed && points.first() != points.last() { points.push(points[0]); }
