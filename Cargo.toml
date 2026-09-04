@@ -32,7 +32,7 @@ acis = ["brep", "dep:cadcodec"]
 # this stack, since the offset path reaches into the crate's internals.
 cavalier_contours = { version = "=0.7.0", optional = true }
 spade = { version = "=2.15.1", optional = true }
-cadcodec = { package = "acadrust", git = "https://github.com/HakanSeven12/cadcodec.git", rev = "41efc90be0dbf165a1a46213d0567b46664a22c3", optional = true }
+cadcodec = { package = "acadrust", git = "https://github.com/HakanSeven12/cadcodec.git", rev = "580678d28f11ccbefbce3f9d3390d28ef4bbde80", optional = true }
 rustc-hash = "2"
 
 [dev-dependencies]
