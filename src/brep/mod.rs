@@ -42,6 +42,7 @@ pub mod pcurve;
 pub mod place;
 pub mod split;
 pub mod sweep;
+pub mod sweep_path;
 pub mod topology;
 
 pub use arena::{Arena, Key};
@@ -55,6 +56,10 @@ pub use place::{edge_points, edge_polylines, transform, Placement};
 pub use sweep::{
     extrude, extrude_region, extrude_surface, revolve, revolve_region, revolve_surface,
     revolve_surface_region, sweep_along, sweep_along_deformed, sweep_along_polyline3d,
+};
+pub use sweep_path::{
+    sweep_path, sweep_path_start, sweep_profile_base, sweep_profile_group_base,
+    sweep_profile_placement, SweepOptions, SweepPath,
 };
 #[cfg(feature = "offset")]
 pub use sweep::{extrude_surface_tapered, extrude_tapered};

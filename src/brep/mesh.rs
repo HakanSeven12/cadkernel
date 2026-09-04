@@ -3575,17 +3575,34 @@ fn fill_whole_surface(
     if u_cells.saturating_mul(v_cells).saturating_mul(2) > MAX_FACE_ADDITIONS {
         return None;
     }
+    // A square parameter grid needlessly refines the nearly straight direction
+    // of anisotropic NURBS patches whenever the curved direction is split.
+    // Seed each direction from its own normal variation, then retain the usual
+    // triangle-level verification below for variation between the probes.
+    let uniform_grid = || {
+        [
+            (0..=u_cells).map(|index| domain[0][0]
+                + (domain[0][1] - domain[0][0]) * index as f64 / u_cells as f64).collect(),
+            (0..=v_cells).map(|index| domain[1][0]
+                + (domain[1][1] - domain[1][0]) * index as f64 / v_cells as f64).collect(),
+        ]
+    };
+    let [u_values, v_values] = if analytic {
+        uniform_grid()
+    } else {
+        surface_grid_values(surface, domain, max_angle)
+            .filter(|[u, v]| u.len().saturating_sub(1)
+                .saturating_mul(v.len().saturating_sub(1))
+                .saturating_mul(2) <= MAX_FACE_ADDITIONS)
+            // Singular normals can prevent directional seeding; preserve the
+            // existing recursive path for those patches.
+            .unwrap_or_else(uniform_grid)
+    };
     let mut mesh = Mesh::default();
-    for v_index in 0..v_cells {
-        let v0 = domain[1][0]
-            + (domain[1][1] - domain[1][0]) * v_index as f64 / v_cells as f64;
-        let v1 = domain[1][0]
-            + (domain[1][1] - domain[1][0]) * (v_index + 1) as f64 / v_cells as f64;
-        for u_index in 0..u_cells {
-            let u0 = domain[0][0]
-                + (domain[0][1] - domain[0][0]) * u_index as f64 / u_cells as f64;
-            let u1 = domain[0][0]
-                + (domain[0][1] - domain[0][0]) * (u_index + 1) as f64 / u_cells as f64;
+    for v_span in v_values.windows(2) {
+        let [v0, v1] = [v_span[0], v_span[1]];
+        for u_span in u_values.windows(2) {
+            let [u0, u1] = [u_span[0], u_span[1]];
             for corners in [
                 [[u0, v0], [u1, v0], [u0, v1]],
                 [[u1, v0], [u1, v1], [u0, v1]],
@@ -3736,20 +3753,15 @@ fn fill_scheduled(
     (!mesh.triangles.is_empty()).then_some(mesh)
 }
 
-fn seed_surface_grid(
-    domain: &mut ConstrainedMesh,
+fn surface_grid_values(
     surface: &super::geometry::Surface,
-    rings: &[Vec<[f64; 2]>],
+    bounds: [[f64; 2]; 2],
     max_angle: f64,
-) -> Option<usize> {
-    if matches!(surface, super::geometry::Surface::Plane(_)) {
-        return Some(0);
-    }
+) -> Option<[Vec<f64>; 2]> {
     let nurbs = match surface {
         super::geometry::Surface::Nurbs(nurbs) => Some(nurbs),
         _ => None,
     };
-    let bounds = parameter_bounds(rings)?;
     let values = [0, 1].map(|axis| {
         let other = 1 - axis;
         let mut probes = nurbs.map_or_else(Vec::new, |nurbs| {
@@ -3809,6 +3821,22 @@ fn seed_surface_grid(
         Some(values)
     });
     let [Some(u_values), Some(v_values)] = values else {
+        return None;
+    };
+    Some([u_values, v_values])
+}
+
+fn seed_surface_grid(
+    domain: &mut ConstrainedMesh,
+    surface: &super::geometry::Surface,
+    rings: &[Vec<[f64; 2]>],
+    max_angle: f64,
+) -> Option<usize> {
+    if matches!(surface, super::geometry::Surface::Plane(_)) {
+        return Some(0);
+    }
+    let bounds = parameter_bounds(rings)?;
+    let Some([u_values, v_values]) = surface_grid_values(surface, bounds, max_angle) else {
         return Some(0);
     };
     if u_values.len().saturating_mul(v_values.len()) > MAX_FACE_ADDITIONS {
@@ -3958,6 +3986,12 @@ fn refine_scheduled(
     tolerance: f64,
     split_axis: Option<usize>,
 ) -> bool {
+    // Recursive patches need the same growth bound as constrained faces.
+    // A folded or singular surface can otherwise keep emitting triangles
+    // around a normal discontinuity until memory is exhausted.
+    if mesh.triangles.len() >= MAX_FACE_ADDITIONS {
+        return false;
+    }
     let Some(node) = body.faces.get(face) else {
         return false;
     };

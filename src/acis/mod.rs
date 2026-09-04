@@ -8,6 +8,6 @@ mod lift;
 mod lower;
 
 pub use append::{append, Unappendable, Written};
-pub use history::{rebuild_body, HistoryRebuildError};
+pub use history::{rebuild_body, rebuild_sweep_with_mode, sweep_history_path_length, sweep_history_placements, sweep_history_reference_point, sweep_profile_geometry, HistoryRebuildError};
 pub use lift::{lift, lift_body, Loss};
 pub use lower::{lower, pending, Unwritable};
