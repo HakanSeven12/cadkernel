@@ -117,6 +117,18 @@ pub struct BodyMesh {
     analytic_cones: Vec<AnalyticConeFace>,
 }
 
+/// Display-only body curves, without a face triangle mesh or silhouette data.
+///
+/// Failed edge schedules are omitted. `missing_faces` lists faces whose
+/// requested isolines could not be generated; an empty list does not certify
+/// that the body's faces can be triangulated.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BodyWireframe {
+    pub edges: Vec<EdgeMesh>,
+    pub isolines: Vec<FacePolyline>,
+    pub missing_faces: Vec<FaceKey>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FacePolyline {
     pub face: FaceKey,
@@ -680,16 +692,7 @@ fn emit_points(mesh: &mut Mesh, a: [f64; 3], b: [f64; 3], c: [f64; 3]) {
 
 /// Tessellates faces and edges from one shared sample schedule.
 pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
-    let schedules: HashMap<EdgeKey, Vec<super::place::EdgeSample>> = body
-        .edge_keys()
-        .filter_map(|edge| {
-            let max_angle = edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal);
-            Some((
-                edge,
-                shared_edge_samples(body, edge, max_angle, tolerance.linear)?,
-            ))
-        })
-        .collect();
+    let schedules = body_edge_schedules(body, tolerance);
     let mut out = BodyMesh::default();
     for face_key in body.face_keys() {
         let max_angle = face_chordal_angle(body, face_key, tolerance.angle, tolerance.chordal);
@@ -724,23 +727,72 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
             None => out.missing_faces.push(face_key),
         }
     }
-    for edge_key in body.edge_keys() {
-        if topological_parameter_seam(body, edge_key) {
-            continue;
-        }
-        if let Some(schedule) = schedules.get(&edge_key) {
-            if schedule.len() >= 2 {
-                out.edges.push(EdgeMesh {
-                    edge: edge_key,
-                    parameters: schedule.iter().map(|sample| sample.parameter).collect(),
-                    positions: schedule.iter().map(|sample| sample.position).collect(),
-                });
-            }
-        }
-    }
+    out.edges = visible_scheduled_edges(body, &schedules);
     out.missing_faces.dedup();
     out.precision = silhouette_precision(&out.mesh);
     out
+}
+
+/// Tessellates display edges and optional face isolines without triangulating.
+///
+/// Uses the same edge samples, seam filtering, face parameter bounds and
+/// tolerance policy as [`tessellate`]. This is intended for wireframe-only
+/// consumers such as interactive previews: no face mesh is built or validated,
+/// and valid isolines remain available even when triangulation would fail.
+/// See [`BodyWireframe`] for partial-output failure semantics.
+pub fn tessellate_wireframe(body: &Body, tolerance: TessellationTolerance) -> BodyWireframe {
+    let schedules = body_edge_schedules(body, tolerance);
+    let mut out = BodyWireframe::default();
+    if tolerance.isolines > 0 {
+        for face_key in body.face_keys() {
+            let max_angle = face_chordal_angle(body, face_key, tolerance.angle, tolerance.chordal);
+            match face_isolines(
+                body,
+                face_key,
+                max_angle,
+                tolerance.linear,
+                tolerance.isolines,
+                &schedules,
+            ) {
+                Some(lines) => out.isolines.extend(lines),
+                None => out.missing_faces.push(face_key),
+            }
+        }
+    }
+    out.edges = visible_scheduled_edges(body, &schedules);
+    out
+}
+
+fn body_edge_schedules(
+    body: &Body,
+    tolerance: TessellationTolerance,
+) -> HashMap<EdgeKey, Vec<super::place::EdgeSample>> {
+    body.edge_keys()
+        .filter_map(|edge| {
+            let max_angle = edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal);
+            Some((
+                edge,
+                shared_edge_samples(body, edge, max_angle, tolerance.linear)?,
+            ))
+        })
+        .collect()
+}
+
+fn visible_scheduled_edges(
+    body: &Body,
+    schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+) -> Vec<EdgeMesh> {
+    body.edge_keys()
+        .filter(|edge| !topological_parameter_seam(body, *edge))
+        .filter_map(|edge| {
+            let schedule = schedules.get(&edge)?;
+            (schedule.len() >= 2).then(|| EdgeMesh {
+                edge,
+                parameters: schedule.iter().map(|sample| sample.parameter).collect(),
+                positions: schedule.iter().map(|sample| sample.position).collect(),
+            })
+        })
+        .collect()
 }
 
 fn topological_parameter_seam(body: &Body, edge: EdgeKey) -> bool {
