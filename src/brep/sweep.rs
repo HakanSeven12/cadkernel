@@ -326,6 +326,24 @@ pub fn extrude_tapered(
     if taper_angle.abs() <= 1e-12 {
         return extrude(plane, profile, direction);
     }
+    // A circular draft remains an analytic cone. A ruled spline loft loses
+    // that identity and makes its otherwise ordinary cap uneditable.
+    if let Some((centre, radius)) = complete_circular_profile(profile) {
+        let normal = Vec3::from(plane.normal()?);
+        let along = Vec3::from(direction);
+        let height = along.dot(normal);
+        if along.cross(normal).length() <= 1e-10 * along.length().max(1.0) {
+            let top = radius - height.abs() * taper_angle.tan();
+            if top <= 1e-12 || height.abs() <= 1e-12 { return None; }
+            let origin = plane.point_at(centre);
+            let section = Plane::from_axes(origin, plane.x_axis, normal.to_array());
+            let points = [[0.0, 0.0], [radius, 0.0], [top, height], [0.0, height]];
+            let edges = (0..4).map(|index| Curve2::Line(crate::geom2d::Line {
+                start: points[index], end: points[(index + 1) % 4],
+            })).collect::<Vec<_>>();
+            return revolve(section, &edges, origin, normal.to_array(), TAU);
+        }
+    }
     let senses = profile_senses(profile)?;
     let along = Vec3::from(direction);
     let height = along.dot(Vec3::from(plane.normal()?)).abs();
@@ -471,14 +489,8 @@ pub fn extrude_surface_tapered(
     let mut body = extrude_tapered(plane, profile, direction, taper_angle)?;
     let lump = *body.roots.first()?;
     let shell = *body.lumps.get(lump)?.shells.first()?;
-    let caps = body
-        .shells
-        .get(shell)?
-        .faces
-        .iter()
-        .copied()
-        .take(2)
-        .collect::<Vec<_>>();
+    let far = Plane::from_axes((Vec3::from(plane.origin) + Vec3::from(direction)).to_array(), plane.x_axis, plane.y_axis);
+    let caps = vec![extrusion_cap(&body, &plane)?, extrusion_cap(&body, &far)?];
     if caps.len() != 2
         || caps.iter().any(|face| {
             body.faces
@@ -508,7 +520,7 @@ pub fn extrude_surface_tapered(
             .get_mut(shell)?
             .faces
             .retain(|candidate| *candidate != face_key);
-        if !body.faces.iter().any(|(_, face)| face.surface == face.surface) {
+        if !body.faces.iter().any(|(_, remaining)| remaining.surface == face.surface) {
             body.surfaces.remove(face.surface);
         }
     }
@@ -726,20 +738,135 @@ pub fn extrude_region(
     profiles: &[Vec<Curve2>],
     direction: [f64; 3],
 ) -> Option<Body> {
-    let mut profiles = profiles.iter();
-    let mut result = extrude(plane, profiles.next()?, direction)?;
-    for hole in profiles {
-        let cutter = extrude(plane, hole, direction)?;
-        let tolerance = super::operation_tolerance(&[&result, &cutter]);
-        result = super::boolean::combine(
-            result,
-            cutter,
-            super::boolean::Operation::Difference,
-            tolerance,
-        )
-        .ok()?;
+    extrusion_region(plane, profiles, direction, |profile, _| extrude(plane, profile, direction))
+}
+
+#[cfg(feature = "offset")]
+fn complete_circular_profile(profile: &[Curve2]) -> Option<([f64; 2], f64)> {
+    let first = profile.first()?;
+    let (centre, radius) = match first {
+        Curve2::Circle(circle) if profile.len() == 1 => return Some((circle.centre, circle.radius)),
+        Curve2::Arc(arc) => (arc.centre, arc.radius),
+        _ => return None,
+    };
+    let mut sweep = 0.0;
+    for curve in profile {
+        let Curve2::Arc(arc) = curve else { return None; };
+        if (arc.centre[0] - centre[0]).hypot(arc.centre[1] - centre[1]) > 1e-9
+            || (arc.radius - radius).abs() > 1e-9 { return None; }
+        sweep += arc.sweep();
+    }
+    ((sweep - TAU).abs() < 1e-9 && profile_senses(profile).is_some()).then_some((centre, radius))
+}
+
+/// Extrudes all region loops as lateral sheets, without Boolean operations.
+pub fn extrude_surface_region(plane: Plane, profiles: &[Vec<Curve2>], direction: [f64; 3]) -> Option<Body> {
+    let mut result = Body::new();
+    for profile in profiles {
+        let pieces = super::extrusion_profile_pieces(profile);
+        append_body(&mut result, &extrude_surface(plane, &pieces, direction)?)?;
     }
     (!result.roots.is_empty() && result.validate().is_empty()).then_some(result)
+}
+
+/// Tapers the outer wall inward and hole walls outward for a positive angle.
+#[cfg(feature = "offset")]
+pub fn extrude_region_tapered(plane: Plane, profiles: &[Vec<Curve2>], direction: [f64; 3], angle: f64) -> Option<Body> {
+    extrusion_region(plane, profiles, direction, |profile, hole| {
+        extrude_tapered(plane, profile, direction, if hole { -angle } else { angle })
+    })
+}
+
+/// Tapered lateral sheets for all loops of a bounded region.
+#[cfg(feature = "offset")]
+pub fn extrude_surface_region_tapered(plane: Plane, profiles: &[Vec<Curve2>], direction: [f64; 3], angle: f64) -> Option<Body> {
+    let mut result = Body::new();
+    for (index, profile) in profiles.iter().enumerate() {
+        let pieces = super::extrusion_profile_pieces(profile);
+        append_body(&mut result, &extrude_surface_tapered(plane, &pieces, direction, if index == 0 { angle } else { -angle })?)?;
+    }
+    (!result.roots.is_empty() && result.validate().is_empty()).then_some(result)
+}
+
+fn extrusion_region(
+    plane: Plane,
+    profiles: &[Vec<Curve2>],
+    direction: [f64; 3],
+    build: impl Fn(&[Curve2], bool) -> Option<Body>,
+) -> Option<Body> {
+    let profiles = profiles.iter().map(|ring| super::extrusion_profile_pieces(ring)).collect::<Vec<_>>();
+    valid_region_loops(&profiles)?;
+    let mut result = build(profiles.first()?, false)?;
+    if profiles.len() == 1 {
+        return Some(result);
+    }
+    let cap_planes = [plane, Plane::from_axes((Vec3::from(plane.origin) + Vec3::from(direction)).to_array(), plane.x_axis, plane.y_axis)];
+    let caps = cap_planes.iter().map(|plane| extrusion_cap(&result, plane)).collect::<Option<Vec<_>>>()?;
+    let shell = result.faces.get(caps[0])?.owner;
+    for hole in profiles.iter().skip(1) {
+        let cutter = build(hole, true)?;
+        let hole_caps = cap_planes.iter().map(|plane| extrusion_cap(&cutter, plane)).collect::<Option<Vec<_>>>()?;
+        for face in cutter.face_keys() {
+            super::boolean::copy_face(&mut result, &cutter, face, shell, true).ok()?;
+            if let Some(index) = hole_caps.iter().position(|cap| *cap == face) {
+                let copied = *result.shells.get(shell)?.faces.last()?;
+                let loops = result.faces.get(copied)?.loops.clone();
+                for ring in &loops {
+                    let coedges = result.loops.get(*ring)?.coedges.clone();
+                    result.loops.get_mut(*ring)?.owner = caps[index];
+                    for coedge in coedges {
+                        result.coedges.get_mut(coedge)?.pcurve = None;
+                    }
+                }
+                result.faces.get_mut(caps[index])?.loops.extend(loops);
+                result.shells.get_mut(shell)?.faces.retain(|key| *key != copied);
+                result.faces.remove(copied)?;
+            }
+        }
+    }
+    // The top can collapse before the base does when holes widen under draft.
+    for cap in caps {
+        valid_region_loops(&super::planar_face_profile(&result, cap)?.loops)?;
+    }
+    (!result.roots.is_empty() && result.validate().is_empty()
+        && result.edges.iter().all(|(_, edge)| edge.coedges.len() == 2)).then_some(result)
+}
+
+fn extrusion_cap(body: &Body, plane: &Plane) -> Option<FaceKey> {
+    let normal = Vec3::from(plane.normal()?);
+    let tolerance = super::operation_tolerance(&[body]);
+    body.face_keys().find(|key| {
+        let Some(face) = body.faces.get(*key) else { return false; };
+        let Some(Surface::Plane(candidate)) = body.surfaces.get(face.surface) else { return false; };
+        candidate.normal().is_some_and(|candidate_normal| normal.dot(Vec3::from(candidate_normal)).abs() > 1.0 - 1e-9)
+            && plane.distance_to(candidate.origin).is_some_and(|gap| gap.abs() <= tolerance)
+    })
+}
+
+fn valid_region_loops(profiles: &[Vec<Curve2>]) -> Option<()> {
+    let outer = profiles.first()?;
+    if outer.is_empty() { return None; }
+    let tolerance = crate::geom2d::Tolerance::new(1e-9);
+    for (index, hole) in profiles.iter().enumerate().skip(1) {
+        if hole.is_empty() || !crate::geom2d::contains(outer, hole[0].point_at(0.5), tolerance) {
+            return None;
+        }
+        for previous in &profiles[..index] {
+            if hole.iter().any(|curve| previous.iter().any(|other| {
+                !crate::geom2d::intersect(curve, other, tolerance).is_empty()
+                    || crate::geom2d::distance_to(other, curve.point_at(0.5)) <= tolerance.linear()
+            })) {
+                return None;
+            }
+        }
+        for previous in &profiles[1..index] {
+            if crate::geom2d::contains(previous, hole[0].point_at(0.5), tolerance)
+                || crate::geom2d::contains(hole, previous[0].point_at(0.5), tolerance) {
+                return None;
+            }
+        }
+    }
+    Some(())
 }
 
 /// Sweeps a profile along a connected chain of straight and circular pieces.
@@ -2589,7 +2716,7 @@ pub fn revolve_surface_region(
 /// Seams name the same face twice and do not create adjacency. Preserving the
 /// input face order keeps the component containing the provisional shell's
 /// first face first as well.
-fn face_components(body: &Body, faces: &[FaceKey]) -> Option<Vec<Vec<FaceKey>>> {
+pub(crate) fn face_components(body: &Body, faces: &[FaceKey]) -> Option<Vec<Vec<FaceKey>>> {
     let included = faces.iter().copied().collect::<HashSet<_>>();
     let mut adjacent = HashMap::<FaceKey, Vec<FaceKey>>::new();
     for (_, edge) in body.edges.iter() {
@@ -2726,7 +2853,7 @@ fn split_revolve_region_shells(body: &mut Body) -> Option<()> {
     Some(())
 }
 
-fn append_body(target: &mut Body, source: &Body) -> Option<()> {
+pub(crate) fn append_body(target: &mut Body, source: &Body) -> Option<()> {
     let vertices = source
         .vertices
         .iter()

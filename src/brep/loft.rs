@@ -282,13 +282,17 @@ fn curved_loft(sections: &[(Plane, Vec<Curve>)]) -> Option<Body> {
 
     let winding = Vec3::from(sections[0].0.normal()?) * first_area.signum();
     let forward = winding.dot(direction) > 0.0;
-    add_cap(&mut body, shell, &points[0], &rims[0], -direction, !forward)?;
+    let first_normal = Vec3::from(sections[0].0.normal()?);
+    let first_normal = if first_normal.dot(direction) > 0.0 { -first_normal } else { first_normal };
+    let last_normal = Vec3::from(sections.last()?.0.normal()?);
+    let last_normal = if last_normal.dot(direction) > 0.0 { last_normal } else { -last_normal };
+    add_cap(&mut body, shell, &points[0], &rims[0], first_normal, !forward)?;
     add_cap(
         &mut body,
         shell,
         points.last()?,
         rims.last()?,
-        direction,
+        last_normal,
         forward,
     )?;
 

@@ -117,6 +117,18 @@ pub struct BodyMesh {
     analytic_cones: Vec<AnalyticConeFace>,
 }
 
+/// Display-only body curves, without a face triangle mesh or silhouette data.
+///
+/// Failed edge schedules are omitted. `missing_faces` lists faces whose
+/// requested isolines could not be generated; an empty list does not certify
+/// that the body's faces can be triangulated.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BodyWireframe {
+    pub edges: Vec<EdgeMesh>,
+    pub isolines: Vec<FacePolyline>,
+    pub missing_faces: Vec<FaceKey>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FacePolyline {
     pub face: FaceKey,
@@ -680,16 +692,7 @@ fn emit_points(mesh: &mut Mesh, a: [f64; 3], b: [f64; 3], c: [f64; 3]) {
 
 /// Tessellates faces and edges from one shared sample schedule.
 pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
-    let schedules: HashMap<EdgeKey, Vec<super::place::EdgeSample>> = body
-        .edge_keys()
-        .filter_map(|edge| {
-            let max_angle = edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal);
-            Some((
-                edge,
-                shared_edge_samples(body, edge, max_angle, tolerance.linear)?,
-            ))
-        })
-        .collect();
+    let schedules = body_edge_schedules(body, tolerance);
     let mut out = BodyMesh::default();
     for face_key in body.face_keys() {
         let max_angle = face_chordal_angle(body, face_key, tolerance.angle, tolerance.chordal);
@@ -724,23 +727,72 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
             None => out.missing_faces.push(face_key),
         }
     }
-    for edge_key in body.edge_keys() {
-        if topological_parameter_seam(body, edge_key) {
-            continue;
-        }
-        if let Some(schedule) = schedules.get(&edge_key) {
-            if schedule.len() >= 2 {
-                out.edges.push(EdgeMesh {
-                    edge: edge_key,
-                    parameters: schedule.iter().map(|sample| sample.parameter).collect(),
-                    positions: schedule.iter().map(|sample| sample.position).collect(),
-                });
-            }
-        }
-    }
+    out.edges = visible_scheduled_edges(body, &schedules);
     out.missing_faces.dedup();
     out.precision = silhouette_precision(&out.mesh);
     out
+}
+
+/// Tessellates display edges and optional face isolines without triangulating.
+///
+/// Uses the same edge samples, seam filtering, face parameter bounds and
+/// tolerance policy as [`tessellate`]. This is intended for wireframe-only
+/// consumers such as interactive previews: no face mesh is built or validated,
+/// and valid isolines remain available even when triangulation would fail.
+/// See [`BodyWireframe`] for partial-output failure semantics.
+pub fn tessellate_wireframe(body: &Body, tolerance: TessellationTolerance) -> BodyWireframe {
+    let schedules = body_edge_schedules(body, tolerance);
+    let mut out = BodyWireframe::default();
+    if tolerance.isolines > 0 {
+        for face_key in body.face_keys() {
+            let max_angle = face_chordal_angle(body, face_key, tolerance.angle, tolerance.chordal);
+            match face_isolines(
+                body,
+                face_key,
+                max_angle,
+                tolerance.linear,
+                tolerance.isolines,
+                &schedules,
+            ) {
+                Some(lines) => out.isolines.extend(lines),
+                None => out.missing_faces.push(face_key),
+            }
+        }
+    }
+    out.edges = visible_scheduled_edges(body, &schedules);
+    out
+}
+
+fn body_edge_schedules(
+    body: &Body,
+    tolerance: TessellationTolerance,
+) -> HashMap<EdgeKey, Vec<super::place::EdgeSample>> {
+    body.edge_keys()
+        .filter_map(|edge| {
+            let max_angle = edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal);
+            Some((
+                edge,
+                shared_edge_samples(body, edge, max_angle, tolerance.linear)?,
+            ))
+        })
+        .collect()
+}
+
+fn visible_scheduled_edges(
+    body: &Body,
+    schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+) -> Vec<EdgeMesh> {
+    body.edge_keys()
+        .filter(|edge| !topological_parameter_seam(body, *edge))
+        .filter_map(|edge| {
+            let schedule = schedules.get(&edge)?;
+            (schedule.len() >= 2).then(|| EdgeMesh {
+                edge,
+                parameters: schedule.iter().map(|sample| sample.parameter).collect(),
+                positions: schedule.iter().map(|sample| sample.position).collect(),
+            })
+        })
+        .collect()
 }
 
 fn topological_parameter_seam(body: &Body, edge: EdgeKey) -> bool {
@@ -1273,7 +1325,7 @@ fn refine_pcurve_edge(
             if distance3(position, surface.point_at(uv[0], uv[1])) > tolerance {
                 return None;
             }
-            let Some(normal) = surface.normal_at(uv[0], uv[1]) else {
+            let Some(normal) = surface_display_normal(surface, uv) else {
                 return None;
             };
             normals.push(normal);
@@ -1427,7 +1479,7 @@ fn refine_edge(
             {
                 return None;
             }
-            normals.push(surface.normal_at(uv[0], uv[1])?);
+            normals.push(surface_display_normal(surface, uv)?);
         }
         split |= angle_exceeds(
             crate::tessellation::max_direction_angle(&normals),
@@ -3523,17 +3575,34 @@ fn fill_whole_surface(
     if u_cells.saturating_mul(v_cells).saturating_mul(2) > MAX_FACE_ADDITIONS {
         return None;
     }
+    // A square parameter grid needlessly refines the nearly straight direction
+    // of anisotropic NURBS patches whenever the curved direction is split.
+    // Seed each direction from its own normal variation, then retain the usual
+    // triangle-level verification below for variation between the probes.
+    let uniform_grid = || {
+        [
+            (0..=u_cells).map(|index| domain[0][0]
+                + (domain[0][1] - domain[0][0]) * index as f64 / u_cells as f64).collect(),
+            (0..=v_cells).map(|index| domain[1][0]
+                + (domain[1][1] - domain[1][0]) * index as f64 / v_cells as f64).collect(),
+        ]
+    };
+    let [u_values, v_values] = if analytic {
+        uniform_grid()
+    } else {
+        surface_grid_values(surface, domain, max_angle)
+            .filter(|[u, v]| u.len().saturating_sub(1)
+                .saturating_mul(v.len().saturating_sub(1))
+                .saturating_mul(2) <= MAX_FACE_ADDITIONS)
+            // Singular normals can prevent directional seeding; preserve the
+            // existing recursive path for those patches.
+            .unwrap_or_else(uniform_grid)
+    };
     let mut mesh = Mesh::default();
-    for v_index in 0..v_cells {
-        let v0 = domain[1][0]
-            + (domain[1][1] - domain[1][0]) * v_index as f64 / v_cells as f64;
-        let v1 = domain[1][0]
-            + (domain[1][1] - domain[1][0]) * (v_index + 1) as f64 / v_cells as f64;
-        for u_index in 0..u_cells {
-            let u0 = domain[0][0]
-                + (domain[0][1] - domain[0][0]) * u_index as f64 / u_cells as f64;
-            let u1 = domain[0][0]
-                + (domain[0][1] - domain[0][0]) * (u_index + 1) as f64 / u_cells as f64;
+    for v_span in v_values.windows(2) {
+        let [v0, v1] = [v_span[0], v_span[1]];
+        for u_span in u_values.windows(2) {
+            let [u0, u1] = [u_span[0], u_span[1]];
             for corners in [
                 [[u0, v0], [u1, v0], [u0, v1]],
                 [[u1, v0], [u1, v1], [u0, v1]],
@@ -3684,20 +3753,15 @@ fn fill_scheduled(
     (!mesh.triangles.is_empty()).then_some(mesh)
 }
 
-fn seed_surface_grid(
-    domain: &mut ConstrainedMesh,
+fn surface_grid_values(
     surface: &super::geometry::Surface,
-    rings: &[Vec<[f64; 2]>],
+    bounds: [[f64; 2]; 2],
     max_angle: f64,
-) -> Option<usize> {
-    if matches!(surface, super::geometry::Surface::Plane(_)) {
-        return Some(0);
-    }
+) -> Option<[Vec<f64>; 2]> {
     let nurbs = match surface {
         super::geometry::Surface::Nurbs(nurbs) => Some(nurbs),
         _ => None,
     };
-    let bounds = parameter_bounds(rings)?;
     let values = [0, 1].map(|axis| {
         let other = 1 - axis;
         let mut probes = nurbs.map_or_else(Vec::new, |nurbs| {
@@ -3757,6 +3821,22 @@ fn seed_surface_grid(
         Some(values)
     });
     let [Some(u_values), Some(v_values)] = values else {
+        return None;
+    };
+    Some([u_values, v_values])
+}
+
+fn seed_surface_grid(
+    domain: &mut ConstrainedMesh,
+    surface: &super::geometry::Surface,
+    rings: &[Vec<[f64; 2]>],
+    max_angle: f64,
+) -> Option<usize> {
+    if matches!(surface, super::geometry::Surface::Plane(_)) {
+        return Some(0);
+    }
+    let bounds = parameter_bounds(rings)?;
+    let Some([u_values, v_values]) = surface_grid_values(surface, bounds, max_angle) else {
         return Some(0);
     };
     if u_values.len().saturating_mul(v_values.len()) > MAX_FACE_ADDITIONS {
@@ -3906,6 +3986,12 @@ fn refine_scheduled(
     tolerance: f64,
     split_axis: Option<usize>,
 ) -> bool {
+    // Recursive patches need the same growth bound as constrained faces.
+    // A folded or singular surface can otherwise keep emitting triangles
+    // around a normal discontinuity until memory is exhausted.
+    if mesh.triangles.len() >= MAX_FACE_ADDITIONS {
+        return false;
+    }
     let Some(node) = body.faces.get(face) else {
         return false;
     };
@@ -4122,13 +4208,54 @@ fn surface_triangle_angle_cached(
     surface_normal_angle_cached(surface, &parameters, cache)
 }
 
+/// A collapsed spline boundary has no differential normal at the pole.
+/// Retain its parameter-dependent one-sided limit for display, without
+/// accepting singularities in the interior of a surface.
+fn surface_display_normal(
+    surface: &super::geometry::Surface,
+    uv: [f64; 2],
+) -> Option<[f64; 3]> {
+    let direct = surface.normal_at(uv[0], uv[1]);
+    let super::geometry::Surface::Nurbs(nurbs) = surface else { return direct; };
+    let ((u0, u1), (v0, v1)) = nurbs.domain();
+    let on_u_boundary = parameter_value_near(uv[0], u0) || parameter_value_near(uv[0], u1);
+    let on_v_boundary = parameter_value_near(uv[1], v0) || parameter_value_near(uv[1], v1);
+    if !on_u_boundary && !on_v_boundary { return direct; }
+    // At a collapsed row, cancellation can leave a tiny, nonzero tangent
+    // with an arbitrary direction. Treat that like the exact zero tangent.
+    let collapsed = surface.tangents_at(uv[0], uv[1]).is_some_and(|(du, dv)| {
+        let u_length = Vec3::from(du).length() * (u1 - u0);
+        let v_length = Vec3::from(dv).length() * (v1 - v0);
+        (on_v_boundary && u_length <= v_length * 1e-12)
+            || (on_u_boundary && v_length <= u_length * 1e-12)
+    });
+    if direct.is_some() && !collapsed { return direct; }
+    let mut inward = uv;
+    for (axis, (low, high)) in [(u0, u1), (v0, v1)].into_iter().enumerate() {
+        let span = high - low;
+        if !span.is_finite() || span <= 0.0 { continue; }
+        let step = span * 1e-6;
+        let value = if parameter_value_near(uv[axis], low) {
+            low + step
+        } else if parameter_value_near(uv[axis], high) {
+            high - step
+        } else { continue; };
+        inward[axis] = value;
+    }
+    // At a corner, moving only along the collapsed boundary still leaves us
+    // on the pole. A tiny cancellation residual there can look like a valid
+    // normal and depend on which endpoint is the pole. Move every boundary
+    // coordinate inward before evaluating the one-sided limit.
+    if inward != uv { surface.normal_at(inward[0], inward[1]) } else { None }
+}
+
 fn surface_normal_angle(
     surface: &super::geometry::Surface,
     parameters: &[[f64; 2]],
 ) -> Option<f64> {
     let normals = parameters
         .iter()
-        .map(|uv| surface.normal_at(uv[0], uv[1]))
+        .map(|uv| surface_display_normal(surface, *uv))
         .collect::<Option<Vec<_>>>()?;
     Some(crate::tessellation::max_direction_angle(&normals))
 }
@@ -4145,7 +4272,7 @@ fn surface_normal_angle_cached(
             if let Some(normal) = cache.get(&key) {
                 return *normal;
             }
-            let normal = surface.normal_at(uv[0], uv[1]);
+            let normal = surface_display_normal(surface, *uv);
             cache.insert(key, normal);
             normal
         })
@@ -4180,14 +4307,9 @@ fn surface_path_angle(
         .iter()
         .map(|uv| surface.tangents_at(uv[0], uv[1]))
         .collect::<Option<Vec<_>>>()?;
-    let normals = frames
+    let normals = parameters
         .iter()
-        .map(|frame| {
-            Vec3::from(frame.0)
-                .cross(Vec3::from(frame.1))
-                .normalize()
-                .map(Vec3::to_array)
-        })
+        .map(|uv| surface_display_normal(surface, *uv))
         .collect::<Option<Vec<_>>>()?;
     let mut largest = crate::tessellation::max_direction_angle(&normals);
     if length <= f64::MIN_POSITIVE {
@@ -4283,7 +4405,7 @@ fn emit_scheduled_with_cache(
             .and_then(|cache| cache.get(&parameters.map(f64::to_bits)))
             .copied()
             .flatten()
-            .or_else(|| surface.normal_at(parameters[0], parameters[1]));
+            .or_else(|| surface_display_normal(surface, parameters));
         let normal = stored
             .and_then(|normal| Vec3::from(normal).normalize())
             .unwrap_or(normal);

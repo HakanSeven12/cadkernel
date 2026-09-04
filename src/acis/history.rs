@@ -9,7 +9,7 @@ use crate::geom2d::{
     Arc, Circle, Curve, Ellipse, EllipseArc, Line, NurbsCurve, Parameterization, Polyline,
     PolylineVertex,
 };
-use crate::space::{coplanarity_tolerance, PlanarCurve, Plane, Vec3};
+use crate::space::{coplanarity_tolerance, NurbsCurve3, PlanarCurve, Plane, Vec3};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryRebuildError {
@@ -56,24 +56,6 @@ fn finish(
     let body = body.ok_or(HistoryRebuildError::InvalidParameters)?;
     brep::transform(&body, &placement(transform)?)
         .ok_or(HistoryRebuildError::InvalidTransform)
-}
-
-fn circular_radius(
-    major: f64,
-    minor: f64,
-    x_radius: f64,
-) -> Result<f64, HistoryRebuildError> {
-    if [major, minor, x_radius]
-        .iter()
-        .any(|value| !value.is_finite() || *value <= 0.0)
-    {
-        return Err(HistoryRebuildError::InvalidParameters);
-    }
-    let tolerance = 1e-9 * major.max(minor).max(x_radius);
-    if (major - minor).abs() > tolerance || (major - x_radius).abs() > tolerance {
-        return Err(HistoryRebuildError::Unsupported);
-    }
-    Ok(major)
 }
 
 fn ocs_plane(normal: Vector3, elevation: f64) -> Result<Plane, HistoryRebuildError> {
@@ -416,7 +398,7 @@ fn path_pieces(curve: &Curve) -> Result<Vec<Curve>, HistoryRebuildError> {
         .ok_or(HistoryRebuildError::InvalidParameters)
 }
 
-fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
+fn legacy_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
     if !value.scale_factor.is_finite()
         || value.scale_factor <= 1e-9
         || !value.draft_angle.is_finite()
@@ -529,6 +511,551 @@ fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError>
     )
 }
 
+fn sweep_profile_pieces(curve: &Curve) -> Result<Vec<Curve>, HistoryRebuildError> {
+    let pieces = match curve {
+        Curve::Polyline(_) => curve.segments(),
+        Curve::Circle(_) => profile_pieces(curve)?,
+        Curve::Arc(_) | Curve::Ellipse(_) if curve.is_closed() => profile_pieces(curve)?,
+        Curve::Nurbs(value) if curve.is_closed() => (0..4)
+            .map(|part| {
+                value
+                    .trimmed(part as f64 / 4.0, (part + 1) as f64 / 4.0)
+                    .map(Curve::Nurbs)
+                    .ok_or(HistoryRebuildError::InvalidParameters)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Curve::Line(_) | Curve::Arc(_) | Curve::Ellipse(_) | Curve::Nurbs(_) => {
+            vec![curve.clone()]
+        }
+        _ => return Err(HistoryRebuildError::Unsupported),
+    };
+    (!pieces.is_empty())
+        .then_some(pieces)
+        .ok_or(HistoryRebuildError::InvalidParameters)
+}
+
+fn region_spline_pcurve(
+    body: &Body,
+    key: brep::CoedgeKey,
+    plane: Plane,
+    tolerance: f64,
+) -> Result<Option<Curve>, HistoryRebuildError> {
+    let coedge = body.coedges.get(key).ok_or(HistoryRebuildError::InvalidBrep)?;
+    if coedge.pcurve.is_some() {
+        return Ok(None);
+    }
+    let edge = body.edges.get(coedge.edge).ok_or(HistoryRebuildError::InvalidBrep)?;
+    let curve = body.curves.get(edge.curve).ok_or(HistoryRebuildError::InvalidBrep)?;
+    let (degree, controls, knots, weights, from, to) = match curve {
+        brep::Curve3::PlanarSpline { plane: source, curve } => (
+            curve.degree(),
+            curve.control_points().iter().map(|point| source.point_at(*point)).collect::<Vec<_>>(),
+            curve.knots().to_vec(),
+            curve.weights().to_vec(),
+            edge.start_parameter,
+            edge.end_parameter,
+        ),
+        brep::Curve3::Nurbs(curve) => {
+            let (start, end) = curve.domain();
+            (
+                curve.degree(),
+                curve.control_points().to_vec(),
+                curve.knots().to_vec(),
+                curve.weights().to_vec(),
+                (edge.start_parameter - start) / (end - start),
+                (edge.end_parameter - start) / (end - start),
+            )
+        }
+        _ => return Ok(None),
+    };
+    if controls.iter().any(|point| !plane.contains(*point, tolerance)) {
+        return Err(HistoryRebuildError::InvalidParameters);
+    }
+    let points = controls
+        .iter()
+        .map(|point| plane.project(*point).ok_or(HistoryRebuildError::InvalidParameters))
+        .collect::<Result<Vec<_>, _>>()?;
+    let curve = NurbsCurve::new(degree, points, knots, Some(weights))
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let curve = if coedge.forward { curve.trimmed(from, to) } else { curve.trimmed(to, from) }
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    Ok(Some(Curve::Nurbs(curve)))
+}
+
+fn region_sweep_profile(
+    region: &cadcodec::entities::Region,
+) -> Result<(Plane, Vec<Vec<Curve>>), HistoryRebuildError> {
+    if region.acis_data.has_data() {
+        let document = region.acis_data.parse().ok_or(HistoryRebuildError::InvalidBrep)?;
+        let (mut bodies, loss) = super::lift(&document);
+        if bodies.len() != 1 || !loss.is_empty() {
+            return Err(HistoryRebuildError::Unsupported);
+        }
+        let mut body = bodies.pop().ok_or(HistoryRebuildError::InvalidBrep)?;
+        let mut faces = body.faces.iter();
+        let (face_key, face) = faces.next().ok_or(HistoryRebuildError::InvalidBrep)?;
+        if faces.next().is_some() {
+            return Err(HistoryRebuildError::Unsupported);
+        }
+        let face = face.clone();
+        let Some(brep::Surface::Plane(plane)) = body.surfaces.get(face.surface) else {
+            return Err(HistoryRebuildError::InvalidParameters);
+        };
+        let plane = *plane;
+        let tolerance = brep::operation_tolerance(&[&body]);
+        let coedges = face.loops.iter().map(|key| {
+            body.loops.get(*key).map(|ring| ring.coedges.clone())
+                .ok_or(HistoryRebuildError::InvalidBrep)
+        }).collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect::<Vec<_>>();
+        for key in coedges {
+            if let Some(curve) = region_spline_pcurve(&body, key, plane, tolerance)? {
+                body.coedges.get_mut(key).ok_or(HistoryRebuildError::InvalidBrep)?.pcurve = Some(curve);
+            }
+        }
+        let boundary = brep::pcurve::face_boundary_parts(&body, face_key, tolerance)
+            .ok_or(HistoryRebuildError::Unsupported)?;
+        let wires = face
+            .loops
+            .iter()
+            .map(|key| {
+                let ring = body.loops.get(*key).ok_or(HistoryRebuildError::InvalidBrep)?;
+                let mut wire = Vec::new();
+                for key in &ring.coedges {
+                    let (_, curve) = boundary
+                        .iter()
+                        .find(|(candidate, _)| candidate == key)
+                        .ok_or(HistoryRebuildError::InvalidBrep)?;
+                    wire.extend(sweep_profile_pieces(curve)?);
+                }
+                (!wire.is_empty())
+                    .then_some(wire)
+                    .ok_or(HistoryRebuildError::InvalidBrep)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return (!wires.is_empty())
+            .then_some((plane, wires))
+            .ok_or(HistoryRebuildError::InvalidBrep);
+    }
+
+    let point_wires = region
+        .wires
+        .iter()
+        .map(|wire| {
+            let mut points = wire
+                .points
+                .iter()
+                .map(|point| [point.x, point.y, point.z])
+                .collect::<Vec<_>>();
+            if points.len() > 2 && points.first() == points.last() {
+                points.pop();
+            }
+            (points.len() >= 3)
+                .then_some(points)
+                .ok_or(HistoryRebuildError::InvalidParameters)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let first = point_wires.first().ok_or(HistoryRebuildError::InvalidParameters)?;
+    let origin = Vec3::from(first[0]);
+    let along = Vec3::from(first[1]) - origin;
+    let normal = first[2..]
+        .iter()
+        .find_map(|point| along.cross(Vec3::from(*point) - origin).normalize())
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let plane = Plane::orthonormal(first[0], along.to_array(), normal.to_array())
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let all_points = point_wires.iter().flatten().copied().collect::<Vec<_>>();
+    let tolerance = coplanarity_tolerance(&all_points);
+    if !tolerance.is_finite() || all_points.iter().any(|point| !plane.contains(*point, tolerance)) {
+        return Err(HistoryRebuildError::InvalidParameters);
+    }
+    let wires = point_wires
+        .into_iter()
+        .map(|points| {
+            let points = points
+                .into_iter()
+                .map(|point| plane.project(point).ok_or(HistoryRebuildError::InvalidParameters))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((0..points.len())
+                .map(|index| Curve::Line(Line {
+                    start: points[index],
+                    end: points[(index + 1) % points.len()],
+                }))
+                .collect())
+        })
+        .collect::<Result<Vec<_>, HistoryRebuildError>>()?;
+    Ok((plane, wires))
+}
+
+/// Resolves an embedded sweep profile without discarding region holes or curves.
+pub fn sweep_profile_geometry(
+    entity: &EmbeddedEntity,
+    transform: [f64; 16],
+) -> Result<(Plane, Vec<Vec<Curve>>, bool), HistoryRebuildError> {
+    if let EmbeddedEntity::Region(region) = entity {
+        let (mut plane, wires) = region_sweep_profile(region)?;
+        let place = placement(transform)?;
+        if place.scale().is_none() {
+            return Err(HistoryRebuildError::InvalidTransform);
+        }
+        plane = Plane::from_axes(
+            place.point(plane.origin),
+            place.vector(plane.x_axis),
+            place.vector(plane.y_axis),
+        );
+        return Ok((plane, wires, true));
+    }
+    let profile = placed_curve(embedded_curve(entity)?, transform)?;
+    let closed = profile.curve.is_closed();
+    Ok((profile.plane, vec![sweep_profile_pieces(&profile.curve)?], closed))
+}
+
+enum HistorySweepPath {
+    Planar { plane: Plane, curves: Vec<Curve>, start: [f64; 3] },
+    Polyline3d { points: Vec<[f64; 3]>, closed: bool },
+    Nurbs3(NurbsCurve3),
+}
+
+impl HistorySweepPath {
+    fn borrowed(&self) -> brep::SweepPath<'_> {
+        match self {
+            Self::Planar { plane, curves, .. } => brep::SweepPath::Planar {
+                plane: *plane,
+                curves,
+            },
+            Self::Polyline3d { points, closed } => brep::SweepPath::Polyline3d {
+                points,
+                closed: *closed,
+            },
+            Self::Nurbs3(curve) => brep::SweepPath::Nurbs3(curve),
+        }
+    }
+
+    fn start(&self) -> Option<[f64; 3]> {
+        match self {
+            Self::Planar { start, .. } => Some(*start),
+            Self::Polyline3d { points, .. } => points.first().copied(),
+            Self::Nurbs3(curve) => Some(curve.point_at(0.0)),
+        }
+    }
+
+    fn translated(mut self, shift: Vec3) -> Result<Self, HistoryRebuildError> {
+        match &mut self {
+            Self::Planar { plane, start, .. } => {
+                plane.origin = (Vec3::from(plane.origin) + shift).to_array();
+                *start = (Vec3::from(*start) + shift).to_array();
+            }
+            Self::Polyline3d { points, .. } => {
+                for point in points {
+                    *point = (Vec3::from(*point) + shift).to_array();
+                }
+            }
+            Self::Nurbs3(curve) => {
+                *curve = NurbsCurve3::new_strict(
+                    curve.degree(),
+                    curve
+                        .control_points()
+                        .iter()
+                        .map(|point| (Vec3::from(*point) + shift).to_array())
+                        .collect(),
+                    curve.knots().to_vec(),
+                    curve.weights().to_vec(),
+                )
+                .ok_or(HistoryRebuildError::InvalidParameters)?
+                .with_periodicity(curve.periodicity());
+            }
+        }
+        Ok(self)
+    }
+}
+
+fn embedded_sweep_path(
+    entity: &EmbeddedEntity,
+    transform: [f64; 16],
+) -> Result<HistorySweepPath, HistoryRebuildError> {
+    if let EmbeddedEntity::Spline(value) = entity {
+        let degree = value.degree.max(1) as usize;
+        let fit_method = !value.fit_points.is_empty() && value.control_points.len() <= degree;
+        let place = placement(transform)?;
+        if place.scale().is_none() {
+            return Err(HistoryRebuildError::InvalidTransform);
+        }
+        if degree == 1 && !fit_method && value.weights.is_empty() {
+            let points = value
+                .control_points
+                .iter()
+                .map(|point| place.point([point.x, point.y, point.z]))
+                .collect::<Vec<_>>();
+            if points.len() < 2 || points.iter().flatten().any(|value| !value.is_finite()) {
+                return Err(HistoryRebuildError::InvalidParameters);
+            }
+            return Ok(HistorySweepPath::Polyline3d {
+                points,
+                closed: value.flags.closed || value.flags.periodic,
+            });
+        }
+        if !fit_method {
+            let controls = value
+                .control_points
+                .iter()
+                .map(|point| place.point([point.x, point.y, point.z]))
+                .collect::<Vec<_>>();
+            let curve = NurbsCurve3::new(
+                degree,
+                controls,
+                value.knots.clone(),
+                (!value.weights.is_empty()).then(|| value.weights.clone()),
+            )
+            .ok_or(HistoryRebuildError::InvalidParameters)?;
+            let curve = NurbsCurve3::new_strict(
+                curve.degree(),
+                curve.control_points().to_vec(),
+                curve.knots().to_vec(),
+                curve.weights().to_vec(),
+            )
+            .ok_or(HistoryRebuildError::InvalidParameters)?
+            .with_periodicity(value.flags.periodic);
+            return Ok(HistorySweepPath::Nurbs3(curve));
+        }
+        if value.flags.periodic {
+            let points = value
+                .fit_points
+                .iter()
+                .map(|point| place.point([point.x, point.y, point.z]))
+                .collect::<Vec<_>>();
+            let parameterization = match value.knot_parameterization {
+                2 => Parameterization::Uniform,
+                1 => Parameterization::Centripetal,
+                _ => Parameterization::Chord,
+            };
+            return NurbsCurve3::interpolate_periodic(&points, parameterization)
+                .map(HistorySweepPath::Nurbs3)
+                .ok_or(HistoryRebuildError::InvalidParameters);
+        }
+        let mut points = value.fit_points.iter()
+            .map(|point| [point.x, point.y, point.z]).collect::<Vec<_>>();
+        if value.flags.closed && points.first() != points.last() && !points.is_empty() {
+            points.push(points[0]);
+        }
+        let parameterization = match value.knot_parameterization {
+            2 => Parameterization::Uniform,
+            1 => Parameterization::Centripetal,
+            _ => Parameterization::Chord,
+        };
+        let (controls, knots) = crate::space::spline::interpolate_open(
+            &points,
+            Some([value.begin_tangent.x, value.begin_tangent.y, value.begin_tangent.z]),
+            Some([value.end_tangent.x, value.end_tangent.y, value.end_tangent.z]),
+            parameterization,
+        ).ok_or(HistoryRebuildError::InvalidParameters)?;
+        let weights = vec![1.0; controls.len()];
+        // Interpolate in source space before applying placement: scaling a
+        // placed fit must also preserve its endpoint derivative constraints.
+        return NurbsCurve3::new_strict(3, controls.into_iter().map(|point| place.point(point)).collect(),
+            knots, weights).map(HistorySweepPath::Nurbs3)
+            .ok_or(HistoryRebuildError::InvalidParameters);
+    }
+    let path = placed_curve(embedded_curve(entity)?, transform)?;
+    Ok(HistorySweepPath::Planar {
+        plane: path.plane,
+        start: path.point_at(0.0),
+        curves: vec![path.curve],
+    })
+}
+
+fn sweep_nurbs_length(curve: &NurbsCurve3) -> f64 {
+    const NODES: [(f64, f64); 5] = [
+        (-0.906_179_845_938_664, 0.236_926_885_056_189),
+        (-0.538_469_310_105_683, 0.478_628_670_499_366),
+        (0.0, 0.568_888_888_888_889),
+        (0.538_469_310_105_683, 0.478_628_670_499_366),
+        (0.906_179_845_938_664, 0.236_926_885_056_189),
+    ];
+    let (start, end) = curve.domain();
+    curve.knots().windows(2).filter_map(|pair| {
+        let from = pair[0].max(start);
+        let to = pair[1].min(end);
+        (to > from).then_some((from, to))
+    }).map(|(from, to)| {
+        let width = (to - from) / 8.0;
+        (0..8).map(|panel| {
+            let half = width * 0.5;
+            let middle = from + width * (panel as f64 + 0.5);
+            half * NODES.iter().map(|(node, weight)| {
+                weight * Vec3::from(curve.tangent_at_knot(middle + half * node)).length()
+            }).sum::<f64>()
+        }).sum::<f64>()
+    }).sum()
+}
+
+/// Length of the history path in world units, including its closing segment.
+pub fn sweep_history_path_length(value: &SolidHistorySweep) -> Result<f64, HistoryRebuildError> {
+    let path = embedded_sweep_path(
+        value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
+        value.path_entity_transform,
+    )?;
+    let length = match path {
+        HistorySweepPath::Planar { plane, curves, .. } => {
+            curves.iter().map(Curve::length).sum::<f64>() * Vec3::from(plane.x_axis).length()
+        }
+        HistorySweepPath::Polyline3d { points, closed } => {
+            let mut length = points.windows(2).map(|pair| {
+                (Vec3::from(pair[1]) - Vec3::from(pair[0])).length()
+            }).sum::<f64>();
+            if closed {
+                length += (Vec3::from(points[0]) - Vec3::from(*points.last().unwrap())).length();
+            }
+            length
+        }
+        HistorySweepPath::Nurbs3(curve) => sweep_nurbs_length(&curve),
+    };
+    let scale = placement(value.base.transform)?.scale().ok_or(HistoryRebuildError::InvalidTransform)?;
+    let length = length * scale;
+    (length.is_finite() && length >= 0.0)
+        .then_some(length)
+        .ok_or(HistoryRebuildError::InvalidParameters)
+}
+
+struct SweepHistoryGeometry {
+    plane: Plane,
+    wires: Vec<Vec<Curve>>,
+    path: HistorySweepPath,
+    path_shift: Vec3,
+    options: brep::SweepOptions,
+}
+
+fn sweep_history_geometry(
+    value: &SolidHistorySweep,
+    surface: bool,
+) -> Result<SweepHistoryGeometry, HistoryRebuildError> {
+    let (plane, wires, closed) = sweep_profile_geometry(
+        value.sweep_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
+        value.sweep_entity_transform,
+    )?;
+    let mut path = embedded_sweep_path(
+        value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
+        value.path_entity_transform,
+    )?;
+    let explicit_alignment = value.has_align_start || value.align_option != 0;
+    let mut path_shift = Vec3::ZERO;
+    let reference_point = if explicit_alignment {
+        [value.reference_point.x, value.reference_point.y, value.reference_point.z]
+    } else {
+        let pieces = wires.first().ok_or(HistoryRebuildError::InvalidParameters)?;
+        let center = pieces.iter()
+            .map(|piece| Vec3::from(plane.point_at(piece.point_at(0.0))))
+            .fold(Vec3::ZERO, |sum, point| sum + point) / pieces.len() as f64;
+        let start = Vec3::from(path.start().ok_or(HistoryRebuildError::InvalidParameters)?);
+        path_shift = center - start;
+        path = path.translated(path_shift)?;
+        center.to_array()
+    };
+    Ok(SweepHistoryGeometry {
+        plane,
+        wires,
+        path,
+        path_shift,
+        options: brep::SweepOptions {
+            align: explicit_alignment && value.align_option != 0,
+            base_point: Some(reference_point),
+            rotation: value.align_angle,
+            twist: value.twist_angle,
+            scale: value.scale_factor,
+            bank: value.bank,
+            surface: surface || !closed,
+        },
+    })
+}
+
+fn compose_placements(outer: Placement, inner: Placement) -> Placement {
+    Placement {
+        origin: outer.point(inner.origin),
+        x_axis: outer.vector(inner.x_axis),
+        y_axis: outer.vector(inner.y_axis),
+        z_axis: outer.vector(inner.z_axis),
+    }
+}
+
+/// World placements of the embedded profile and path used by the sweep.
+/// Editing clients use their inverses so grips follow the displayed geometry.
+pub fn sweep_history_placements(
+    value: &SolidHistorySweep,
+) -> Result<(Placement, Placement), HistoryRebuildError> {
+    let geometry = sweep_history_geometry(value, false)?;
+    let profile = brep::sweep_profile_placement(
+        geometry.plane, &geometry.wires, geometry.path.borrowed(), geometry.options,
+    ).ok_or(HistoryRebuildError::InvalidParameters)?;
+    let base = placement(value.base.transform)?;
+    let path_shift = Placement {
+        origin: geometry.path_shift.to_array(),
+        x_axis: [1.0, 0.0, 0.0],
+        y_axis: [0.0, 1.0, 0.0],
+        z_axis: [0.0, 0.0, 1.0],
+    };
+    Ok((
+        compose_placements(base, compose_placements(profile, placement(value.sweep_entity_transform)?)),
+        compose_placements(base, compose_placements(path_shift, placement(value.path_entity_transform)?)),
+    ))
+}
+
+/// The displayed reference point; new aligned sweeps reference the path start.
+pub fn sweep_history_reference_point(value: &SolidHistorySweep) -> Result<[f64; 3], HistoryRebuildError> {
+    let reference = if value.has_align_start || value.align_option != 0 {
+        let path = embedded_sweep_path(
+            value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
+            value.path_entity_transform,
+        )?;
+        brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?
+    } else {
+        [value.reference_point.x, value.reference_point.y, value.reference_point.z]
+    };
+    Ok(placement(value.base.transform)?.point(reference))
+}
+
+/// Rebuilds a sweep, retaining whether its owning entity is a sheet or a solid.
+///
+/// New records with an explicit alignment start place their reference point on
+/// the path. Older records retain their original profile placement, because
+/// those writers translated the path to the profile rather than moving it.
+pub fn rebuild_sweep_with_mode(
+    value: &SolidHistorySweep,
+    surface: bool,
+) -> Result<Body, HistoryRebuildError> {
+    // Nondefault native miter/intersection policies cannot be replaced by
+    // the standard construction without changing the saved object's intent.
+    if value.miter_option != 0 || value.check_intersections {
+        return Err(HistoryRebuildError::Unsupported);
+    }
+    if !value.scale_factor.is_finite()
+        || value.scale_factor <= 1e-9
+        || !value.draft_angle.is_finite()
+        || !value.twist_angle.is_finite()
+        || !value.align_angle.is_finite()
+    {
+        return Err(HistoryRebuildError::InvalidParameters);
+    }
+    if value.draft_angle.abs() > 1e-12 {
+        return if !surface && !value.has_align_start {
+            legacy_sweep(value)
+        } else {
+            Err(HistoryRebuildError::Unsupported)
+        };
+    }
+    let geometry = sweep_history_geometry(value, surface)?;
+    finish(
+        brep::sweep_path(
+            geometry.plane,
+            &geometry.wires,
+            geometry.path.borrowed(),
+            geometry.options,
+        ),
+        value.base.transform,
+    )
+}
+
+fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
+    rebuild_sweep_with_mode(value, false)
+}
+
 fn embedded_line_path_3d(entity: &EmbeddedEntity) -> Option<Vec<[f64; 3]>> {
     let EmbeddedEntity::Spline(value) = entity else {
         return None;
@@ -552,6 +1079,11 @@ fn embedded_line_path_3d(entity: &EmbeddedEntity) -> Option<Vec<[f64; 3]>> {
 }
 
 fn rebuild_extrusion(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
+    rebuild_extrusion_with_mode(value, false)
+}
+
+/// Rebuilds extrusion history without losing region holes or open sheet mode.
+pub fn rebuild_extrusion_with_mode(value: &SolidHistorySweep, surface: bool) -> Result<Body, HistoryRebuildError> {
     if !value.scale_factor.is_finite()
         || (value.scale_factor - 1.0).abs() > 1e-9
         || !value.draft_angle.is_finite()
@@ -562,42 +1094,46 @@ fn rebuild_extrusion(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildEr
     {
         return Err(HistoryRebuildError::Unsupported);
     }
-    let profile = placed_curve(
-        embedded_curve(
-            value
-                .sweep_entity
-                .as_ref()
-                .ok_or(HistoryRebuildError::InvalidParameters)?,
-        )?,
+    let (plane, wires, closed) = sweep_profile_geometry(
+        value.sweep_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
         value.sweep_entity_transform,
     )?;
-    let pieces = profile_pieces(&profile.curve)?;
+    if !surface && !closed { return Err(HistoryRebuildError::InvalidParameters); }
     let body = if let Some(path) = value.path_entity.as_ref() {
-        if value.draft_angle.abs() > 1e-9 {
+        if value.draft_angle.abs() > 1e-9 || surface || wires.len() != 1 {
             return Err(HistoryRebuildError::Unsupported);
         }
+        let pieces = &wires[0];
         let mut path = placed_curve(embedded_curve(path)?, value.path_entity_transform)?;
         let profile_center = pieces
             .iter()
-            .map(|piece| Vec3::from(profile.plane.point_at(piece.point_at(0.0))))
+            .map(|piece| Vec3::from(plane.point_at(piece.point_at(0.0))))
             .fold(Vec3::ZERO, |sum, point| sum + point)
             / pieces.len() as f64;
         let path_start = Vec3::from(path.plane.point_at(path.curve.point_at(0.0)));
         path.plane.origin =
             (Vec3::from(path.plane.origin) + profile_center - path_start).to_array();
-        brep::sweep_along(profile.plane, &pieces, path.plane, &path_pieces(&path.curve)?)
+        brep::sweep_along(plane, pieces, path.plane, &path_pieces(&path.curve)?)
     } else {
         let direction = [value.direction.x, value.direction.y, value.direction.z];
         #[cfg(feature = "offset")]
         {
-            brep::extrude_tapered(profile.plane, &pieces, direction, value.draft_angle)
+            if surface {
+                brep::extrude_surface_region_tapered(plane, &wires, direction, value.draft_angle)
+            } else {
+                brep::extrude_region_tapered(plane, &wires, direction, value.draft_angle)
+            }
         }
         #[cfg(not(feature = "offset"))]
         {
             if value.draft_angle.abs() > 1e-9 {
                 return Err(HistoryRebuildError::Unsupported);
             }
-            brep::extrude(profile.plane, &pieces, direction)
+            if surface {
+                brep::extrude_surface_region(plane, &wires, direction)
+            } else {
+                brep::extrude_region(plane, &wires, direction)
+            }
         }
     };
     finish(body, value.base.transform)
@@ -668,22 +1204,161 @@ fn rebuild_revolve(value: &SolidHistoryRevolve) -> Result<Body, HistoryRebuildEr
     )
 }
 
+/// Decode a section or a joined chain without losing rational curves or region holes.
+pub fn loft_section_geometry(entities: &[EmbeddedEntity]) -> Result<brep::LoftSection, String> {
+    let identity = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+    if let [EmbeddedEntity::Point(point)] = entities {
+        return Ok(brep::LoftSection::Point([point.location.x, point.location.y, point.location.z]));
+    }
+    let mut profiles = entities.iter().map(|entity| sweep_profile_geometry(entity, identity)
+        .map_err(|error| format!("Invalid loft section: {error}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if profiles.is_empty() { return Err("Select a curve for each loft section.".into()); }
+    if profiles.len() == 1 {
+        let (plane, wires, closed) = profiles.remove(0);
+        return Ok(brep::LoftSection::Profile { plane, wires, closed });
+    }
+    if profiles.iter().any(|(_, wires, closed)| *closed || wires.len() != 1) {
+        return Err("Join only connected open edges in one section.".into());
+    }
+    // A single line's arbitrary supporting plane need not contain the other
+    // selected edges. Derive the joined plane from the entire spatial chain.
+    let mut spatial = Vec::new();
+    for (plane, wires, _) in &profiles {
+        for curve in &wires[0] {
+            spatial.extend(brep::nurbs_builder::RationalCurve2::from_curve(curve)
+                .ok_or("Unsupported joined section curve")?.lifted(plane).points);
+        }
+    }
+    let origin = Vec3::from(*spatial.first().ok_or("Empty joined section")?);
+    let tolerance = coplanarity_tolerance(&spatial);
+    let axis = spatial.iter().map(|point| Vec3::from(*point)-origin)
+        .find(|axis| axis.length() > tolerance).and_then(Vec3::normalize)
+        .ok_or("Degenerate joined section")?;
+    let normal = spatial.iter().map(|point| axis.cross(Vec3::from(*point)-origin))
+        .find(|normal| normal.length() > tolerance).and_then(Vec3::normalize);
+    let plane = match normal {
+        Some(normal) => Plane::orthonormal(origin.to_array(), axis.to_array(), normal.to_array())
+            .ok_or("Invalid joined section plane")?,
+        None => Plane::from_axes(origin.to_array(), profiles[0].0.x_axis, profiles[0].0.y_axis),
+    };
+    let normal = Vec3::from(plane.normal().ok_or("Invalid section plane")?);
+    let mut curves = Vec::new();
+    for (source_plane, wires, _) in profiles {
+        for curve in &wires[0] {
+            let rational = brep::nurbs_builder::RationalCurve2::from_curve(curve)
+                .ok_or("Unsupported joined section curve")?.lifted(&source_plane);
+            let scale = rational.points.iter().map(|point| (Vec3::from(*point) - Vec3::from(plane.origin)).length())
+                .fold(1.0_f64, f64::max);
+            let mut points = Vec::new();
+            for point in rational.points {
+                if (Vec3::from(point) - Vec3::from(plane.origin)).dot(normal).abs() > scale * 1e-8 {
+                    return Err("Joined section edges must be coplanar.".into());
+                }
+                points.push(plane.project(point).ok_or("Invalid section plane")?);
+            }
+            curves.push(NurbsCurve::new_strict(rational.degree, points, rational.knots, rational.weights)
+                .ok_or("Invalid joined section curve")?);
+        }
+    }
+    let distance = |a: [f64;2], b: [f64;2]| (a[0]-b[0]).hypot(a[1]-b[1]);
+    let scale = curves.iter().map(|curve| curve.control_points().iter().map(|point| point[0].hypot(point[1]))
+        .fold(1.0_f64, f64::max)).fold(1.0_f64, f64::max);
+    let tolerance = scale * 1e-8;
+    let mut chain = vec![curves.remove(0)];
+    while !curves.is_empty() {
+        let end = chain.last().unwrap().point_at(1.0);
+        if let Some((at, reverse)) = curves.iter().enumerate().find_map(|(at, curve)| {
+            if distance(end, curve.point_at(0.0)) <= tolerance { Some((at, false)) }
+            else if distance(end, curve.point_at(1.0)) <= tolerance { Some((at, true)) }
+            else { None }
+        }) {
+            let curve = curves.remove(at);
+            chain.push(if reverse { curve.reversed() } else { curve });
+            continue;
+        }
+        let start = chain.first().unwrap().point_at(0.0);
+        if let Some((at, reverse)) = curves.iter().enumerate().find_map(|(at, curve)| {
+            if distance(start, curve.point_at(1.0)) <= tolerance { Some((at, false)) }
+            else if distance(start, curve.point_at(0.0)) <= tolerance { Some((at, true)) }
+            else { None }
+        }) {
+            let curve = curves.remove(at);
+            chain.insert(0, if reverse { curve.reversed() } else { curve });
+        } else { return Err("Joined section edges must form one connected chain.".into()); }
+    }
+    let closed = distance(chain[0].point_at(0.0), chain.last().unwrap().point_at(1.0)) <= tolerance;
+    Ok(brep::LoftSection::Profile { plane, wires: vec![chain.into_iter().map(Curve::Nurbs).collect()], closed })
+}
+
+/// Bounded, normalized three-dimensional guide/path curves.
+pub fn loft_path_geometry(entity: &EmbeddedEntity) -> Result<Vec<brep::Curve3>, String> {
+    let identity = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+    match embedded_sweep_path(entity, identity).map_err(|error| format!("Invalid loft guide or path: {error}"))? {
+        HistorySweepPath::Planar { plane, curves, start } => {
+            let pieces = curves.iter().map(sweep_profile_pieces)
+                .collect::<Result<Vec<_>, _>>().map_err(|error| format!("Invalid loft path pieces: {error}"))?;
+            let mut previous = Vec3::from(start);
+            pieces.into_iter().flatten().map(|curve| {
+            let mut rational = brep::nurbs_builder::RationalCurve2::from_curve(&curve)
+                .ok_or("Unsupported loft guide or path")?.lifted(&plane);
+            let initial = rational.curve().ok_or("Invalid loft guide or path")?;
+            if previous.distance(Vec3::from(initial.point_at(1.0)))
+                < previous.distance(Vec3::from(initial.point_at(0.0))) {
+                rational = rational.reversed();
+            }
+            let oriented = rational.curve().ok_or("Invalid loft guide or path")?;
+            previous = Vec3::from(oriented.point_at(1.0));
+            Ok(brep::Curve3::Nurbs(oriented))
+            }).collect()
+        },
+        HistorySweepPath::Polyline3d { points, closed } => {
+            let mut points = points;
+            if closed && points.first() != points.last() { points.push(points[0]); }
+            Ok(points.windows(2).map(|pair| brep::Curve3::Line(brep::Line3 {
+                origin: pair[0], direction: (Vec3::from(pair[1])-Vec3::from(pair[0])).to_array(),
+            })).collect())
+        }
+        HistorySweepPath::Nurbs3(curve) => {
+            let (start, end) = curve.domain();
+            let knots = curve.knots().iter().map(|value| (value-start)/(end-start)).collect();
+            Ok(vec![brep::Curve3::Nurbs(NurbsCurve3::new_strict(curve.degree(), curve.control_points().to_vec(),
+                knots, curve.weights().to_vec()).ok_or("Invalid loft path spline")?)])
+        }
+    }
+}
+
+/// First creation, Properties changes and reload all use this same builder.
+pub fn rebuild_loft_with_options(value: &SolidHistoryLoft) -> Result<Body, String> {
+    let settings = value.parameters.clone().unwrap_or_else(|| cadcodec::objects::SolidHistoryLoftParameters {
+        normals: 0, ..Default::default()
+    });
+    let counts = if settings.section_counts.is_empty() { vec![1; value.cross_sections.len()] }
+        else { settings.section_counts.clone() };
+    if counts.iter().any(|count| *count == 0) || counts.iter().try_fold(0usize, |sum, count| sum.checked_add(*count))
+        != Some(value.cross_sections.len()) { return Err("Invalid loft section grouping.".into()); }
+    let mut offset = 0;
+    let mut sections = Vec::new();
+    for count in counts {
+        sections.push(loft_section_geometry(&value.cross_sections[offset..offset+count])?);
+        offset += count;
+    }
+    let guides = value.guides.iter().map(loft_path_geometry).collect::<Result<Vec<_>, _>>()?;
+    let path = settings.path_entity.as_ref().map(loft_path_geometry).transpose()?;
+    let body = brep::loft_with_options(&sections, &guides, path.as_deref(), brep::LoftOptions {
+        surface: settings.surface, normals: settings.normals,
+        start_draft_angle: settings.start_draft_angle, end_draft_angle: settings.end_draft_angle,
+        start_magnitude: settings.start_magnitude, end_magnitude: settings.end_magnitude,
+        start_continuity: settings.start_continuity, end_continuity: settings.end_continuity,
+        start_bulge: settings.start_bulge, end_bulge: settings.end_bulge,
+        closed: settings.closed, periodic: settings.periodic, align_direction: settings.align_direction,
+    }).map_err(|error| error.to_string())?;
+    brep::transform(&body, &placement(value.base.transform).map_err(|error| error.to_string())?)
+        .ok_or_else(|| "Invalid loft placement.".into())
+}
+
 fn rebuild_loft(value: &SolidHistoryLoft) -> Result<Body, HistoryRebuildError> {
-    if !value.guides.is_empty() {
-        return Err(HistoryRebuildError::Unsupported);
-    }
-    let sections = value
-        .cross_sections
-        .iter()
-        .map(|entity| {
-            let curve = embedded_curve(entity)?;
-            Ok((curve.plane, profile_pieces(&curve.curve)?))
-        })
-        .collect::<Result<Vec<_>, HistoryRebuildError>>()?;
-    if sections.len() < 2 {
-        return Err(HistoryRebuildError::InvalidParameters);
-    }
-    finish(brep::loft(&sections), value.base.transform)
+    rebuild_loft_with_options(value).map_err(|_| HistoryRebuildError::InvalidParameters)
 }
 
 pub fn rebuild_body(

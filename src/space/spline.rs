@@ -139,6 +139,96 @@ pub enum Parameterization {
     Chord,
 }
 
+/// Natural or endpoint-clamped C² interpolation in any coordinate dimension.
+/// The returned polynomial B-spline passes through every fit point; it is
+/// not a polyline approximation. Parameter spans use the full source-space
+/// distance, so a spatial fit never changes when viewed in another plane.
+pub(crate) fn interpolate_open<const N: usize>(
+    points: &[[f64; N]],
+    start_tangent: Option<[f64; N]>,
+    end_tangent: Option<[f64; N]>,
+    parameterization: Parameterization,
+) -> Option<(Vec<[f64; N]>, Vec<f64>)> {
+    let count = points.len();
+    if count < 2 || !points.iter().flatten().all(|value| value.is_finite())
+        || start_tangent.iter().chain(end_tangent.iter()).flatten().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    let usable = |tangent: Option<[f64; N]>| {
+        tangent.filter(|vector| vector.iter().map(|value| value * value).sum::<f64>() > 1e-18)
+    };
+    let start_tangent = usable(start_tangent);
+    let end_tangent = usable(end_tangent);
+    let spans = points.windows(2).map(|pair| {
+        let distance = (0..N).map(|axis| (pair[1][axis] - pair[0][axis]).powi(2))
+            .sum::<f64>().sqrt().max(1e-9);
+        match parameterization {
+            Parameterization::Uniform => 1.0,
+            Parameterization::Centripetal => distance.sqrt(),
+            Parameterization::Chord => distance,
+        }
+    }).collect::<Vec<_>>();
+    if !spans.iter().all(|span| span.is_finite()) { return None; }
+
+    let mut lower = vec![0.0; count];
+    let mut diagonal = vec![0.0; count];
+    let mut upper = vec![0.0; count];
+    let mut slopes = vec![[0.0; N]; count];
+    if let Some(tangent) = start_tangent {
+        diagonal[0] = 1.0;
+        slopes[0] = tangent;
+    } else {
+        diagonal[0] = 2.0;
+        upper[0] = 1.0;
+        for axis in 0..N {
+            slopes[0][axis] = 3.0 * (points[1][axis] - points[0][axis]) / spans[0];
+        }
+    }
+    for index in 1..count - 1 {
+        let before = spans[index - 1];
+        let after = spans[index];
+        lower[index] = after;
+        diagonal[index] = 2.0 * (before + after);
+        upper[index] = before;
+        for axis in 0..N {
+            let incoming = (points[index][axis] - points[index - 1][axis]) / before;
+            let outgoing = (points[index + 1][axis] - points[index][axis]) / after;
+            slopes[index][axis] = 3.0 * (after * incoming + before * outgoing);
+        }
+    }
+    if let Some(tangent) = end_tangent {
+        diagonal[count - 1] = 1.0;
+        slopes[count - 1] = tangent;
+    } else {
+        lower[count - 1] = 1.0;
+        diagonal[count - 1] = 2.0;
+        for axis in 0..N {
+            slopes[count - 1][axis] = 3.0 * (points[count - 1][axis] - points[count - 2][axis]) / spans[count - 2];
+        }
+    }
+    solve_tridiagonal_system(&lower, &diagonal, &upper, &mut slopes)?;
+
+    let mut controls = Vec::with_capacity(3 * count - 2);
+    let mut knots = vec![0.0; 4];
+    let mut parameter = 0.0;
+    controls.push(points[0]);
+    for index in 0..count - 1 {
+        let mut after = points[index];
+        let mut before = points[index + 1];
+        for axis in 0..N {
+            after[axis] += slopes[index][axis] * spans[index] / 3.0;
+            before[axis] -= slopes[index + 1][axis] * spans[index] / 3.0;
+        }
+        controls.extend([after, before, points[index + 1]]);
+        parameter += spans[index];
+        if index + 1 < count - 1 { knots.extend([parameter; 3]); }
+    }
+    knots.extend([parameter; 4]);
+    (controls.iter().flatten().all(|value| value.is_finite()) && parameter.is_finite())
+        .then_some((controls, knots))
+}
+
 pub(crate) fn interpolate_periodic<const N: usize>(
     points: &[[f64; N]],
     parameterization: Parameterization,

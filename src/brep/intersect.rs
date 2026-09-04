@@ -67,8 +67,49 @@ pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
         (Surface::Cylinder(one), Surface::Cylinder(other)) => {
             cylinders(one, other, tolerance)
         }
+        (Surface::Cone(cone), Surface::Cylinder(cylinder))
+        | (Surface::Cylinder(cylinder), Surface::Cone(cone)) => coaxial_conics(
+            &cone.base, cone.radius, cone.half_angle.tan(),
+            &cylinder.base, cylinder.radius, 0.0, tolerance,
+        ),
+        (Surface::Cone(one), Surface::Cone(other)) => coaxial_conics(
+            &one.base, one.radius, one.half_angle.tan(),
+            &other.base, other.radius, other.half_angle.tan(), tolerance,
+        ),
         _ => Meeting::Unknown,
     }
+}
+
+/// Coaxial cones and cylinders share exact circles, even when the two
+/// parameter axes point in opposite directions. Both cone nappes are kept;
+/// the faces' trims decide which circle belongs to the bounded solid.
+fn coaxial_conics(one: &Plane, radius_one: f64, slope_one: f64, other: &Plane, radius_other: f64, slope_other: f64, tolerance: f64) -> Meeting {
+    let (Some(axis), Some(other_axis)) = (one.normal(), other.normal()) else { return Meeting::Unknown; };
+    let axis = Vec3::from(axis);
+    let other_axis = Vec3::from(other_axis);
+    if axis.cross(other_axis).length() > 1e-9 { return Meeting::Unknown; }
+    let delta = Vec3::from(other.origin) - Vec3::from(one.origin);
+    let shift = delta.dot(axis);
+    if (delta - axis * shift).length() > tolerance { return Meeting::Unknown; }
+    let slope_other = slope_other * axis.dot(other_axis);
+    let other_at_origin = radius_other + slope_other * shift;
+    let mut curves = Vec::new();
+    for sign in [1.0, -1.0] {
+        let denominator = slope_one - sign * slope_other;
+        let numerator = radius_one - sign * other_at_origin;
+        if denominator.abs() <= 1e-12 {
+            if numerator.abs() <= tolerance { return Meeting::Coincident; }
+            continue;
+        }
+        let height = numerator / denominator;
+        let radius = (radius_one - slope_one * height).abs();
+        if radius <= tolerance { continue; }
+        let mut plane = *one;
+        plane.origin = (Vec3::from(one.origin) + axis * height).to_array();
+        if curves.iter().any(|curve: &Curve3| matches!(curve, Curve3::Circle(circle) if Vec3::from(circle.plane.origin).distance(Vec3::from(plane.origin)) <= tolerance)) { continue; }
+        curves.push(Curve3::Circle(Circle3 { plane, radius }));
+    }
+    if curves.is_empty() { Meeting::None } else { Meeting::Curves(curves) }
 }
 
 /// Two planes: a line, nothing, or the same plane.

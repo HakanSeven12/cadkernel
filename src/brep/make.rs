@@ -477,9 +477,9 @@ pub fn cone(base: [f64; 3], radius: f64, height: f64) -> Option<Body> {
 ///
 /// `base_x_radius` and `base_y_radius` are the base semi-axes. `top_radius`
 /// is the top X semi-axis; its Y semi-axis keeps the base aspect ratio. A
-/// zero top radius produces a pointed cone. Circular pointed cones retain
-/// the analytic cone representation, while elliptical and truncated forms
-/// use exact rational ruled surfaces.
+/// zero top radius produces a pointed cone. Circular cones and frusta retain
+/// analytic surfaces and circular cap edges; elliptical forms use exact
+/// rational ruled surfaces.
 pub fn frustum(
     base: [f64; 3],
     base_x_radius: f64,
@@ -508,6 +508,15 @@ pub fn frustum(
         } else {
             elliptical_cone(base, base_x_radius, base_y_radius, height)
         };
+    }
+
+    if base_x_radius == base_y_radius {
+        let section = Plane::from_axes(base, Vec3::X.to_array(), Vec3::Z.to_array());
+        let points = [[0.0, 0.0], [base_x_radius, 0.0], [top_radius, height], [0.0, height]];
+        let profile = (0..4).map(|index| Curve2::Line(Line2 {
+            start: points[index], end: points[(index + 1) % 4],
+        })).collect::<Vec<_>>();
+        return super::sweep::revolve(section, &profile, base, Vec3::Z.to_array(), TAU);
     }
 
     let base_plane = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
