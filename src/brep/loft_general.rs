@@ -839,7 +839,11 @@ fn path_shift(path: &Constraint, band: usize, a: f64, b: f64, sections: &[Sectio
 /// profiles always produce a sheet, even when `surface` was not requested.
 pub fn loft_with_options(sections: &[LoftSection], guides: &[Vec<Curve3>], path: Option<&[Curve3]>, options: LoftOptions) -> Result<Body, LoftError> {
     if !guides.is_empty() && path.is_some() { return Err(error("Choose either loft guides or a loft path, not both.")); }
-    let mut sections = prepared(sections, options)?;
+    let prepared_sections = prepared(sections, options)?;
+    if guides.is_empty() && path.is_none() {
+        if let Some(body) = circular_pair(sections, &prepared_sections, options) { return Ok(body); }
+    }
+    let mut sections = prepared_sections;
     let mut guides = guides.iter().map(|g| constraint(g, &sections, true, options.closed)).collect::<Result<Vec<_>, _>>()?;
     let path = path.map(|p| constraint(p, &sections, false, options.closed)).transpose()?;
     validate_point_guides(&sections, &guides, options)?;
@@ -913,6 +917,72 @@ pub fn loft_with_options(sections: &[LoftSection], guides: &[Vec<Curve3>], path:
         grids.push(grid);
     }
     assemble(&sections, &grids, profile_closed, solid, options.closed)
+}
+
+/// Two untwisted coaxial circles interpolate to an analytic cone or cylinder.
+/// Retain that identity instead of replacing editable circular cap boundaries
+/// with spline edges. Raw arcs prove circularity; homogeneous control data,
+/// after the ordinary seam alignment, proves the loft has straight generators.
+fn circular_pair(source: &[LoftSection], sections: &[Section], options: LoftOptions) -> Option<Body> {
+    if source.len() != 2 || options.closed || !matches!(options.normals, 0 | 1)
+        || options.start_draft_angle != FRAC_PI_2 || options.end_draft_angle != FRAC_PI_2
+        || options.start_magnitude != 0.0 || options.end_magnitude != 0.0 { return None; }
+    let (first_plane, first_centre, first_radius) = circular_section(&source[0])?;
+    let (last_plane, last_centre, last_radius) = circular_section(&source[1])?;
+    let axis = Vec3::from(first_plane.normal()?);
+    let delta = last_centre - first_centre;
+    let height = delta.dot(axis);
+    let tolerance = geometry_tolerance([first_centre.to_array(), last_centre.to_array()], f64::EPSILON * 128.0)
+        .max(first_radius.max(last_radius) * f64::EPSILON * 128.0);
+    if height.abs() <= tolerance.max(1e-10) || (delta - axis * height).length() > tolerance
+        || axis.cross(Vec3::from(last_plane.normal()?)).length() > f64::EPSILON * 128.0 { return None; }
+    let first = &sections[0].wires[0];
+    let last = &sections[1].wires[0];
+    if first.spans.len() != last.spans.len() { return None; }
+    for (a, b) in first.spans.iter().zip(&last.spans) {
+        if (a.start - b.start).abs() > f64::EPSILON * 128.0
+            || (a.end - b.end).abs() > f64::EPSILON * 128.0
+            || a.curve.control.len() != b.curve.control.len() { return None; }
+        for (a, b) in a.curve.control.iter().zip(&b.curve.control) {
+            if (a[3] - b[3]).abs() > a[3].abs().max(b[3].abs()) * f64::EPSILON * 128.0 { return None; }
+            let expected = last_centre + (Vec3::from(project(*a)) - first_centre) * (last_radius / first_radius);
+            if expected.distance(Vec3::from(project(*b))) > tolerance { return None; }
+        }
+    }
+    let radial = (Vec3::from(first.point(0.0)) - first_centre).normalize()?;
+    let plane = Plane::from_axes(first_centre.to_array(), radial.to_array(), axis.to_array());
+    if options.surface {
+        return super::revolve_surface(plane, &[Curve::Line(Line {
+            start: [first_radius, 0.0], end: [last_radius, height],
+        })], first_centre.to_array(), axis.to_array(), TAU);
+    }
+    let points = [[0.0, 0.0], [first_radius, 0.0], [last_radius, height], [0.0, height]];
+    let profile = (0..4).map(|i| Curve::Line(Line { start: points[i], end: points[(i + 1) % 4] })).collect::<Vec<_>>();
+    super::revolve(plane, &profile, first_centre.to_array(), axis.to_array(), TAU)
+}
+
+fn circular_section(section: &LoftSection) -> Option<(Plane, Vec3, f64)> {
+    let LoftSection::Profile { plane, wires, closed: true } = section else { return None; };
+    if wires.len() != 1 || wires[0].is_empty() { return None; }
+    let x = Vec3::from(plane.x_axis); let y = Vec3::from(plane.y_axis);
+    // A sheared or unequally scaled plane maps a local circle to an ellipse.
+    let angular_tolerance = f64::EPSILON * 128.0;
+    if (x.length_squared() - 1.0).abs() > angular_tolerance
+        || (y.length_squared() - 1.0).abs() > angular_tolerance
+        || x.dot(y).abs() > angular_tolerance { return None; }
+    let Curve::Arc(first) = wires[0].first()? else { return None; };
+    if !first.radius.is_finite() || first.radius <= 0.0 { return None; }
+    let mut sweep = 0.0;
+    for (index, curve) in wires[0].iter().enumerate() {
+        let Curve::Arc(arc) = curve else { return None; };
+        let Curve::Arc(next) = &wires[0][(index + 1) % wires[0].len()] else { return None; };
+        if arc.centre != first.centre || arc.radius != first.radius { return None; }
+        let gap = (arc.end_angle - next.start_angle).rem_euclid(TAU);
+        if gap.min(TAU - gap) > angular_tolerance { return None; }
+        sweep += arc.sweep();
+    }
+    if (sweep - TAU).abs() > angular_tolerance { return None; }
+    Some((*plane, Vec3::from(plane.point_at(first.centre)), first.radius))
 }
 
 fn add_vertex(body: &mut Body, point: [f64; 3]) -> VertexKey {

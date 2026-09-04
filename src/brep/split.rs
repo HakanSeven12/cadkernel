@@ -335,6 +335,25 @@ pub fn split_face(
             return None;
         }
 
+        // A closed cutter carries its own plane orientation. Surface/face
+        // sense alone says nothing about which way increasing its parameter
+        // winds: intersection circles can use the opposite plane normal.
+        // The island follows the face and the new hole runs the other way.
+        let (cutter_plane, winding) = match cutter {
+            Curve3::Circle(circle) => (&circle.plane, 1.0),
+            Curve3::Ellipse(ellipse) => (&ellipse.plane, 1.0),
+            Curve3::PlanarSpline { plane, curve } => {
+                (plane, crate::geom2d::Curve::Nurbs(curve.clone()).enclosed_area())
+            }
+            _ => return None,
+        };
+        let alignment = Vec3::from(cutter_plane.normal()?)
+            .dot(Vec3::from(surface.normal_at(u, v)?)) * winding;
+        if !alignment.is_finite() || alignment == 0.0 {
+            return None;
+        }
+        let island_forward = (alignment > 0.0) == node.forward;
+
         let seam = body.vertices.insert(Vertex {
             point,
             provenance: Provenance::Synthesized,
@@ -357,7 +376,7 @@ pub fn split_face(
         });
         let hole = body.coedges.insert(Coedge {
             edge: cut,
-            forward: !node.forward,
+            forward: !island_forward,
             pcurve: None,
             owner: hole_ring,
             provenance: Provenance::Synthesized,
@@ -381,7 +400,7 @@ pub fn split_face(
         });
         let inner = body.coedges.insert(Coedge {
             edge: cut,
-            forward: node.forward,
+            forward: island_forward,
             pcurve: None,
             owner: other_ring,
             provenance: Provenance::Synthesized,
