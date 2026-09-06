@@ -1,24 +1,5 @@
-//! How much room a piece of a body takes up.
-//!
-//! A boolean that tested every face of one solid against every face of the
-//! other would spend most of its time on pairs that are nowhere near each
-//! other — two hundred faces a side is forty thousand surface intersections
-//! to find the dozen that matter. A box test rejects almost all of them for
-//! the cost of six comparisons.
-//!
-//! # A prefilter must not have false negatives
-//!
-//! Its only job is to say "definitely apart" or "possibly not". Saying
-//! "apart" about two faces that do meet loses part of the answer silently,
-//! which is why a face whose extent cannot be bounded from its boundary
-//! reports `None` — read as "cannot exclude" — rather than a box that might
-//! be too small.
-//!
-//! That happens on a closed surface: a sphere patch containing a pole, or a
-//! cylinder face wrapping the whole way round, bulges past every edge that
-//! bounds it. A planar face never does, and neither does a patch of a
-//! cylinder or cone bounded by its own generators and sections, which is what
-//! a boolean produces.
+//! Conservative spatial bounds for rejecting separated geometry.
+//! Closed analytic surfaces and positive-weight NURBS use their full extents.
 
 use super::geometry::Surface;
 use super::topology::{Body, FaceKey};
@@ -117,14 +98,36 @@ impl Aabb {
 /// caller applies covers the rest.
 const SAMPLES: usize = 16;
 
-/// The box around a face, or `None` where its boundary does not enclose it.
+/// A conservative face box, including the full supporting surface when needed.
 ///
 /// `None` means "cannot exclude this face", not "this face is empty".
 pub fn face_bounds(body: &Body, face: FaceKey) -> Option<Aabb> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
-    if !bounded_by_its_edges(surface) {
-        return None;
+    match surface {
+        Surface::Sphere(sphere) => {
+            let normal = sphere.frame.normal()?;
+            let extent = std::array::from_fn(|axis| sphere.radius.abs()
+                * sphere.frame.x_axis[axis].hypot(sphere.frame.y_axis[axis]).hypot(normal[axis]));
+            return centred_bounds(sphere.frame.origin, extent);
+        }
+        Surface::Torus(torus) => {
+            let normal = torus.frame.normal()?;
+            let extent = std::array::from_fn(|axis| {
+                let radial = torus.frame.x_axis[axis].hypot(torus.frame.y_axis[axis]);
+                torus.major_radius.abs() * radial + torus.minor_radius.abs() * radial.hypot(normal[axis])
+            });
+            return centred_bounds(torus.frame.origin, extent);
+        }
+        Surface::Nurbs(surface) => {
+            // Positive rational weights keep the surface inside its control hull.
+            if surface.weights().iter().flatten().any(|w| !w.is_finite() || *w <= 0.0)
+                || surface.control_points().iter().flatten().flatten().any(|v| !v.is_finite()) {
+                return None;
+            }
+            return Aabb::around(surface.control_points().iter().flatten().copied());
+        }
+        _ => {}
     }
     let mut bounds: Option<Aabb> = None;
     for coedge in body.face_coedges(face) {
@@ -179,17 +182,12 @@ pub fn operation_tolerance(bodies: &[&Body]) -> f64 {
     extent * 1e-8 + f64::EPSILON * coordinate_scale * 64.0
 }
 
-/// Whether a patch of this surface stays within the box its own edges do.
-///
-/// A plane does. So does a cylinder or a cone, whose curvature runs one way
-/// only and whose patches are bounded by the sections and generators a
-/// boolean cuts. A sphere and a torus do not: a patch can hold a pole or wrap
-/// the whole way round, and its bulge is nowhere near any edge.
-fn bounded_by_its_edges(surface: &Surface) -> bool {
-    matches!(
-        surface,
-        Surface::Plane(_) | Surface::Cylinder(_) | Surface::Cone(_)
-    )
+fn centred_bounds(centre: [f64; 3], extent: [f64; 3]) -> Option<Aabb> {
+    let bounds = Aabb {
+        min: std::array::from_fn(|axis| centre[axis] - extent[axis]),
+        max: std::array::from_fn(|axis| centre[axis] + extent[axis]),
+    };
+    bounds.min.iter().chain(&bounds.max).all(|v| v.is_finite()).then_some(bounds)
 }
 
 /// The box around a point set, for a caller that already has the points.
@@ -288,21 +286,39 @@ mod tests {
     }
 
     #[test]
-    fn a_surface_whose_patch_can_bulge_declines_to_be_bounded() {
-        // The one direction a prefilter must never be wrong in. A sphere
-        // patch can hold a pole, which is nowhere near any of its edges, so
-        // a box built from them would be too small and the pair would be
-        // rejected as apart when it is not.
-        let mut body = cuboid([0.0; 3], [1.0; 3]).unwrap();
-        let face = body.face_keys().next().unwrap();
-        let surface = body.faces.get(face).unwrap().surface;
-        *body.surfaces.get_mut(surface).unwrap() =
-            crate::brep::Surface::Sphere(crate::brep::Sphere {
-                frame: crate::space::Plane::XY,
-                radius: 1.0,
-            });
-        assert!(face_bounds(&body, face).is_none());
-        assert!(body_bounds(&body).is_none(), "and so is the body");
+    fn closed_surfaces_and_nurbs_are_bounded_by_their_full_extent() {
+        use crate::brep::{Sphere, Torus};
+        use crate::space::{Plane, NurbsSurface3};
+        let frame = Plane::orthonormal([7.0, -9.0, 12.0], [1.0, 1.0, 0.0], [1.0, -1.0, 2.0]).unwrap();
+        let surfaces = [
+            Surface::Sphere(Sphere { frame, radius: 3.0 }),
+            Surface::Torus(Torus { frame, major_radius: 5.0, minor_radius: 2.0 }),
+            Surface::Nurbs(NurbsSurface3::new(1, 1,
+                vec![vec![[0.0; 3], [1.0, 2.0, 3.0]], vec![[4.0, 5.0, 1.0], [6.0, 7.0, 2.0]]],
+                vec![0.0, 0.0, 1.0, 1.0], vec![0.0, 0.0, 1.0, 1.0], Some(vec![vec![1.0, 2.0], vec![3.0, 1.0]])).unwrap()),
+        ];
+        for surface in surfaces {
+            let mut body = cuboid([0.0; 3], [1.0; 3]).unwrap();
+            let face = body.face_keys().next().unwrap();
+            let key = body.faces.get(face).unwrap().surface;
+            *body.surfaces.get_mut(key).unwrap() = surface.clone();
+            let bounds = face_bounds(&body, face).unwrap().grown(1e-12);
+            for i in 0..=32 {
+                for j in 0..=32 {
+                    let (u, v) = if matches!(surface, Surface::Nurbs(_)) {
+                        (i as f64 / 32.0, j as f64 / 32.0)
+                    } else {
+                        (i as f64 * std::f64::consts::TAU / 32.0, j as f64 * std::f64::consts::TAU / 32.0)
+                    };
+                    assert!(bounds.holds(surface.point_at(u, v)));
+                }
+            }
+            assert!(body_bounds(&body).is_some());
+        }
+        let sphere = crate::brep::make::sphere([2.0; 3], 3.0).unwrap();
+        let bounds = body_bounds(&sphere).unwrap();
+        assert_eq!(bounds.min, [-1.0; 3]);
+        assert_eq!(bounds.max, [5.0; 3]);
     }
 
     #[test]
