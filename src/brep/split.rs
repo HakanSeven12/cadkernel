@@ -234,9 +234,28 @@ pub fn split_face(
     cutter: &Curve3,
     tolerance: f64,
 ) -> Option<[FaceKey; 2]> {
+    let mut candidate = body.clone();
+    let result = split_face_in_place(&mut candidate, face, cutter, tolerance)?;
+    *body = candidate;
+    Some(result)
+}
+
+fn split_face_in_place(
+    body: &mut Body,
+    face: FaceKey,
+    cutter: &Curve3,
+    tolerance: f64,
+) -> Option<[FaceKey; 2]> {
     let node = body.faces.get(face)?.clone();
     let surface = body.surfaces.get(node.surface)?.clone();
     let flat_cutter = pcurve::project(&surface, cutter, tolerance)?;
+    if matches!(surface, super::geometry::Surface::Sphere(_)) {
+        if let Some(result) =
+            split_full_sphere(body, face, &node, &surface, cutter, &flat_cutter)
+        {
+            return Some(result);
+        }
+    }
     let boundary_parts = pcurve::face_boundary_parts(body, face, tolerance)?;
     let original_boundary: Vec<_> = boundary_parts
         .iter()
@@ -307,6 +326,18 @@ pub fn split_face(
                 .all(|edge| distance_to(edge, point) > tolerance)
         }))
     };
+    if matches!(surface, super::geometry::Surface::Plane(_)) {
+        if let Some(period) = closed_period(cutter) {
+            let step = period * 1.0e-6;
+            landings.retain(|landing| {
+                let parameter = cutter.parameter_at(landing.point);
+                matches!(
+                    (inside(parameter - step), inside(parameter + step)),
+                    (Some(before), Some(after)) if before != after
+                )
+            });
+        }
+    }
     if landings.is_empty() {
         let period = closed_period(cutter)?;
         if node.loops.len() > 1 {
@@ -320,7 +351,10 @@ pub fn split_face(
                 period,
             );
         }
-        let point = cutter.point_at(0.0);
+        let start_parameter = (0..16)
+            .map(|index| period * index as f64 / 16.0)
+            .find(|parameter| strictly_inside(*parameter) == Some(true))?;
+        let point = cutter.point_at(start_parameter);
         let (u, v) = surface.parameters_at(point)?;
         let strictly_inside = periodic_points([u, v], periods).into_iter().any(|point| {
             crate::geom2d::contains(
@@ -361,8 +395,8 @@ pub fn split_face(
         let curve = body.curves.insert(cutter.clone());
         let cut = body.edges.insert(Edge {
             curve,
-            start_parameter: 0.0,
-            end_parameter: period,
+            start_parameter,
+            end_parameter: start_parameter + period,
             start: seam,
             end: seam,
             coedges: Vec::new(),
@@ -523,12 +557,16 @@ pub fn split_face(
         body.coedge_vertices(coedge)
             .is_some_and(|(from, _)| from == vertex)
     };
-    let landing_index = |vertex: VertexKey| {
-        ring.iter()
-            .position(|coedge| begins_at(body, *coedge, vertex))
+    let landing_index = |landing: &Landing, vertex: VertexKey| {
+        let at = ring.iter().position(|coedge| *coedge == landing.coedge)?;
+        if begins_at(body, ring[at], vertex) {
+            return Some(at);
+        }
+        let next = (at + 1) % ring.len();
+        begins_at(body, ring[next], vertex).then_some(next)
     };
-    let at_first = landing_index(first)?;
-    let at_second = landing_index(second)?;
+    let at_first = landing_index(&landings[0], first)?;
+    let at_second = landing_index(&landings[1], second)?;
     // The stretch of the ring from one index round to the other, not
     // including where it stops.
     let arc = |from: usize, to: usize| -> Vec<CoedgeKey> {
@@ -602,6 +640,149 @@ pub fn split_face(
     body.shells.get_mut(node.owner)?.faces.push(other);
 
     Some([face, other])
+}
+
+/// Split an untrimmed one-face sphere without routing the cut through its
+/// artificial pole-to-pole seam. The seam is only a parameterisation aid; a
+/// real closed section leaves two spherical faces bounded by the section.
+fn split_full_sphere(
+    body: &mut Body,
+    face: FaceKey,
+    node: &Face,
+    surface: &super::geometry::Surface,
+    cutter: &Curve3,
+    flat_cutter: &crate::geom2d::Curve,
+) -> Option<[FaceKey; 2]> {
+    let period = closed_period(cutter)?;
+    if node.loops.len() != 1 {
+        return None;
+    }
+    let old_loop = node.loops[0];
+    let old_coedges = body.loops.get(old_loop)?.coedges.clone();
+    if old_coedges.len() != 2 {
+        return None;
+    }
+    let first = body.coedges.get(old_coedges[0])?;
+    let second = body.coedges.get(old_coedges[1])?;
+    if first.edge != second.edge || first.forward == second.forward {
+        return None;
+    }
+
+    let (start_parameter, point, alignment) = (0..32).find_map(|index| {
+        let parameter = period * index as f64 / 32.0;
+        let point = cutter.point_at(parameter);
+        let (u, v) = surface.parameters_at(point)?;
+        let plane = match cutter {
+            Curve3::Circle(circle) => &circle.plane,
+            Curve3::Ellipse(ellipse) => &ellipse.plane,
+            Curve3::PlanarSpline { plane, .. } => plane,
+            _ => return None,
+        };
+        let alignment = Vec3::from(plane.normal()?)
+            .dot(Vec3::from(surface.normal_at(u, v)?));
+        (alignment.is_finite() && alignment != 0.0).then_some((parameter, point, alignment))
+    })?;
+    let first_forward = (alignment > 0.0) == node.forward;
+
+    let old_edge = first.edge;
+    for coedge in old_coedges {
+        body.coedges.remove(coedge);
+    }
+    body.loops.remove(old_loop);
+    body.edges.remove(old_edge);
+
+    let seam = body.vertices.insert(Vertex {
+        point,
+        provenance: Provenance::Synthesized,
+    });
+    let curve = body.curves.insert(cutter.clone());
+    let cut = body.edges.insert(Edge {
+        curve,
+        start_parameter,
+        end_parameter: start_parameter + period,
+        start: seam,
+        end: seam,
+        coedges: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+
+    let first_loop = body.loops.insert(Loop {
+        coedges: Vec::new(),
+        owner: face,
+        provenance: Provenance::Synthesized,
+    });
+    let first_pcurve = if first_forward {
+        flat_cutter.clone()
+    } else {
+        reverse_closed_pcurve(flat_cutter)?
+    };
+    let first_coedge = body.coedges.insert(Coedge {
+        edge: cut,
+        forward: first_forward,
+        pcurve: Some(first_pcurve),
+        owner: first_loop,
+        provenance: Provenance::Synthesized,
+    });
+    body.loops.get_mut(first_loop)?.coedges = vec![first_coedge];
+    let kept = body.faces.get_mut(face)?;
+    kept.loops = vec![first_loop];
+    kept.provenance.soil();
+
+    let other = body.faces.insert(Face {
+        surface: node.surface,
+        forward: node.forward,
+        loops: Vec::new(),
+        owner: node.owner,
+        provenance: Provenance::Synthesized,
+    });
+    let other_loop = body.loops.insert(Loop {
+        coedges: Vec::new(),
+        owner: other,
+        provenance: Provenance::Synthesized,
+    });
+    let other_forward = !first_forward;
+    let other_pcurve = if other_forward {
+        flat_cutter.clone()
+    } else {
+        reverse_closed_pcurve(flat_cutter)?
+    };
+    let other_coedge = body.coedges.insert(Coedge {
+        edge: cut,
+        forward: other_forward,
+        pcurve: Some(other_pcurve),
+        owner: other_loop,
+        provenance: Provenance::Synthesized,
+    });
+    body.loops.get_mut(other_loop)?.coedges = vec![other_coedge];
+    body.faces.get_mut(other)?.loops = vec![other_loop];
+    body.shells.get_mut(node.owner)?.faces.push(other);
+    body.edges.get_mut(cut)?.coedges = vec![first_coedge, other_coedge];
+    body.validate().is_empty().then_some([face, other])
+}
+
+fn reverse_closed_pcurve(curve: &crate::geom2d::Curve) -> Option<crate::geom2d::Curve> {
+    use crate::geom2d::{Curve, Line, Polyline};
+    Some(match curve {
+        Curve::Line(line) => Curve::Line(Line {
+            start: line.end,
+            end: line.start,
+        }),
+        Curve::Polyline(polyline)
+            if polyline
+                .vertices
+                .iter()
+                .all(|vertex| vertex.bulge == 0.0) =>
+        {
+            let mut vertices = polyline.vertices.clone();
+            vertices.reverse();
+            Curve::Polyline(Polyline {
+                vertices,
+                closed: polyline.closed,
+            })
+        }
+        Curve::Nurbs(curve) => Curve::Nurbs(curve.reversed()),
+        _ => return None,
+    })
 }
 
 /// Divides a periodic band along a closed section.
