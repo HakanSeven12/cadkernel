@@ -139,6 +139,17 @@ fn face_hits(
             // placed within the face's boundary, so the count is unusable.
             return None;
         };
+        // A planar edge hit can survive only one adjacent face's trim test.
+        // Retry the ray before rounding makes that single hit a crossing.
+        if distance >= -tolerance && matches!(surface, super::Surface::Plane(_))
+            && boundary.iter().any(|edge| {
+                let closest = crate::geom2d::closest_point(edge, [u, v]).point;
+                Vec3::from(surface.point_at(closest[0], closest[1]))
+                    .distance(Vec3::from(point)) <= tolerance
+            })
+        {
+            return None;
+        }
         if pcurve::contains_parameter(
             surface,
             &boundary,

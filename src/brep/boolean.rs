@@ -692,6 +692,40 @@ mod tests {
     }
 
     #[test]
+    fn a_door_cut_retries_rays_that_graze_the_wall_bottom() {
+        use crate::geom2d::{Curve, Line};
+        let prism = |points: &[[f64; 2]]| {
+            let profile = (0..points.len()).map(|index| Curve::Line(Line {
+                start: points[index], end: points[(index + 1) % points.len()],
+            })).collect::<Vec<_>>();
+            crate::brep::extrude(crate::space::Plane::XY, &profile, [0.0, 0.0, 3000.0]).unwrap()
+        };
+        let outer = prism(&[
+            [0.0, 2350.608306267448], [0.0, 6299.998941667038],
+            [18119.99661333453, 6299.998941667038],
+            [18119.99661333453, -299.99964722234654],
+            [2650.609364600408, -299.99964722234654],
+        ]);
+        let inner = prism(&[
+            [299.99964722234614, 2474.872823655858],
+            [299.99964722234614, 5999.998941667038],
+            [17819.995555001562, 5999.998941667038],
+            [17819.995555001562, 0.0], [2774.8735292111646, 0.0],
+        ]);
+        let tolerance = crate::brep::operation_tolerance(&[&outer, &inner]);
+        let wall = combine(outer, inner, Operation::Difference, tolerance).unwrap();
+        assert_eq!(crate::brep::contains_point(&wall,
+            [6159.999129815122, -349.99982361117327, -50.0], tolerance),
+            Containment::Outside);
+        let cutter = cuboid([6159.999129815122, -400.0, -100.0], [1200.0, 500.0, 2200.0]).unwrap();
+        let expected = volume(&wall) - 1200.0 * 299.99964722234654 * 2100.0;
+        let result = combine(wall, cutter, Operation::Difference, tolerance).unwrap();
+        assert!(result.validate().is_empty());
+        assert!(result.edges.iter().all(|(_, edge)| edge.coedges.len() == 2));
+        assert!((volume(&result) - expected).abs() < 1e-3);
+    }
+
+    #[test]
     fn a_union_reaches_across_both() {
         let (a, b) = pair();
         let result = combine(a, b, Operation::Union, TOL).expect("two boxes union");
