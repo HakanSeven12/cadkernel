@@ -242,6 +242,12 @@ pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body
         }
         components.push(component);
     }
+    // A disconnected or nested shell needs explicit lump/cavity containment.
+    // Until that topology is represented, accept only one closed shell so a
+    // cavity can never be silently converted into filled material.
+    if components.len() != 1 {
+        return None;
+    }
     for (face, flip) in faces.iter_mut().zip(flips) {
         if flip? {
             face.reverse();

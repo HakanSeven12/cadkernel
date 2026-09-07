@@ -5,8 +5,9 @@
 //! operation reconstructs a solid from an intersection of half-spaces: doing
 //! that changes concave solids, holes, and unrelated lumps into another shape.
 
+use super::nurbs_builder::RationalCurve2;
 use super::{Body, Curve3, EdgeKey, FaceKey, Meeting, Operation, Placement, Surface};
-use crate::geom2d::{Arc, Curve, EllipseArc, Tolerance, Transform};
+use crate::geom2d::{Arc, Curve, EllipseArc, Line, Polyline, PolylineVertex, Tolerance, Transform};
 use crate::space::{Plane, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::{FRAC_PI_2, TAU};
@@ -352,9 +353,18 @@ fn component_boundary_loops(
         let order = closed_curve_order(&pending, tolerance)?;
         let ring = order
             .iter()
-            .map(|index| pending[*index].clone())
+            .map(|(index, forward)| {
+                if *forward {
+                    Some(pending[*index].clone())
+                } else {
+                    reversed_curve(&pending[*index])
+                }
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut remove = order
+            .into_iter()
+            .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        let mut remove = order;
         remove.sort_unstable();
         for index in remove.into_iter().rev() {
             pending.remove(index);
@@ -365,7 +375,44 @@ fn component_boundary_loops(
     Some(loops)
 }
 
-fn closed_curve_order(curves: &[Curve], tolerance: f64) -> Option<Vec<usize>> {
+fn reversed_curve(curve: &Curve) -> Option<Curve> {
+    match curve {
+        Curve::Line(line) => Some(Curve::Line(Line {
+            start: line.end,
+            end: line.start,
+        })),
+        Curve::Polyline(polyline) => {
+            let count = polyline.vertices.len();
+            let vertices = (0..count)
+                .rev()
+                .map(|index| {
+                    let bulge = if index > 0 {
+                        -polyline.vertices[index - 1].bulge
+                    } else if polyline.closed && count > 0 {
+                        -polyline.vertices[count - 1].bulge
+                    } else {
+                        0.0
+                    };
+                    PolylineVertex {
+                        position: polyline.vertices[index].position,
+                        bulge,
+                    }
+                })
+                .collect();
+            Some(Curve::Polyline(Polyline {
+                vertices,
+                closed: polyline.closed,
+            }))
+        }
+        Curve::Nurbs(curve) => Some(Curve::Nurbs(curve.reversed())),
+        Curve::Circle(_) | Curve::Arc(_) | Curve::Ellipse(_) => Some(Curve::Nurbs(
+            RationalCurve2::from_curve(curve)?.reversed().curve()?,
+        )),
+        Curve::Ray(_) | Curve::XLine(_) => None,
+    }
+}
+
+fn closed_curve_order(curves: &[Curve], tolerance: f64) -> Option<Vec<(usize, bool)>> {
     let near = |a: [f64; 2], b: [f64; 2]| {
         (a[0] - b[0]).hypot(a[1] - b[1]) <= tolerance * 4.0
     };
@@ -375,7 +422,7 @@ fn closed_curve_order(curves: &[Curve], tolerance: f64) -> Option<Vec<usize>> {
         let mut head = first.point_at(if first_forward { 1.0 } else { 0.0 });
         let mut used = vec![false; curves.len()];
         used[0] = true;
-        let mut order = vec![0];
+        let mut order = vec![(0, first_forward)];
         while !near(head, start) {
             let (next, forward) = curves.iter().enumerate().find_map(|(index, curve)| {
                 if used[index] {
@@ -390,7 +437,7 @@ fn closed_curve_order(curves: &[Curve], tolerance: f64) -> Option<Vec<usize>> {
                 }
             })?;
             used[next] = true;
-            order.push(next);
+            order.push((next, forward));
             head = curves[next].point_at(if forward { 1.0 } else { 0.0 });
         }
         Some(order)
