@@ -42,6 +42,29 @@ pub struct Mesh {
 }
 
 impl Mesh {
+    /// Volume and centroid of a closed, consistently wound mesh. Curved-body
+    /// accuracy follows the tessellation tolerance. Empty or degenerate meshes
+    /// return `None`; a local reference keeps survey coordinates well conditioned.
+    pub fn mass_properties(&self) -> Option<(f64, [f64; 3])> {
+        let origin = Vec3::from(*self.positions.first()?);
+        let mut volume6 = 0.0;
+        let mut moment = Vec3::from([0.0; 3]);
+        for triangle in &self.triangles {
+            let a = Vec3::from(*self.positions.get(triangle[0])?) - origin;
+            let b = Vec3::from(*self.positions.get(triangle[1])?) - origin;
+            let c = Vec3::from(*self.positions.get(triangle[2])?) - origin;
+            let weight = a.dot(b.cross(c));
+            volume6 += weight;
+            moment = moment + (a + b + c) * weight;
+        }
+        if volume6 == 0.0 || !volume6.is_finite() {
+            return None;
+        }
+        let centroid = (origin + moment / (4.0 * volume6)).to_array();
+        centroid.iter().all(|value| value.is_finite())
+            .then_some((volume6.abs() / 6.0, centroid))
+    }
+
     /// How many triangles it holds.
     pub fn len(&self) -> usize {
         self.triangles.len()
@@ -4463,6 +4486,30 @@ mod tests {
     use crate::brep::make::cuboid;
 
     const TOL: f64 = 1e-9;
+
+    #[test]
+    fn mesh_mass_properties_preserve_translation_and_orientation() {
+        for origin in [[0.0; 3], [1e9, -2e9, 3e9]] {
+            let solid = cuboid(origin, [2.0, 3.0, 4.0]).unwrap();
+            let mut mesh = self::body(&solid, default_angle(), TOL);
+            for _ in 0..2 {
+                let (volume, centroid) = mesh.mass_properties().unwrap();
+                assert!((volume - 24.0).abs() < 1e-9);
+                for axis in 0..3 {
+                    assert!((centroid[axis] - origin[axis] - [1.0, 1.5, 2.0][axis]).abs() < 1e-6);
+                }
+                for triangle in &mut mesh.triangles {
+                    triangle.swap(1, 2);
+                }
+            }
+        }
+        assert!(Mesh::default().mass_properties().is_none());
+        assert!(Mesh {
+            positions: vec![[0.0; 3]],
+            triangles: vec![[0, 0, 0]],
+            ..Default::default()
+        }.mass_properties().is_none());
+    }
 
     #[test]
     fn a_box_meshes_into_two_triangles_a_side() {
