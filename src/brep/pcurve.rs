@@ -28,7 +28,9 @@
 //! can refuse, a caller told something wrong cannot.
 
 use super::geometry::{Curve3, Surface};
-use crate::geom2d::{Arc, Circle, Curve, Ellipse, EllipseArc, Line, XLine};
+use crate::geom2d::{
+    Arc, Circle, Curve, Ellipse, EllipseArc, Line, Polyline, PolylineVertex, XLine,
+};
 use crate::space::Vec3;
 use std::f64::consts::TAU;
 
@@ -164,13 +166,75 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
             _ => None,
         },
 
-        // A sphere is closed too, but its `u` has no value at the poles —
-        // every meridian passes through them — so a seam ending at one
-        // cannot be placed in `(u, v)` from the geometry alone. Stored
-        // coedge pcurves are handled before this projection path.
-        Surface::Sphere(_) => None,
+        // A latitude is straight in a sphere's `(u, v)` space. This is the
+        // exact pcurve needed when a plane perpendicular to the sphere axis
+        // cuts it, including the equator used by coaxial round solids. Other
+        // circles can cross the longitude seam or a pole and need a general
+        // spherical pcurve representation rather than being guessed here.
+        Surface::Sphere(sphere) => match curve {
+            Curve3::Circle(circle) => {
+                let axis = Vec3::from(sphere.frame.normal()?);
+                let plane_normal = Vec3::from(circle.plane.normal()?);
+                if plane_normal.is_parallel_to(axis, tolerance) {
+                    let height = (Vec3::from(circle.plane.origin)
+                        - Vec3::from(sphere.frame.origin))
+                    .dot(axis);
+                    if height.abs() > sphere.radius + tolerance {
+                        return None;
+                    }
+                    return Some(band_at(
+                        (height / sphere.radius).clamp(-1.0, 1.0).asin(),
+                    ));
+                }
+                let centred = Vec3::from(circle.plane.origin)
+                    .distance(Vec3::from(sphere.frame.origin))
+                    <= tolerance;
+                let meridian = plane_normal.dot(axis).abs() <= tolerance
+                    && centred
+                    && (circle.radius - sphere.radius).abs() <= tolerance;
+                if meridian {
+                    return Some(generator_at(angle_about(
+                        &sphere.frame,
+                        curve.point_at(0.0),
+                    )?));
+                }
+                sampled_sphere_circle(surface, curve)
+            }
+            _ => None,
+        },
         Surface::Nurbs(_) => None,
     }
+}
+
+/// A general circle on a sphere is not a conic in longitude/latitude space.
+/// Store its pcurve as a dense closed parameter-space chain through exact
+/// samples while retaining the analytic circle as the space edge.
+fn sampled_sphere_circle(surface: &Surface, curve: &Curve3) -> Option<Curve> {
+    const SAMPLES: usize = 96;
+    let mut points = Vec::with_capacity(SAMPLES);
+    let mut previous = None;
+    for index in 0..SAMPLES {
+        let parameter = TAU * index as f64 / SAMPLES as f64;
+        let (mut u, v) = surface.parameters_at(curve.point_at(parameter))?;
+        if let Some(last) = previous {
+            u = unwound(u, last, TAU);
+        }
+        previous = Some(u);
+        points.push([u, v]);
+    }
+    let (mut final_u, final_v) = surface.parameters_at(curve.point_at(TAU))?;
+    final_u = unwound(final_u, previous?, TAU);
+    let first = points[0];
+    if (final_u - first[0]).abs() > 1.0e-6 || (final_v - first[1]).abs() > 1.0e-6 {
+        return None;
+    }
+    Some(Curve::Polyline(Polyline {
+        vertices: points
+            .into_iter()
+            .map(PolylineVertex::straight)
+            .collect(),
+        closed: true,
+    }))
 }
 
 /// A face's loops as curves in its surface's parameter space, each trimmed
@@ -345,12 +409,46 @@ fn trim_to(
     // backwards unless it is unwound. One that does not wrap must be left
     // alone: unwinding a plane's coordinates would move the curve.
     let periods = periods(surface);
-    let mut walk: Vec<[f64; 2]> = Vec::with_capacity(WALK + 1);
-    let mut last: Option<[f64; 2]> = None;
+    let mut raw: Vec<[f64; 2]> = Vec::with_capacity(WALK + 1);
     for step in 0..=WALK {
         let t = span.0 + (span.1 - span.0) * step as f64 / WALK as f64;
-        let (u, v) = surface.parameters_at(curve.point_at(t))?;
-        let mut here = [u, v];
+        let point = curve.point_at(t);
+        if let Some((u, v)) = surface.parameters_at(point) {
+            raw.push([u, v]);
+            continue;
+        }
+        let Surface::Sphere(sphere) = surface else {
+            return None;
+        };
+        let local = sphere.frame.project(point)?;
+        let axis = Vec3::from(sphere.frame.normal()?);
+        let height = (Vec3::from(point) - Vec3::from(sphere.frame.origin)).dot(axis);
+        if local[0].hypot(local[1]) > f64::EPSILON * sphere.radius.max(1.0) {
+            return None;
+        }
+        // Longitude is singular at a pole. Keep it unset until a neighbouring
+        // non-pole sample supplies the meridian this edge approaches on.
+        raw.push([f64::NAN, height.atan2(0.0)]);
+    }
+    for index in 0..raw.len() {
+        if raw[index][0].is_finite() {
+            continue;
+        }
+        let longitude = (1..raw.len()).find_map(|distance| {
+            index
+                .checked_sub(distance)
+                .and_then(|near| raw[near][0].is_finite().then_some(raw[near][0]))
+                .or_else(|| {
+                    raw.get(index + distance)
+                        .and_then(|near| near[0].is_finite().then_some(near[0]))
+                })
+        })?;
+        raw[index][0] = longitude;
+    }
+
+    let mut walk: Vec<[f64; 2]> = Vec::with_capacity(WALK + 1);
+    let mut last: Option<[f64; 2]> = None;
+    for mut here in raw {
         if let Some(previous) = last {
             for axis in 0..2 {
                 if let Some(period) = periods[axis] {

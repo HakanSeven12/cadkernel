@@ -51,6 +51,8 @@ pub enum Operation {
 /// not the body the caller handed over, and returning it silently would be
 /// worse than asking for ownership.
 pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+    let original_a = a.clone();
+    let original_b = b.clone();
     imprint(&mut a, &mut b, tolerance)?;
 
     let (keep_a, keep_b, flip_b) = match how {
@@ -73,9 +75,9 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
     result.roots = vec![lump];
 
     let mut kept = 0;
-    for (body, other, wanted, flip, first) in [
-        (&a, &b, keep_a, false, true),
-        (&b, &a, keep_b, flip_b, false),
+    for (body, other, classifier, wanted, flip, first) in [
+        (&a, &b, &original_b, keep_a, false, true),
+        (&b, &a, &original_a, keep_b, flip_b, false),
     ] {
         for face in body.face_keys() {
             // A shared wall is settled by the two normals rather than by
@@ -87,7 +89,7 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
                 }
                 continue;
             }
-            match face_side(body, other, face, tolerance) {
+            match face_side(body, classifier, face, tolerance) {
                 Containment::OnBoundary => return Err(Snag::Coincident),
                 Containment::Unknown => return Err(Snag::CutRefused),
                 side if side == wanted => {
@@ -368,6 +370,27 @@ fn face_side(body: &Body, other: &Body, face: FaceKey, tolerance: f64) -> Contai
 fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Option<[f64; 3]> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
+    if let Surface::Sphere(sphere) = surface {
+        if node.loops.len() == 1 {
+            let ring = body.loops.get(node.loops[0])?;
+            if ring.coedges.len() == 1 {
+                let coedge = body.coedges.get(ring.coedges[0])?;
+                let edge = body.edges.get(coedge.edge)?;
+                if edge.start == edge.end {
+                    if let Some(super::geometry::Curve3::Circle(circle)) =
+                        body.curves.get(edge.curve)
+                    {
+                        let normal = Vec3::from(circle.plane.normal()?);
+                        let sign = if coedge.forward == node.forward { 1.0 } else { -1.0 };
+                        return Some(
+                            (Vec3::from(sphere.frame.origin) + normal * sphere.radius * sign)
+                                .to_array(),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let boundary = pcurve::face_boundary(body, face, tolerance)?;
     let samples: Vec<[f64; 2]> = boundary
         .iter()

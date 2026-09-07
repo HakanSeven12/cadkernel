@@ -6,7 +6,7 @@
 //! that changes concave solids, holes, and unrelated lumps into another shape.
 
 use super::{Body, Curve3, EdgeKey, FaceKey, Meeting, Operation, Placement, Surface};
-use crate::geom2d::{Arc, Curve, EllipseArc, Tolerance};
+use crate::geom2d::{Arc, Curve, EllipseArc, Tolerance, Transform};
 use crate::space::{Plane, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::{FRAC_PI_2, TAU};
@@ -142,6 +142,194 @@ pub fn planar_region(plane: Plane, loops: &[Vec<Curve>]) -> Option<Body> {
     result.roots.push(lump);
     super::boolean::copy_face(&mut result, &solid, face, shell, true).ok()?;
     result.validate().is_empty().then_some(result)
+}
+
+/// Unites coplanar bounded sheets while preserving exact curved boundaries.
+///
+/// The sheets are lifted into equal-depth temporary solids so the regular
+/// Boolean owns all overlap and hole decisions. The bottom caps of the
+/// result are then copied back into one open sheet body.
+pub fn union_planar_regions(bodies: &[Body], tolerance: f64) -> Result<Body, super::Snag> {
+    if bodies.len() < 2 || !tolerance.is_finite() || tolerance <= 0.0 {
+        return Err(super::Snag::CutRefused);
+    }
+
+    let profiles = bodies
+        .iter()
+        .flat_map(|body| body.face_keys().map(move |face| (body, face)))
+        .map(|(body, face)| planar_face_profile(body, face).ok_or(super::Snag::NoClosedForm))
+        .collect::<Result<Vec<_>, _>>()?;
+    let base = profiles.first().ok_or(super::Snag::CutRefused)?.plane;
+    let normal = Vec3::from(base.normal().ok_or(super::Snag::CutRefused)?);
+    let mut solids = Vec::with_capacity(profiles.len());
+
+    for profile in profiles {
+        let profile_normal = Vec3::from(profile.plane.normal().ok_or(super::Snag::CutRefused)?);
+        if normal.dot(profile_normal).abs() < 1.0 - 1e-9
+            || base
+                .distance_to(profile.plane.origin)
+                .is_none_or(|distance| distance.abs() > tolerance)
+        {
+            return Err(super::Snag::NoClosedForm);
+        }
+        let transform =
+            plane_transform(&base, &profile.plane).ok_or(super::Snag::CutRefused)?;
+        let loops = profile
+            .loops
+            .iter()
+            .map(|ring| {
+                ring.iter()
+                    .map(|curve| curve.transformed(&transform).ok_or(super::Snag::CutRefused))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        solids.push(
+            super::extrude_region(base, &loops, normal.to_array())
+                .ok_or(super::Snag::CutRefused)?,
+        );
+    }
+
+    let mut solids = solids.into_iter();
+    let mut united = solids.next().ok_or(super::Snag::CutRefused)?;
+    for solid in solids {
+        united = super::combine(united, solid, Operation::Union, tolerance)?;
+    }
+
+    let bottom = united
+        .face_keys()
+        .filter(|face| {
+            planar_face_profile(&united, *face).is_some_and(|profile| {
+                base.distance_to(profile.plane.origin)
+                    .is_some_and(|distance| distance.abs() <= tolerance * 4.0)
+                    && Vec3::from(profile.outward).dot(normal) < -1.0 + 1e-9
+            })
+        })
+        .collect::<Vec<_>>();
+    if bottom.is_empty() {
+        return Err(super::Snag::CutRefused);
+    }
+
+    let components = super::sweep::face_components(&united, &bottom)
+        .ok_or(super::Snag::CutRefused)?;
+    let mut result = Body::new();
+    for component in components {
+        let loops = component_boundary_loops(&united, &component, &base, tolerance)
+            .ok_or(super::Snag::CutRefused)?;
+        let sheet = planar_region(base, &loops).ok_or(super::Snag::CutRefused)?;
+        let lump = result.lumps.insert(super::Lump {
+            shells: Vec::new(),
+            provenance: super::Provenance::Synthesized,
+        });
+        let shell = result.shells.insert(super::Shell {
+            faces: Vec::new(),
+            owner: lump,
+            provenance: super::Provenance::Synthesized,
+        });
+        result
+            .lumps
+            .get_mut(lump)
+            .ok_or(super::Snag::CutRefused)?
+            .shells
+            .push(shell);
+        result.roots.push(lump);
+        for face in sheet.face_keys() {
+            super::boolean::copy_face(&mut result, &sheet, face, shell, false)?;
+        }
+    }
+    if result.validate().is_empty() {
+        Ok(result)
+    } else {
+        Err(super::Snag::CutRefused)
+    }
+}
+
+fn plane_transform(base: &Plane, source: &Plane) -> Option<Transform> {
+    Some(Transform {
+        origin: base.project(source.origin)?.into(),
+        x_axis: base.project_vector(source.x_axis)?.into(),
+        y_axis: base.project_vector(source.y_axis)?.into(),
+    })
+}
+
+fn component_boundary_loops(
+    body: &Body,
+    faces: &[FaceKey],
+    base: &Plane,
+    tolerance: f64,
+) -> Option<Vec<Vec<Curve>>> {
+    let face_set = faces.iter().copied().collect::<HashSet<_>>();
+    let mut pending = Vec::new();
+    for face in faces {
+        let node = body.faces.get(*face)?;
+        let Surface::Plane(plane) = body.surfaces.get(node.surface)? else {
+            return None;
+        };
+        let transform = plane_transform(base, plane)?;
+        for (coedge, curve) in super::pcurve::face_boundary_parts(body, *face, tolerance)? {
+            let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
+            let internal = edge.coedges.iter().any(|candidate| {
+                if *candidate == coedge {
+                    return false;
+                }
+                body.coedges
+                    .get(*candidate)
+                    .and_then(|node| body.loops.get(node.owner))
+                    .is_some_and(|ring| face_set.contains(&ring.owner))
+            });
+            if !internal {
+                pending.push(curve.transformed(&transform)?);
+            }
+        }
+    }
+
+    let mut loops = Vec::new();
+    while !pending.is_empty() {
+        let order = closed_curve_order(&pending, tolerance)?;
+        let ring = order
+            .iter()
+            .map(|index| pending[*index].clone())
+            .collect::<Vec<_>>();
+        let mut remove = order;
+        remove.sort_unstable();
+        for index in remove.into_iter().rev() {
+            pending.remove(index);
+        }
+        loops.push(ring);
+    }
+    loops.sort_by(|a, b| boundary_area(b).abs().total_cmp(&boundary_area(a).abs()));
+    Some(loops)
+}
+
+fn closed_curve_order(curves: &[Curve], tolerance: f64) -> Option<Vec<usize>> {
+    let near = |a: [f64; 2], b: [f64; 2]| {
+        (a[0] - b[0]).hypot(a[1] - b[1]) <= tolerance * 4.0
+    };
+    [true, false].into_iter().find_map(|first_forward| {
+        let first = curves.first()?;
+        let start = first.point_at(if first_forward { 0.0 } else { 1.0 });
+        let mut head = first.point_at(if first_forward { 1.0 } else { 0.0 });
+        let mut used = vec![false; curves.len()];
+        used[0] = true;
+        let mut order = vec![0];
+        while !near(head, start) {
+            let (next, forward) = curves.iter().enumerate().find_map(|(index, curve)| {
+                if used[index] {
+                    return None;
+                }
+                if near(head, curve.point_at(0.0)) {
+                    Some((index, true))
+                } else if near(head, curve.point_at(1.0)) {
+                    Some((index, false))
+                } else {
+                    None
+                }
+            })?;
+            used[next] = true;
+            order.push(next);
+            head = curves[next].point_at(if forward { 1.0 } else { 0.0 });
+        }
+        Some(order)
+    })
 }
 
 /// Splits complete conics into exact bounded pieces for extrusion builders.

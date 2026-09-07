@@ -67,6 +67,10 @@ pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
         (Surface::Cylinder(one), Surface::Cylinder(other)) => {
             cylinders(one, other, tolerance)
         }
+        (Surface::Sphere(sphere), Surface::Cylinder(cylinder))
+        | (Surface::Cylinder(cylinder), Surface::Sphere(sphere)) => {
+            sphere_cylinder(sphere, cylinder, tolerance)
+        }
         (Surface::Cone(cone), Surface::Cylinder(cylinder))
         | (Surface::Cylinder(cylinder), Surface::Cone(cone)) => coaxial_conics(
             &cone.base, cone.radius, cone.half_angle.tan(),
@@ -78,6 +82,49 @@ pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
         ),
         _ => Meeting::Unknown,
     }
+}
+
+/// A sphere and a coaxial cylinder meet in one or two exact latitude circles.
+/// Offset axes form a quartic and remain unknown until the marching path can
+/// represent every branch safely.
+fn sphere_cylinder(sphere: &Sphere, cylinder: &Cylinder, tolerance: f64) -> Meeting {
+    let (Some(axis), Some(sphere_axis)) =
+        (cylinder.base.normal(), sphere.frame.normal())
+    else {
+        return Meeting::Unknown;
+    };
+    let axis = Vec3::from(axis);
+    if !axis.is_parallel_to(Vec3::from(sphere_axis), tolerance) {
+        return Meeting::Unknown;
+    }
+    let offset = Vec3::from(sphere.frame.origin) - Vec3::from(cylinder.base.origin);
+    let along = offset.dot(axis);
+    if (offset - axis * along).length() > tolerance {
+        return Meeting::Unknown;
+    }
+    if cylinder.radius - sphere.radius > tolerance {
+        return Meeting::None;
+    }
+    let squared = sphere.radius * sphere.radius - cylinder.radius * cylinder.radius;
+    if squared < -tolerance * tolerance {
+        return Meeting::None;
+    }
+    let rise = squared.max(0.0).sqrt();
+    let heights = if rise <= tolerance {
+        vec![along]
+    } else {
+        vec![along - rise, along + rise]
+    };
+    let mut curves = Vec::with_capacity(heights.len());
+    for height in heights {
+        let centre = Vec3::from(cylinder.base.origin) + axis * height;
+        let Meeting::Curves(mut circle) = circle_on(centre, axis, cylinder.radius, tolerance)
+        else {
+            return Meeting::Unknown;
+        };
+        curves.append(&mut circle);
+    }
+    Meeting::Curves(curves)
 }
 
 /// Coaxial cones and cylinders share exact circles, even when the two
