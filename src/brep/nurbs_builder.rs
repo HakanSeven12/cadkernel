@@ -47,11 +47,7 @@ impl RationalCurve2 {
                 arc.start_angle,
                 arc.sweep(),
             ),
-            Curve::Ellipse(arc) => conic(
-                arc.ellipse,
-                arc.start_parameter,
-                arc.sweep(),
-            ),
+            Curve::Ellipse(arc) => conic(arc.ellipse, arc.start_parameter, arc.sweep()),
             Curve::Nurbs(curve) => from_nurbs(curve),
             _ => None,
         }
@@ -178,7 +174,11 @@ fn from_nurbs(curve: &NurbsCurve) -> Option<RationalCurve2> {
     }
     Some(RationalCurve2 {
         degree: curve.degree(),
-        knots: curve.knots().iter().map(|value| (value - start) / span).collect(),
+        knots: curve
+            .knots()
+            .iter()
+            .map(|value| (value - start) / span)
+            .collect(),
         points: curve.control_points().to_vec(),
         weights: curve.weights().to_vec(),
     })

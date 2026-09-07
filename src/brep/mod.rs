@@ -27,8 +27,8 @@
 //! the blast radius of an edit is the edit.
 
 pub mod arena;
-pub mod boolean;
 pub mod blend;
+pub mod boolean;
 pub mod bounds;
 pub mod classify;
 pub mod geometry;
@@ -48,32 +48,36 @@ pub mod sweep_path;
 pub mod topology;
 
 pub use arena::{Arena, Key};
-pub use bounds::{body_bounds, face_bounds, operation_tolerance, Aabb};
-pub use geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
-pub use boolean::{combine, Operation};
 pub use blend::{chamfer, fillet, presspull};
-pub use presspull::{
-    extrusion_profile_pieces, planar_face_at_point, planar_face_profile, planar_region, presspull_face,
-    presspull_region, subtract_planar_regions, union_planar_regions, PlanarFaceProfile,
-    PresspullMode,
-};
+pub use boolean::{combine, Operation};
+pub use bounds::{body_bounds, face_bounds, operation_tolerance, Aabb};
 pub use classify::{contains_point, Containment};
+pub use geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
+pub use imprint::{imprint, Imprint, Snag};
+pub use intersect::{surfaces as intersect_surfaces, Meeting};
+pub use loft::loft;
+pub use loft_general::{loft_with_options, LoftError, LoftOptions, LoftSection};
 pub use mesh::{body as mesh_body, Mesh};
 pub use place::{edge_points, edge_polylines, transform, Placement};
+pub use presspull::{
+    extrusion_profile_pieces, intersect_planar_regions, planar_face_at_point, planar_face_profile,
+    planar_region, presspull_face, presspull_region, subtract_planar_regions, union_planar_regions,
+    PlanarFaceProfile, PlanarIntersection, PresspullMode,
+};
 pub use sweep::{
-    extrude, extrude_region, extrude_surface, extrude_surface_region, revolve, revolve_region, revolve_surface,
-    revolve_surface_region, sweep_along, sweep_along_deformed, sweep_along_polyline3d,
+    extrude, extrude_region, extrude_surface, extrude_surface_region, revolve, revolve_region,
+    revolve_surface, revolve_surface_region, sweep_along, sweep_along_deformed,
+    sweep_along_polyline3d,
+};
+#[cfg(feature = "offset")]
+pub use sweep::{
+    extrude_region_tapered, extrude_surface_region_tapered, extrude_surface_tapered,
+    extrude_tapered,
 };
 pub use sweep_path::{
     sweep_path, sweep_path_start, sweep_profile_base, sweep_profile_group_base,
     sweep_profile_placement, SweepOptions, SweepPath,
 };
-#[cfg(feature = "offset")]
-pub use sweep::{extrude_region_tapered, extrude_surface_region_tapered, extrude_surface_tapered, extrude_tapered};
-pub use imprint::{imprint, Imprint, Snag};
-pub use intersect::{surfaces as intersect_surfaces, Meeting};
-pub use loft::loft;
-pub use loft_general::{loft_with_options, LoftError, LoftOptions, LoftSection};
 pub use topology::{
     Body, Coedge, CoedgeKey, CurveKey, Edge, EdgeKey, Face, FaceKey, Flaw, Loop, LoopKey, Lump,
     LumpKey, Shell, ShellKey, SurfaceKey, Vertex, VertexKey,

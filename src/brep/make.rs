@@ -15,11 +15,11 @@ use super::nurbs_builder::RationalCurve2;
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, Loop, Lump, Shell, Vertex, VertexKey,
 };
-use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use super::Provenance;
 use crate::geom2d::{Arc, Curve as Curve2, Ellipse, EllipseArc, Line as Line2};
 use crate::space::{Plane, Vec3};
 use std::collections::{HashMap, VecDeque};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 /// A rectangular box with one corner at `origin` and the opposite at
 /// `origin + size`.
@@ -64,9 +64,18 @@ pub fn cuboid(origin: [f64; 3], size: [f64; 3]) -> Option<Body> {
     // The twelve edges as corner pairs, each running from the lower index to
     // the higher so a shared edge is found rather than duplicated.
     const EDGES: [(usize, usize); 12] = [
-        (0, 1), (2, 3), (4, 5), (6, 7), // along x
-        (0, 2), (1, 3), (4, 6), (5, 7), // along y
-        (0, 4), (1, 5), (2, 6), (3, 7), // along z
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7), // along x
+        (0, 2),
+        (1, 3),
+        (4, 6),
+        (5, 7), // along y
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7), // along z
     ];
     let edges: Vec<EdgeKey> = EDGES
         .iter()
@@ -202,7 +211,9 @@ pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body
                 uses.entry(key).or_default().push((face, from < to));
             }
         }
-        uses.values().all(|entries| entries.len() == 2).then_some(uses)
+        uses.values()
+            .all(|entries| entries.len() == 2)
+            .then_some(uses)
     };
 
     let uses = edge_uses(&faces)?;
@@ -288,10 +299,7 @@ pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body
     }
 
     let uses = edge_uses(&faces)?;
-    if uses
-        .values()
-        .any(|entries| entries[0].1 == entries[1].1)
-    {
+    if uses.values().any(|entries| entries[0].1 == entries[1].1) {
         return None;
     }
 
@@ -335,7 +343,10 @@ pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body
         });
         for face_index in component {
             let ring = &faces[face_index];
-            let points = ring.iter().map(|&index| vertices[index]).collect::<Vec<_>>();
+            let points = ring
+                .iter()
+                .map(|&index| vertices[index])
+                .collect::<Vec<_>>();
             let standard_normal = crate::space::polygon::normal(&points)?;
             let origin = Vec3::from(points[0]);
             let along = points[1..]
@@ -606,10 +617,19 @@ pub fn sphere(centre: [f64; 3], radius: f64) -> Option<Body> {
     });
 
     let (lump, shell) = add_shell(&mut body);
-    let surface = body.surfaces.insert(Surface::Sphere(Sphere { frame, radius }));
+    let surface = body
+        .surfaces
+        .insert(Surface::Sphere(Sphere { frame, radius }));
     // Up the seam and back down it: the loop closes on itself because the
     // face wraps the whole way round in between.
-    close_shell(&mut body, lump, shell, surface, true, &[(seam, true), (seam, false)])?;
+    close_shell(
+        &mut body,
+        lump,
+        shell,
+        surface,
+        true,
+        &[(seam, true), (seam, false)],
+    )?;
     body.validate().is_empty().then_some(body)
 }
 
@@ -630,7 +650,11 @@ pub fn elliptical_cylinder(
     {
         return None;
     }
-    let scale = x_radius.abs().max(y_radius.abs()).max(height.abs()).max(1.0);
+    let scale = x_radius
+        .abs()
+        .max(y_radius.abs())
+        .max(height.abs())
+        .max(1.0);
     if (x_radius - y_radius).abs() <= 1e-12 * scale {
         return cylinder(base, x_radius, height);
     }
@@ -755,10 +779,20 @@ pub fn frustum(
 
     if base_x_radius == base_y_radius {
         let section = Plane::from_axes(base, Vec3::X.to_array(), Vec3::Z.to_array());
-        let points = [[0.0, 0.0], [base_x_radius, 0.0], [top_radius, height], [0.0, height]];
-        let profile = (0..4).map(|index| Curve2::Line(Line2 {
-            start: points[index], end: points[(index + 1) % 4],
-        })).collect::<Vec<_>>();
+        let points = [
+            [0.0, 0.0],
+            [base_x_radius, 0.0],
+            [top_radius, height],
+            [0.0, height],
+        ];
+        let profile = (0..4)
+            .map(|index| {
+                Curve2::Line(Line2 {
+                    start: points[index],
+                    end: points[(index + 1) % 4],
+                })
+            })
+            .collect::<Vec<_>>();
         return super::sweep::revolve(section, &profile, base, Vec3::Z.to_array(), TAU);
     }
 
@@ -790,12 +824,7 @@ fn ellipse_profile(x_radius: f64, y_radius: f64) -> Vec<Curve2> {
         .collect()
 }
 
-fn elliptical_cone(
-    base: [f64; 3],
-    x_radius: f64,
-    y_radius: f64,
-    height: f64,
-) -> Option<Body> {
+fn elliptical_cone(base: [f64; 3], x_radius: f64, y_radius: f64, height: f64) -> Option<Body> {
     let base_plane = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
     let apex_point = (Vec3::from(base) + Vec3::Z * height).to_array();
     let rim_point = base_plane.point_at([x_radius, 0.0]);
@@ -953,11 +982,7 @@ pub fn torus(centre: [f64; 3], major_radius: f64, minor_radius: f64) -> Option<B
     body.validate().is_empty().then_some(body)
 }
 
-fn closed_hole_torus(
-    centre: [f64; 3],
-    major_radius: f64,
-    minor_radius: f64,
-) -> Option<Body> {
+fn closed_hole_torus(centre: [f64; 3], major_radius: f64, minor_radius: f64) -> Option<Body> {
     let profile_plane = Plane::orthonormal(centre, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0])?;
     let intersection_angle = (major_radius / minor_radius).clamp(0.0, 1.0).acos();
     let half_axis_length = (minor_radius * minor_radius - major_radius * major_radius)
@@ -1042,10 +1067,7 @@ pub fn pyramid_frustum(
             let angle = TAU * index as f64 / sides as f64;
             add_vertex(
                 &mut body,
-                ground.point_at([
-                    base_radius * angle.cos(),
-                    base_radius * angle.sin(),
-                ]),
+                ground.point_at([base_radius * angle.cos(), base_radius * angle.sin()]),
             )
         })
         .collect();
@@ -1067,11 +1089,7 @@ pub fn pyramid_frustum(
     // by the side standing on it.
     let ground_down = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, -1.0])?;
     let surface = body.surfaces.insert(Surface::Plane(ground_down));
-    let floor: Vec<(EdgeKey, bool)> = base_rim
-        .iter()
-        .rev()
-        .map(|edge| (*edge, false))
-        .collect();
+    let floor: Vec<(EdgeKey, bool)> = base_rim.iter().rev().map(|edge| (*edge, false)).collect();
     close_shell(&mut body, lump, shell, surface, true, &floor)?;
 
     if top_radius <= 1e-12 {
@@ -1113,13 +1131,8 @@ pub fn pyramid_frustum(
             let angle = TAU * index as f64 / sides as f64;
             add_vertex(
                 &mut body,
-                (top_center
-                    + Vec3::new(
-                        top_radius * angle.cos(),
-                        top_radius * angle.sin(),
-                        0.0,
-                    ))
-                .to_array(),
+                (top_center + Vec3::new(top_radius * angle.cos(), top_radius * angle.sin(), 0.0))
+                    .to_array(),
             )
         })
         .collect();
@@ -1136,11 +1149,7 @@ pub fn pyramid_frustum(
         .map(|index| add_line_edge(&mut body, base_corners[index], top_corners[index]))
         .collect::<Option<Vec<_>>>()?;
 
-    let top_plane = Plane::orthonormal(
-        top_center.to_array(),
-        [1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-    )?;
+    let top_plane = Plane::orthonormal(top_center.to_array(), [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
     let surface = body.surfaces.insert(Surface::Plane(top_plane));
     let ceiling: Vec<(EdgeKey, bool)> = top_rim.iter().map(|edge| (*edge, true)).collect();
     close_shell(&mut body, lump, shell, surface, true, &ceiling)?;
@@ -1305,9 +1314,18 @@ fn add_line_edge(body: &mut Body, from: VertexKey, to: VertexKey) -> Option<Edge
 /// runs along it or against it.
 fn find_edge(from: usize, to: usize) -> Option<(usize, bool)> {
     const EDGES: [(usize, usize); 12] = [
-        (0, 1), (2, 3), (4, 5), (6, 7),
-        (0, 2), (1, 3), (4, 6), (5, 7),
-        (0, 4), (1, 5), (2, 6), (3, 7),
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7),
+        (0, 2),
+        (1, 3),
+        (4, 6),
+        (5, 7),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
     ];
     EDGES.iter().enumerate().find_map(|(index, (a, b))| {
         if (*a, *b) == (from, to) {
@@ -1346,6 +1364,35 @@ mod tests {
 
     fn unit_box() -> Body {
         cuboid([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]).expect("a unit box")
+    }
+
+    #[test]
+    fn a_closed_faceted_mesh_becomes_a_valid_solid() {
+        let vertices = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let faces = vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3], vec![2, 0, 3]];
+
+        let body = faceted_solid(&vertices, &faces).expect("a tetrahedron");
+        assert_eq!(body.faces.len(), 4);
+        assert_eq!(body.euler_characteristic(), 2);
+        assert!(body.validate().is_empty());
+    }
+
+    #[test]
+    fn an_open_faceted_mesh_is_refused() {
+        let vertices = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let faces = vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3]];
+
+        assert!(faceted_solid(&vertices, &faces).is_none());
     }
 
     #[test]
@@ -1445,11 +1492,21 @@ mod tests {
         let points: HashSet<[u64; 3]> = body
             .vertices
             .iter()
-            .map(|(_, v)| [v.point[0].to_bits(), v.point[1].to_bits(), v.point[2].to_bits()])
+            .map(|(_, v)| {
+                [
+                    v.point[0].to_bits(),
+                    v.point[1].to_bits(),
+                    v.point[2].to_bits(),
+                ]
+            })
             .collect();
         assert_eq!(points.len(), 8, "no two corners coincide");
         for corner in [[10.0_f64, 20.0, 30.0], [11.0, 22.0, 33.0]] {
-            let bits = [corner[0].to_bits(), corner[1].to_bits(), corner[2].to_bits()];
+            let bits = [
+                corner[0].to_bits(),
+                corner[1].to_bits(),
+                corner[2].to_bits(),
+            ];
             assert!(points.contains(&bits), "{corner:?} missing");
         }
     }
@@ -1636,7 +1693,10 @@ mod tests {
         // small, and an inside-out one reads negative.
         let cases: [(Body, f64); 7] = [
             (cuboid([0.0; 3], [4.0; 3]).unwrap(), 64.0),
-            (wedge([0.0; 3], 4.0, 3.0, 5.0).unwrap(), 0.5 * 4.0 * 5.0 * 3.0),
+            (
+                wedge([0.0; 3], 4.0, 3.0, 5.0).unwrap(),
+                0.5 * 4.0 * 5.0 * 3.0,
+            ),
             (
                 cylinder([0.0; 3], 3.0, 6.0).unwrap(),
                 std::f64::consts::PI * 9.0 * 6.0,
@@ -1674,17 +1734,22 @@ mod tests {
         // convex enough that every normal must lead away from one point
         // inside: a face wound the wrong way lights the solid inside out.
         let solids = [
-            (cuboid([0.0; 3], [4.0; 3]).unwrap(), Vec3::new(2.0, 2.0, 2.0)),
-            (cylinder([0.0; 3], 3.0, 6.0).unwrap(), Vec3::new(0.0, 0.0, 3.0)),
+            (
+                cuboid([0.0; 3], [4.0; 3]).unwrap(),
+                Vec3::new(2.0, 2.0, 2.0),
+            ),
+            (
+                cylinder([0.0; 3], 3.0, 6.0).unwrap(),
+                Vec3::new(0.0, 0.0, 3.0),
+            ),
             (cone([0.0; 3], 5.0, 12.0).unwrap(), Vec3::new(0.0, 0.0, 1.0)),
-            (wedge([0.0; 3], 4.0, 3.0, 5.0).unwrap(), Vec3::new(1.0, 1.5, 1.0)),
+            (
+                wedge([0.0; 3], 4.0, 3.0, 5.0).unwrap(),
+                Vec3::new(1.0, 1.5, 1.0),
+            ),
         ];
         for (solid, inside) in solids {
-            let mesh = crate::brep::mesh::body(
-                &solid,
-                crate::tessellation::DEFAULT_ANGLE,
-                1e-9,
-            );
+            let mesh = crate::brep::mesh::body(&solid, crate::tessellation::DEFAULT_ANGLE, 1e-9);
             assert!(!mesh.is_empty(), "nothing meshed");
             for triangle in &mesh.triangles {
                 let corner = Vec3::from(mesh.positions[triangle[0]]);
@@ -1707,7 +1772,10 @@ mod tests {
             assert_eq!(solid.euler_characteristic(), 2, "{sides}");
             assert!(solid.validate().is_empty(), "{sides}");
         }
-        assert!(pyramid([0.0; 3], 4.0, 9.0, 2).is_none(), "a sliver is not a solid");
+        assert!(
+            pyramid([0.0; 3], 4.0, 9.0, 2).is_none(),
+            "a sliver is not a solid"
+        );
         assert!(pyramid([0.0; 3], 0.0, 9.0, 4).is_none());
         assert!(pyramid([0.0; 3], 4.0, -1.0, 4).is_none());
     }
@@ -1720,7 +1788,10 @@ mod tests {
         // A square inscribed in a circle of radius four has diagonal eight.
         let expected = (0.5 * 8.0 * 8.0) * 9.0 / 3.0;
         let volume = meshed_volume(&solid);
-        assert!((volume - expected).abs() < 1e-9 * expected, "{volume} vs {expected}");
+        assert!(
+            (volume - expected).abs() < 1e-9 * expected,
+            "{volume} vs {expected}"
+        );
     }
 
     #[test]
@@ -1735,7 +1806,10 @@ mod tests {
         let volume = meshed_volume(&solid);
         let expected = 4.0 / 3.0 * std::f64::consts::PI * 125.0;
         assert!(volume > 0.0, "wound inwards: {volume}");
-        assert!(volume < expected, "a tessellation cannot read over: {volume}");
+        assert!(
+            volume < expected,
+            "a tessellation cannot read over: {volume}"
+        );
         assert!(volume > 0.98 * expected, "{volume} vs {expected}");
     }
 
@@ -1776,7 +1850,9 @@ mod tests {
         body.faces.remove(victim);
         let flaws = body.validate();
         assert!(
-            flaws.iter().any(|flaw| matches!(flaw, Flaw::DanglingKey(_))),
+            flaws
+                .iter()
+                .any(|flaw| matches!(flaw, Flaw::DanglingKey(_))),
             "{flaws:?}"
         );
         assert_ne!(body.euler_characteristic(), 2);
@@ -1805,7 +1881,9 @@ mod tests {
         }
         let flaws = body.validate();
         assert!(
-            flaws.iter().any(|flaw| matches!(flaw, Flaw::SameSidedEdge(_))),
+            flaws
+                .iter()
+                .any(|flaw| matches!(flaw, Flaw::SameSidedEdge(_))),
             "{flaws:?}"
         );
     }
@@ -1840,6 +1918,4 @@ mod tests {
             .count();
         assert_eq!(dirty_faces, 3, "only the faces those bound");
     }
-
-
 }

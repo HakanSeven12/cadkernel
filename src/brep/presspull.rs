@@ -31,6 +31,17 @@ pub enum PresspullMode {
     Offset,
 }
 
+/// The positive-area and zero-area outcomes of a planar intersection.
+#[derive(Debug, Clone)]
+pub enum PlanarIntersection {
+    /// The inputs share a bounded area represented by this open sheet body.
+    Area(Body),
+    /// The inputs meet only along a boundary point or edge.
+    Touching,
+    /// The inputs have no point in common.
+    Disjoint,
+}
+
 /// Extracts every trimmed loop, retaining curved boundaries and holes.
 pub fn planar_face_profile(body: &Body, key: FaceKey) -> Option<PlanarFaceProfile> {
     let face = body.faces.get(key)?;
@@ -42,9 +53,15 @@ pub fn planar_face_profile(body: &Body, key: FaceKey) -> Option<PlanarFaceProfil
     let mut loops = Vec::new();
     for ring in &face.loops {
         let coedges = &body.loops.get(*ring)?.coedges;
-        let curves = coedges.iter().map(|key| {
-            parts.iter().find(|(candidate, _)| candidate == key).map(|(_, curve)| curve.clone())
-        }).collect::<Option<Vec<_>>>()?;
+        let curves = coedges
+            .iter()
+            .map(|key| {
+                parts
+                    .iter()
+                    .find(|(candidate, _)| candidate == key)
+                    .map(|(_, curve)| curve.clone())
+            })
+            .collect::<Option<Vec<_>>>()?;
         if curves.is_empty() {
             return None;
         }
@@ -64,22 +81,30 @@ pub fn planar_face_at_point(body: &Body, point: [f64; 3], tolerance: f64) -> Opt
     if !tolerance.is_finite() || tolerance < 0.0 || point.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    body.face_keys().filter_map(|key| {
-        let profile = planar_face_profile(body, key)?;
-        let distance = profile.plane.distance_to(point)?.abs();
-        if distance > tolerance {
-            return None;
-        }
-        let local = profile.plane.project(point)?;
-        let boundary = profile.loops.into_iter().flatten().collect::<Vec<_>>();
-        crate::geom2d::contains(&boundary, local, Tolerance::new(tolerance.max(1e-12)))
-            .then_some((key, distance))
-    }).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(key, _)| key)
+    body.face_keys()
+        .filter_map(|key| {
+            let profile = planar_face_profile(body, key)?;
+            let distance = profile.plane.distance_to(point)?.abs();
+            if distance > tolerance {
+                return None;
+            }
+            let local = profile.plane.project(point)?;
+            let boundary = profile.loops.into_iter().flatten().collect::<Vec<_>>();
+            crate::geom2d::contains(&boundary, local, Tolerance::new(tolerance.max(1e-12)))
+                .then_some((key, distance))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(key, _)| key)
 }
 
 /// Applies a signed edit along the selected face's outward normal.
 /// The original is never changed, including on unsupported geometry or collapse.
-pub fn presspull_face(body: &Body, key: FaceKey, distance: f64, mode: PresspullMode) -> Option<Body> {
+pub fn presspull_face(
+    body: &Body,
+    key: FaceKey,
+    distance: f64,
+    mode: PresspullMode,
+) -> Option<Body> {
     if !distance.is_finite() || distance.abs() <= f64::EPSILON {
         return None;
     }
@@ -111,15 +136,25 @@ pub fn presspull_region(body: &Body, region: &PlanarFaceProfile, distance: f64) 
     let local = super::transform(body, &Placement::at((-origin).to_array()))?;
     let mut plane = region.plane;
     plane.origin = [0.0; 3];
-    let loops = region.loops.iter().map(|ring| split_closed_curves(ring)).collect::<Vec<_>>();
+    let loops = region
+        .loops
+        .iter()
+        .map(|ring| split_closed_curves(ring))
+        .collect::<Vec<_>>();
     let tool = super::extrude_region(plane, &loops, (normal * distance).to_array())?;
     let tolerance = super::operation_tolerance(&[&local, &tool])
         .max(f64::EPSILON * origin.length().max(1.0) * 64.0);
-    let edited = super::combine(local, tool, if distance > 0.0 {
-        Operation::Union
-    } else {
-        Operation::Difference
-    }, tolerance).ok()?;
+    let edited = super::combine(
+        local,
+        tool,
+        if distance > 0.0 {
+            Operation::Union
+        } else {
+            Operation::Difference
+        },
+        tolerance,
+    )
+    .ok()?;
     if edited.roots.is_empty() || !edited.validate().is_empty() {
         return None;
     }
@@ -128,17 +163,29 @@ pub fn presspull_region(body: &Body, region: &PlanarFaceProfile, distance: f64) 
 
 /// Builds one bounded planar sheet face, including exact curved inner loops.
 pub fn planar_region(plane: Plane, loops: &[Vec<Curve>]) -> Option<Body> {
-    let loops = loops.iter().map(|ring| split_closed_curves(ring)).collect::<Vec<_>>();
+    let loops = loops
+        .iter()
+        .map(|ring| split_closed_curves(ring))
+        .collect::<Vec<_>>();
     let solid = super::extrude_region(plane, &loops, plane.normal()?)?;
     let face = solid.face_keys().find(|key| {
         planar_face_profile(&solid, *key).is_some_and(|profile| {
-            plane.distance_to(profile.plane.origin).is_some_and(|gap| gap.abs() < 1e-9)
+            plane
+                .distance_to(profile.plane.origin)
+                .is_some_and(|gap| gap.abs() < 1e-9)
                 && Vec3::from(profile.outward).dot(Vec3::from(plane.normal().unwrap())) < 0.0
         })
     })?;
     let mut result = Body::new();
-    let lump = result.lumps.insert(super::Lump { shells: Vec::new(), provenance: super::Provenance::Synthesized });
-    let shell = result.shells.insert(super::Shell { faces: Vec::new(), owner: lump, provenance: super::Provenance::Synthesized });
+    let lump = result.lumps.insert(super::Lump {
+        shells: Vec::new(),
+        provenance: super::Provenance::Synthesized,
+    });
+    let shell = result.shells.insert(super::Shell {
+        faces: Vec::new(),
+        owner: lump,
+        provenance: super::Provenance::Synthesized,
+    });
     result.lumps.get_mut(lump)?.shells.push(shell);
     result.roots.push(lump);
     super::boolean::copy_face(&mut result, &solid, face, shell, true).ok()?;
@@ -158,6 +205,116 @@ pub fn union_planar_regions(bodies: &[Body], tolerance: f64) -> Result<Body, sup
     planar_regions_boolean(bodies, &[], Operation::Union, tolerance)
 }
 
+/// Intersects coplanar bounded sheets while preserving exact curved boundaries.
+pub fn intersect_planar_regions(
+    bodies: &[Body],
+    tolerance: f64,
+) -> Result<PlanarIntersection, super::Snag> {
+    if bodies.len() < 2 || !tolerance.is_finite() || tolerance <= 0.0 {
+        return Err(super::Snag::CutRefused);
+    }
+
+    let profiles = bodies
+        .iter()
+        .map(|body| {
+            body.face_keys()
+                .map(|face| planar_face_profile(body, face).ok_or(super::Snag::NoClosedForm))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let base = profiles
+        .first()
+        .and_then(|group| group.first())
+        .ok_or(super::Snag::CutRefused)?
+        .plane;
+    let normal = Vec3::from(base.normal().ok_or(super::Snag::CutRefused)?);
+    let profiles = planar_intersection_profiles(&profiles, &base, normal, tolerance)?;
+
+    let mut solids = profiles
+        .iter()
+        .map(|group| planar_intersection_profile_solid(group, &base, normal, tolerance))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter();
+    let mut result = solids.next().ok_or(super::Snag::CutRefused)?;
+    for solid in solids {
+        result = super::combine(result, solid, Operation::Intersection, tolerance)?;
+        if result.faces.is_empty() {
+            return Ok(if planar_profiles_share_point(&profiles, tolerance) {
+                PlanarIntersection::Touching
+            } else {
+                PlanarIntersection::Disjoint
+            });
+        }
+    }
+
+    Ok(PlanarIntersection::Area(planar_bottom_sheets(
+        &result, &base, normal, tolerance,
+    )?))
+}
+
+fn planar_intersection_profiles(
+    profiles: &[Vec<PlanarFaceProfile>],
+    base: &Plane,
+    normal: Vec3,
+    tolerance: f64,
+) -> Result<Vec<Vec<Vec<Vec<Curve>>>>, super::Snag> {
+    profiles
+        .iter()
+        .map(|group| {
+            if group.is_empty() {
+                return Err(super::Snag::CutRefused);
+            }
+            group
+                .iter()
+                .map(|profile| {
+                    let profile_normal =
+                        Vec3::from(profile.plane.normal().ok_or(super::Snag::CutRefused)?);
+                    if normal.dot(profile_normal).abs() < 1.0 - 1e-9
+                        || base
+                            .distance_to(profile.plane.origin)
+                            .is_none_or(|distance| distance.abs() > tolerance)
+                    {
+                        return Err(super::Snag::NoClosedForm);
+                    }
+                    let transform =
+                        plane_transform(base, &profile.plane).ok_or(super::Snag::CutRefused)?;
+                    profile
+                        .loops
+                        .iter()
+                        .map(|ring| {
+                            ring.iter()
+                                .map(|curve| {
+                                    curve.transformed(&transform).ok_or(super::Snag::CutRefused)
+                                })
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect()
+}
+
+fn planar_intersection_profile_solid(
+    profiles: &[Vec<Vec<Curve>>],
+    base: &Plane,
+    normal: Vec3,
+    tolerance: f64,
+) -> Result<Body, super::Snag> {
+    let mut solids = profiles
+        .iter()
+        .map(|loops| {
+            super::extrude_region(*base, loops, normal.to_array()).ok_or(super::Snag::CutRefused)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter();
+    let mut result = solids.next().ok_or(super::Snag::CutRefused)?;
+    for solid in solids {
+        result = super::combine(result, solid, Operation::Union, tolerance)?;
+    }
+    Ok(result)
+}
+
 /// Subtracts coplanar bounded sheets while preserving exact curved boundaries.
 ///
 /// Every base sheet is united first, every cutter sheet is united second, and
@@ -169,11 +326,7 @@ pub fn subtract_planar_regions(
     cutters: &[Body],
     tolerance: f64,
 ) -> Result<Body, super::Snag> {
-    if bases.is_empty()
-        || cutters.is_empty()
-        || !tolerance.is_finite()
-        || tolerance <= 0.0
-    {
+    if bases.is_empty() || cutters.is_empty() || !tolerance.is_finite() || tolerance <= 0.0 {
         return Err(super::Snag::CutRefused);
     }
 
@@ -219,12 +372,7 @@ fn unite_planar_profile_solids(
 ) -> Result<Body, super::Snag> {
     let mut solids = Vec::with_capacity(profiles.len());
     for profile in profiles {
-        let profile_normal = Vec3::from(
-            profile
-                .plane
-                .normal()
-                .ok_or(super::Snag::CutRefused)?,
-        );
+        let profile_normal = Vec3::from(profile.plane.normal().ok_or(super::Snag::CutRefused)?);
         if normal.dot(profile_normal).abs() < 1.0 - 1e-9
             || base
                 .distance_to(profile.plane.origin)
@@ -255,6 +403,53 @@ fn unite_planar_profile_solids(
     Ok(united)
 }
 
+fn planar_profiles_share_point(profiles: &[Vec<Vec<Vec<Curve>>>], tolerance: f64) -> bool {
+    let tolerance = Tolerance::new(tolerance);
+    let boundary = |group: &Vec<Vec<Vec<Curve>>>| {
+        group
+            .iter()
+            .flat_map(|profile| profile.iter())
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let boundaries = profiles.iter().map(boundary).collect::<Vec<_>>();
+    let Some(first) = boundaries.first() else {
+        return false;
+    };
+    let mut candidates = Vec::new();
+    for curve in first {
+        candidates.push(curve.point_at(0.0));
+        candidates.push(curve.point_at(1.0));
+    }
+    for other in boundaries.iter().skip(1) {
+        for a in first {
+            for b in other {
+                candidates.extend(
+                    crate::geom2d::intersect(a, b, tolerance)
+                        .into_iter()
+                        .map(|crossing| crossing.point),
+                );
+                for point in [a.point_at(0.0), a.point_at(1.0)] {
+                    if crate::geom2d::distance_to(b, point) <= tolerance.linear() {
+                        candidates.push(point);
+                    }
+                }
+                for point in [b.point_at(0.0), b.point_at(1.0)] {
+                    if crate::geom2d::distance_to(a, point) <= tolerance.linear() {
+                        candidates.push(point);
+                    }
+                }
+            }
+        }
+    }
+    candidates.into_iter().any(|point| {
+        boundaries
+            .iter()
+            .all(|curves| crate::geom2d::contains(curves, point, tolerance))
+    })
+}
+
 fn planar_bottom_sheets(
     body: &Body,
     base: &Plane,
@@ -275,8 +470,7 @@ fn planar_bottom_sheets(
         return Err(super::Snag::CutRefused);
     }
 
-    let components = super::sweep::face_components(body, &bottom)
-        .ok_or(super::Snag::CutRefused)?;
+    let components = super::sweep::face_components(body, &bottom).ok_or(super::Snag::CutRefused)?;
     let mut result = Body::new();
     for component in components {
         let loops = component_boundary_loops(body, &component, base, tolerance)
@@ -413,9 +607,7 @@ fn reversed_curve(curve: &Curve) -> Option<Curve> {
 }
 
 fn closed_curve_order(curves: &[Curve], tolerance: f64) -> Option<Vec<(usize, bool)>> {
-    let near = |a: [f64; 2], b: [f64; 2]| {
-        (a[0] - b[0]).hypot(a[1] - b[1]) <= tolerance * 4.0
-    };
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= tolerance * 4.0;
     [true, false].into_iter().find_map(|first_forward| {
         let first = curves.first()?;
         let start = first.point_at(if first_forward { 0.0 } else { 1.0 });
@@ -446,23 +638,41 @@ fn closed_curve_order(curves: &[Curve], tolerance: f64) -> Option<Vec<(usize, bo
 
 /// Splits complete conics into exact bounded pieces for extrusion builders.
 pub fn extrusion_profile_pieces(ring: &[Curve]) -> Vec<Curve> {
-    ring.iter().flat_map(|curve| match curve {
-        Curve::Circle(circle) => (0..4).map(|i| Curve::Arc(Arc {
-            centre: circle.centre, radius: circle.radius,
-            start_angle: i as f64 * FRAC_PI_2, end_angle: (i + 1) as f64 * FRAC_PI_2,
-        })).collect(),
-        Curve::Arc(arc) if arc.sweep() >= TAU - 1e-12 => (0..4).map(|i| Curve::Arc(Arc {
-            centre: arc.centre, radius: arc.radius,
-            start_angle: arc.start_angle + i as f64 * FRAC_PI_2,
-            end_angle: arc.start_angle + (i + 1) as f64 * FRAC_PI_2,
-        })).collect(),
-        Curve::Ellipse(arc) if arc.sweep() >= TAU - 1e-12 => (0..4).map(|i| Curve::Ellipse(EllipseArc {
-            ellipse: arc.ellipse, start_parameter: arc.start_parameter + i as f64 * FRAC_PI_2,
-            end_parameter: arc.start_parameter + (i + 1) as f64 * FRAC_PI_2,
-        })).collect(),
-        Curve::Polyline(_) => curve.segments(),
-        _ => vec![curve.clone()],
-    }).collect()
+    ring.iter()
+        .flat_map(|curve| match curve {
+            Curve::Circle(circle) => (0..4)
+                .map(|i| {
+                    Curve::Arc(Arc {
+                        centre: circle.centre,
+                        radius: circle.radius,
+                        start_angle: i as f64 * FRAC_PI_2,
+                        end_angle: (i + 1) as f64 * FRAC_PI_2,
+                    })
+                })
+                .collect(),
+            Curve::Arc(arc) if arc.sweep() >= TAU - 1e-12 => (0..4)
+                .map(|i| {
+                    Curve::Arc(Arc {
+                        centre: arc.centre,
+                        radius: arc.radius,
+                        start_angle: arc.start_angle + i as f64 * FRAC_PI_2,
+                        end_angle: arc.start_angle + (i + 1) as f64 * FRAC_PI_2,
+                    })
+                })
+                .collect(),
+            Curve::Ellipse(arc) if arc.sweep() >= TAU - 1e-12 => (0..4)
+                .map(|i| {
+                    Curve::Ellipse(EllipseArc {
+                        ellipse: arc.ellipse,
+                        start_parameter: arc.start_parameter + i as f64 * FRAC_PI_2,
+                        end_parameter: arc.start_parameter + (i + 1) as f64 * FRAC_PI_2,
+                    })
+                })
+                .collect(),
+            Curve::Polyline(_) => curve.segments(),
+            _ => vec![curve.clone()],
+        })
+        .collect()
 }
 
 fn split_closed_curves(ring: &[Curve]) -> Vec<Curve> {
@@ -478,7 +688,9 @@ fn offset_local(body: &Body, key: FaceKey, distance: f64) -> Option<Body> {
     if distance.abs() <= tolerance {
         return None;
     }
-    let boundary: HashSet<EdgeKey> = body.face_coedges(key).into_iter()
+    let boundary: HashSet<EdgeKey> = body
+        .face_coedges(key)
+        .into_iter()
         .map(|coedge| body.coedges.get(coedge).map(|coedge| coedge.edge))
         .collect::<Option<HashSet<_>>>()?;
     let mut vertices = HashSet::new();
@@ -490,24 +702,48 @@ fn offset_local(body: &Body, key: FaceKey, distance: f64) -> Option<Body> {
     let mut moved = HashMap::new();
     for vertex in &vertices {
         let original = Vec3::from(body.vertices.get(*vertex)?.point);
-        let rails = body.edges.iter().filter(|(key, edge)| !boundary.contains(key)
-            && (edge.start == *vertex || edge.end == *vertex)).collect::<Vec<_>>();
+        let rails = body
+            .edges
+            .iter()
+            .filter(|(key, edge)| {
+                !boundary.contains(key) && (edge.start == *vertex || edge.end == *vertex)
+            })
+            .collect::<Vec<_>>();
         let mut candidates = Vec::new();
         for (_, edge) in rails {
             let curve = body.curves.get(edge.curve)?;
             let parameters = plane_curve_parameters(&plane, curve)?;
             let start = edge.start == *vertex;
-            let old = if start { edge.start_parameter } else { edge.end_parameter };
-            let other = if start { edge.end_parameter } else { edge.start_parameter };
-            let parameter = parameters.into_iter().filter(|t| {
-                t.is_finite() && if start { *t < other - tolerance } else { *t > other + tolerance }
-            }).min_by(|a, b| (a - old).abs().total_cmp(&(b - old).abs()))?;
+            let old = if start {
+                edge.start_parameter
+            } else {
+                edge.end_parameter
+            };
+            let other = if start {
+                edge.end_parameter
+            } else {
+                edge.start_parameter
+            };
+            let parameter = parameters
+                .into_iter()
+                .filter(|t| {
+                    t.is_finite()
+                        && if start {
+                            *t < other - tolerance
+                        } else {
+                            *t > other + tolerance
+                        }
+                })
+                .min_by(|a, b| (a - old).abs().total_cmp(&(b - old).abs()))?;
             candidates.push(Vec3::from(curve.point_at(parameter)));
         }
         // A closed circular seam sometimes has no rail. Its radial parameter
         // on the neighbouring analytic surface identifies the same seam.
         let point = if let Some(first) = candidates.first().copied() {
-            if candidates.iter().any(|other| first.distance(*other) > tolerance * 4.0) {
+            if candidates
+                .iter()
+                .any(|other| first.distance(*other) > tolerance * 4.0)
+            {
                 return None;
             }
             first
@@ -545,7 +781,12 @@ fn offset_local(body: &Body, key: FaceKey, distance: f64) -> Option<Body> {
         let start = result.vertices.get(edge.start)?.point;
         let end = result.vertices.get(edge.end)?.point;
         let curve = if boundary.contains(&edge_key) {
-            intersect_curve(&plane, adjacent_surface(body, edge, key)?, original_curve, tolerance)?
+            intersect_curve(
+                &plane,
+                adjacent_surface(body, edge, key)?,
+                original_curve,
+                tolerance,
+            )?
         } else {
             original_curve.clone()
         };
@@ -579,10 +820,12 @@ fn offset_local(body: &Body, key: FaceKey, distance: f64) -> Option<Body> {
             let edge = result.edges.get(result.coedges.get(coedge)?.edge)?;
             let curve = result.curves.get(edge.curve)?;
             for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
-                let point = curve.point_at(edge.start_parameter
-                    + fraction * (edge.end_parameter - edge.start_parameter));
+                let point = curve.point_at(
+                    edge.start_parameter + fraction * (edge.end_parameter - edge.start_parameter),
+                );
                 if !surface.distance_to(point).is_finite()
-                    || surface.distance_to(point).abs() > tolerance * 8.0 {
+                    || surface.distance_to(point).abs() > tolerance * 8.0
+                {
                     return None;
                 }
             }
@@ -592,7 +835,11 @@ fn offset_local(body: &Body, key: FaceKey, distance: f64) -> Option<Body> {
     (result.validate().is_empty() && result.worst_vertex_gap() <= tolerance * 4.0).then_some(result)
 }
 
-fn adjacent_surface<'a>(body: &'a Body, edge: &super::Edge, selected: FaceKey) -> Option<&'a Surface> {
+fn adjacent_surface<'a>(
+    body: &'a Body,
+    edge: &super::Edge,
+    selected: FaceKey,
+) -> Option<&'a Surface> {
     let other = edge.coedges.iter().find_map(|coedge| {
         let owner = body.loops.get(body.coedges.get(*coedge)?.owner)?.owner;
         (owner != selected).then_some(owner)
@@ -601,7 +848,9 @@ fn adjacent_surface<'a>(body: &'a Body, edge: &super::Edge, selected: FaceKey) -
 }
 
 fn intersect_curve(plane: &Plane, other: &Surface, old: &Curve3, tolerance: f64) -> Option<Curve3> {
-    let Meeting::Curves(curves) = super::intersect_surfaces(&Surface::Plane(*plane), other, tolerance) else {
+    let Meeting::Curves(curves) =
+        super::intersect_surfaces(&Surface::Plane(*plane), other, tolerance)
+    else {
         return None;
     };
     if curves.len() != 1 {
@@ -634,11 +883,22 @@ fn plane_curve_parameters(plane: &Plane, curve: &Curve3) -> Option<Vec<f64>> {
     match curve {
         Curve3::Line(line) => {
             let along = normal.dot(Vec3::from(line.direction));
-            if along.abs() <= 1e-12 * Vec3::from(line.direction).length() { return None; }
-            Some(vec![normal.dot(Vec3::from(plane.origin) - Vec3::from(line.origin)) / along])
+            if along.abs() <= 1e-12 * Vec3::from(line.direction).length() {
+                return None;
+            }
+            Some(vec![
+                normal.dot(Vec3::from(plane.origin) - Vec3::from(line.origin)) / along,
+            ])
         }
-        Curve3::Circle(circle) => trigonometric_parameters(plane, &circle.plane, circle.radius, circle.radius),
-        Curve3::Ellipse(ellipse) => trigonometric_parameters(plane, &ellipse.plane, ellipse.major_radius, ellipse.minor_radius),
+        Curve3::Circle(circle) => {
+            trigonometric_parameters(plane, &circle.plane, circle.radius, circle.radius)
+        }
+        Curve3::Ellipse(ellipse) => trigonometric_parameters(
+            plane,
+            &ellipse.plane,
+            ellipse.major_radius,
+            ellipse.minor_radius,
+        ),
         _ => None,
     }
 }
@@ -649,22 +909,44 @@ fn trigonometric_parameters(plane: &Plane, frame: &Plane, x: f64, y: f64) -> Opt
     let b = normal.dot(Vec3::from(frame.y_axis)) * y;
     let c = normal.dot(Vec3::from(plane.origin) - Vec3::from(frame.origin));
     let radius = a.hypot(b);
-    if radius <= 1e-12 || c.abs() > radius { return None; }
+    if radius <= 1e-12 || c.abs() > radius {
+        return None;
+    }
     let phase = b.atan2(a);
     let angle = (c / radius).clamp(-1.0, 1.0).acos();
-    Some((-2..=2).flat_map(|turn| [phase - angle + turn as f64 * TAU, phase + angle + turn as f64 * TAU]).collect())
+    Some(
+        (-2..=2)
+            .flat_map(|turn| {
+                [
+                    phase - angle + turn as f64 * TAU,
+                    phase + angle + turn as f64 * TAU,
+                ]
+            })
+            .collect(),
+    )
 }
 
-fn curve_span(curve: &Curve3, start: [f64; 3], end: [f64; 3], original: &super::Edge, tolerance: f64) -> Option<(f64, f64)> {
+fn curve_span(
+    curve: &Curve3,
+    start: [f64; 3],
+    end: [f64; 3],
+    original: &super::Edge,
+    tolerance: f64,
+) -> Option<(f64, f64)> {
     let from = curve.parameter_at(start);
     let mut to = curve.parameter_at(end);
     if matches!(curve, Curve3::Circle(_) | Curve3::Ellipse(_)) {
         to = from + (to - from).rem_euclid(TAU);
-        if original.start == original.end { to = from + TAU; }
+        if original.start == original.end {
+            to = from + TAU;
+        }
     }
-    if !from.is_finite() || !to.is_finite() || to <= from
+    if !from.is_finite()
+        || !to.is_finite()
+        || to <= from
         || Vec3::from(curve.point_at(from)).distance(Vec3::from(start)) > tolerance * 4.0
-        || Vec3::from(curve.point_at(to)).distance(Vec3::from(end)) > tolerance * 4.0 {
+        || Vec3::from(curve.point_at(to)).distance(Vec3::from(end)) > tolerance * 4.0
+    {
         return None;
     }
     Some((from, to))
@@ -672,4 +954,67 @@ fn curve_span(curve: &Curve3, start: [f64; 3], end: [f64; 3], original: &super::
 
 fn boundary_area(curves: &[Curve]) -> f64 {
     curves.iter().map(Curve::enclosed_area).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rectangle(min: [f64; 2], max: [f64; 2]) -> Body {
+        let plane =
+            Plane::orthonormal([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]).expect("an XY plane");
+        let corners = [
+            [min[0], min[1]],
+            [max[0], min[1]],
+            [max[0], max[1]],
+            [min[0], max[1]],
+        ];
+        let boundary = (0..corners.len())
+            .map(|index| {
+                Curve::Line(Line {
+                    start: corners[index],
+                    end: corners[(index + 1) % corners.len()],
+                })
+            })
+            .collect::<Vec<_>>();
+        planar_region(plane, &[boundary]).expect("a rectangular sheet")
+    }
+
+    #[test]
+    fn planar_booleans_return_valid_sheets() {
+        let left = rectangle([0.0, 0.0], [2.0, 2.0]);
+        let right = rectangle([1.0, 0.0], [3.0, 2.0]);
+
+        let united = union_planar_regions(&[left.clone(), right.clone()], 1e-9).unwrap();
+        assert_eq!(united.face_keys().count(), 1);
+        assert!(united.validate().is_empty());
+
+        let subtracted = subtract_planar_regions(&[left.clone()], &[right.clone()], 1e-9).unwrap();
+        assert_eq!(subtracted.face_keys().count(), 1);
+        assert!(subtracted.validate().is_empty());
+
+        let PlanarIntersection::Area(intersection) =
+            intersect_planar_regions(&[left, right], 1e-9).unwrap()
+        else {
+            panic!("overlapping sheets must have an area intersection");
+        };
+        assert_eq!(intersection.face_keys().count(), 1);
+        assert!(intersection.validate().is_empty());
+    }
+
+    #[test]
+    fn planar_intersection_distinguishes_contact_from_separation() {
+        let left = rectangle([0.0, 0.0], [1.0, 1.0]);
+        let touching = rectangle([1.0, 0.0], [2.0, 1.0]);
+        let separate = rectangle([2.0, 0.0], [3.0, 1.0]);
+
+        assert!(matches!(
+            intersect_planar_regions(&[left.clone(), touching], 1e-9).unwrap(),
+            PlanarIntersection::Touching
+        ));
+        assert!(matches!(
+            intersect_planar_regions(&[left, separate], 1e-9).unwrap(),
+            PlanarIntersection::Disjoint
+        ));
+    }
 }
