@@ -154,17 +154,76 @@ pub fn union_planar_regions(bodies: &[Body], tolerance: f64) -> Result<Body, sup
         return Err(super::Snag::CutRefused);
     }
 
+    planar_regions_boolean(bodies, &[], Operation::Union, tolerance)
+}
+
+/// Subtracts coplanar bounded sheets while preserving exact curved boundaries.
+///
+/// Every base sheet is united first, every cutter sheet is united second, and
+/// the two temporary solids are differenced. The surviving bottom caps are
+/// copied back into a bounded open sheet body. A fully consumed base is a
+/// successful empty body, not an operation failure.
+pub fn subtract_planar_regions(
+    bases: &[Body],
+    cutters: &[Body],
+    tolerance: f64,
+) -> Result<Body, super::Snag> {
+    if bases.is_empty()
+        || cutters.is_empty()
+        || !tolerance.is_finite()
+        || tolerance <= 0.0
+    {
+        return Err(super::Snag::CutRefused);
+    }
+
+    planar_regions_boolean(bases, cutters, Operation::Difference, tolerance)
+}
+
+fn planar_regions_boolean(
+    bases: &[Body],
+    cutters: &[Body],
+    operation: Operation,
+    tolerance: f64,
+) -> Result<Body, super::Snag> {
+    let bodies = bases.iter().chain(cutters);
+
     let profiles = bodies
-        .iter()
         .flat_map(|body| body.face_keys().map(move |face| (body, face)))
         .map(|(body, face)| planar_face_profile(body, face).ok_or(super::Snag::NoClosedForm))
         .collect::<Result<Vec<_>, _>>()?;
     let base = profiles.first().ok_or(super::Snag::CutRefused)?.plane;
     let normal = Vec3::from(base.normal().ok_or(super::Snag::CutRefused)?);
-    let mut solids = Vec::with_capacity(profiles.len());
+    let base_count = bases
+        .iter()
+        .map(|body| body.face_keys().count())
+        .sum::<usize>();
+    let (base_profiles, cutter_profiles) = profiles.split_at(base_count);
+    let mut result = unite_planar_profile_solids(base_profiles, &base, normal, tolerance)?;
+    if operation == Operation::Difference {
+        let cutters = unite_planar_profile_solids(cutter_profiles, &base, normal, tolerance)?;
+        result = super::combine(result, cutters, Operation::Difference, tolerance)?;
+    }
+    if result.faces.is_empty() {
+        return Ok(Body::new());
+    }
 
+    planar_bottom_sheets(&result, &base, normal, tolerance)
+}
+
+fn unite_planar_profile_solids(
+    profiles: &[PlanarFaceProfile],
+    base: &Plane,
+    normal: Vec3,
+    tolerance: f64,
+) -> Result<Body, super::Snag> {
+    let mut solids = Vec::with_capacity(profiles.len());
     for profile in profiles {
-        let profile_normal = Vec3::from(profile.plane.normal().ok_or(super::Snag::CutRefused)?);
+        let profile_normal = Vec3::from(
+            profile
+                .plane
+                .normal()
+                .ok_or(super::Snag::CutRefused)?,
+        );
         if normal.dot(profile_normal).abs() < 1.0 - 1e-9
             || base
                 .distance_to(profile.plane.origin)
@@ -172,8 +231,7 @@ pub fn union_planar_regions(bodies: &[Body], tolerance: f64) -> Result<Body, sup
         {
             return Err(super::Snag::NoClosedForm);
         }
-        let transform =
-            plane_transform(&base, &profile.plane).ok_or(super::Snag::CutRefused)?;
+        let transform = plane_transform(base, &profile.plane).ok_or(super::Snag::CutRefused)?;
         let loops = profile
             .loops
             .iter()
@@ -184,21 +242,28 @@ pub fn union_planar_regions(bodies: &[Body], tolerance: f64) -> Result<Body, sup
             })
             .collect::<Result<Vec<_>, _>>()?;
         solids.push(
-            super::extrude_region(base, &loops, normal.to_array())
+            super::extrude_region(*base, &loops, normal.to_array())
                 .ok_or(super::Snag::CutRefused)?,
         );
     }
-
     let mut solids = solids.into_iter();
     let mut united = solids.next().ok_or(super::Snag::CutRefused)?;
     for solid in solids {
         united = super::combine(united, solid, Operation::Union, tolerance)?;
     }
+    Ok(united)
+}
 
-    let bottom = united
+fn planar_bottom_sheets(
+    body: &Body,
+    base: &Plane,
+    normal: Vec3,
+    tolerance: f64,
+) -> Result<Body, super::Snag> {
+    let bottom = body
         .face_keys()
         .filter(|face| {
-            planar_face_profile(&united, *face).is_some_and(|profile| {
+            planar_face_profile(body, *face).is_some_and(|profile| {
                 base.distance_to(profile.plane.origin)
                     .is_some_and(|distance| distance.abs() <= tolerance * 4.0)
                     && Vec3::from(profile.outward).dot(normal) < -1.0 + 1e-9
@@ -209,13 +274,13 @@ pub fn union_planar_regions(bodies: &[Body], tolerance: f64) -> Result<Body, sup
         return Err(super::Snag::CutRefused);
     }
 
-    let components = super::sweep::face_components(&united, &bottom)
+    let components = super::sweep::face_components(body, &bottom)
         .ok_or(super::Snag::CutRefused)?;
     let mut result = Body::new();
     for component in components {
-        let loops = component_boundary_loops(&united, &component, &base, tolerance)
+        let loops = component_boundary_loops(body, &component, base, tolerance)
             .ok_or(super::Snag::CutRefused)?;
-        let sheet = planar_region(base, &loops).ok_or(super::Snag::CutRefused)?;
+        let sheet = planar_region(*base, &loops).ok_or(super::Snag::CutRefused)?;
         let lump = result.lumps.insert(super::Lump {
             shells: Vec::new(),
             provenance: super::Provenance::Synthesized,

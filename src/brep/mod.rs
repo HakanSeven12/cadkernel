@@ -54,7 +54,8 @@ pub use boolean::{combine, Operation};
 pub use blend::{chamfer, fillet, presspull};
 pub use presspull::{
     extrusion_profile_pieces, planar_face_at_point, planar_face_profile, planar_region, presspull_face,
-    presspull_region, union_planar_regions, PlanarFaceProfile, PresspullMode,
+    presspull_region, subtract_planar_regions, union_planar_regions, PlanarFaceProfile,
+    PresspullMode,
 };
 pub use classify::{contains_point, Containment};
 pub use mesh::{body as mesh_body, Mesh};
