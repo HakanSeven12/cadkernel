@@ -56,6 +56,15 @@ impl RationalCurve2 {
         }
     }
 
+    pub fn curve(&self) -> Option<NurbsCurve> {
+        NurbsCurve::new_strict(
+            self.degree,
+            self.points.clone(),
+            self.knots.clone(),
+            self.weights.clone(),
+        )
+    }
+
     pub fn unit_arc(sweep: f64) -> Option<Self> {
         conic(
             Ellipse {

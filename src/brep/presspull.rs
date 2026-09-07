@@ -5,8 +5,11 @@
 //! operation reconstructs a solid from an intersection of half-spaces: doing
 //! that changes concave solids, holes, and unrelated lumps into another shape.
 
+use super::nurbs_builder::RationalCurve2;
 use super::{Body, Curve3, EdgeKey, FaceKey, Meeting, Operation, Placement, Surface};
-use crate::geom2d::{Arc, Curve, EllipseArc, Tolerance};
+use crate::geom2d::{
+    Arc, Curve, EllipseArc, Line, Polyline, PolylineVertex, Tolerance, Transform,
+};
 use crate::space::{Plane, Vec3};
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::{FRAC_PI_2, TAU};
@@ -28,6 +31,17 @@ pub enum PresspullMode {
     Extrude,
     /// Extend or trim the neighbouring surfaces to the moved face plane.
     Offset,
+}
+
+/// The positive-area and zero-area outcomes of a planar intersection.
+#[derive(Debug, Clone)]
+pub enum PlanarIntersection {
+    /// The inputs share a bounded area represented by this open sheet body.
+    Area(Body),
+    /// The inputs meet only along a boundary point or edge.
+    Touching,
+    /// The inputs have no point in common.
+    Disjoint,
 }
 
 /// Extracts every trimmed loop, retaining curved boundaries and holes.
@@ -142,6 +156,367 @@ pub fn planar_region(plane: Plane, loops: &[Vec<Curve>]) -> Option<Body> {
     result.roots.push(lump);
     super::boolean::copy_face(&mut result, &solid, face, shell, true).ok()?;
     result.validate().is_empty().then_some(result)
+}
+
+/// Intersects coplanar bounded sheets while preserving exact curved boundaries.
+///
+/// Each sheet is lifted into an equal-depth temporary solid. Multi-face input
+/// bodies are united first, then the input bodies are intersected in order.
+/// The surviving bottom caps are copied back into one open sheet body. A
+/// zero-area result distinguishes boundary contact from complete separation.
+pub fn intersect_planar_regions(
+    bodies: &[Body],
+    tolerance: f64,
+) -> Result<PlanarIntersection, super::Snag> {
+    if bodies.len() < 2 || !tolerance.is_finite() || tolerance <= 0.0 {
+        return Err(super::Snag::CutRefused);
+    }
+
+    let profiles = bodies
+        .iter()
+        .map(|body| {
+            body.face_keys()
+                .map(|face| planar_face_profile(body, face).ok_or(super::Snag::NoClosedForm))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let base = profiles
+        .first()
+        .and_then(|group| group.first())
+        .ok_or(super::Snag::CutRefused)?
+        .plane;
+    let normal = Vec3::from(base.normal().ok_or(super::Snag::CutRefused)?);
+    let profiles = planar_intersection_profiles(&profiles, &base, normal, tolerance)?;
+
+    let mut solids = profiles
+        .iter()
+        .map(|group| planar_intersection_profile_solid(group, &base, normal, tolerance))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter();
+    let mut result = solids.next().ok_or(super::Snag::CutRefused)?;
+    for solid in solids {
+        result = super::combine(result, solid, Operation::Intersection, tolerance)?;
+        if result.faces.is_empty() {
+            return Ok(if planar_profiles_share_point(&profiles, tolerance) {
+                PlanarIntersection::Touching
+            } else {
+                PlanarIntersection::Disjoint
+            });
+        }
+    }
+
+    let sheet = planar_intersection_bottom_sheets(&result, &base, normal, tolerance)?;
+    Ok(PlanarIntersection::Area(sheet))
+}
+
+fn planar_intersection_profiles(
+    profiles: &[Vec<PlanarFaceProfile>],
+    base: &Plane,
+    normal: Vec3,
+    tolerance: f64,
+) -> Result<Vec<Vec<Vec<Vec<Curve>>>>, super::Snag> {
+    profiles
+        .iter()
+        .map(|group| {
+            if group.is_empty() {
+                return Err(super::Snag::CutRefused);
+            }
+            group
+                .iter()
+                .map(|profile| {
+                    let profile_normal = Vec3::from(
+                        profile
+                            .plane
+                            .normal()
+                            .ok_or(super::Snag::CutRefused)?,
+                    );
+                    if normal.dot(profile_normal).abs() < 1.0 - 1e-9
+                        || base
+                            .distance_to(profile.plane.origin)
+                            .is_none_or(|distance| distance.abs() > tolerance)
+                    {
+                        return Err(super::Snag::NoClosedForm);
+                    }
+                    let transform = planar_intersection_plane_transform(base, &profile.plane)
+                        .ok_or(super::Snag::CutRefused)?;
+                    profile
+                        .loops
+                        .iter()
+                        .map(|ring| {
+                            ring.iter()
+                                .map(|curve| {
+                                    curve
+                                        .transformed(&transform)
+                                        .ok_or(super::Snag::CutRefused)
+                                })
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect()
+}
+
+fn planar_intersection_profile_solid(
+    profiles: &[Vec<Vec<Curve>>],
+    base: &Plane,
+    normal: Vec3,
+    tolerance: f64,
+) -> Result<Body, super::Snag> {
+    let mut solids = profiles
+        .iter()
+        .map(|loops| {
+            super::extrude_region(*base, loops, normal.to_array())
+                .ok_or(super::Snag::CutRefused)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter();
+    let mut result = solids.next().ok_or(super::Snag::CutRefused)?;
+    for solid in solids {
+        result = super::combine(result, solid, Operation::Union, tolerance)?;
+    }
+    Ok(result)
+}
+
+fn planar_profiles_share_point(profiles: &[Vec<Vec<Vec<Curve>>>], tolerance: f64) -> bool {
+    let tolerance = Tolerance::new(tolerance);
+    let boundary = |group: &Vec<Vec<Vec<Curve>>>| {
+        group
+            .iter()
+            .flat_map(|profile| profile.iter())
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let boundaries = profiles.iter().map(boundary).collect::<Vec<_>>();
+    let Some(first) = boundaries.first() else {
+        return false;
+    };
+    let mut candidates = Vec::new();
+    for curve in first {
+        candidates.push(curve.point_at(0.0));
+        candidates.push(curve.point_at(1.0));
+    }
+    for other in boundaries.iter().skip(1) {
+        for a in first {
+            for b in other {
+                candidates.extend(
+                    crate::geom2d::intersect(a, b, tolerance)
+                        .into_iter()
+                        .map(|crossing| crossing.point),
+                );
+                for point in [a.point_at(0.0), a.point_at(1.0)] {
+                    if crate::geom2d::distance_to(b, point) <= tolerance.linear() {
+                        candidates.push(point);
+                    }
+                }
+                for point in [b.point_at(0.0), b.point_at(1.0)] {
+                    if crate::geom2d::distance_to(a, point) <= tolerance.linear() {
+                        candidates.push(point);
+                    }
+                }
+            }
+        }
+    }
+    candidates.into_iter().any(|point| {
+        boundaries
+            .iter()
+            .all(|curves| crate::geom2d::contains(curves, point, tolerance))
+    })
+}
+
+fn planar_intersection_bottom_sheets(
+    body: &Body,
+    base: &Plane,
+    normal: Vec3,
+    tolerance: f64,
+) -> Result<Body, super::Snag> {
+    let bottom = body
+        .face_keys()
+        .filter(|face| {
+            planar_face_profile(body, *face).is_some_and(|profile| {
+                base.distance_to(profile.plane.origin)
+                    .is_some_and(|distance| distance.abs() <= tolerance * 4.0)
+                    && Vec3::from(profile.outward).dot(normal) < -1.0 + 1e-9
+            })
+        })
+        .collect::<Vec<_>>();
+    if bottom.is_empty() {
+        return Err(super::Snag::CutRefused);
+    }
+
+    let components = super::sweep::face_components(body, &bottom)
+        .ok_or(super::Snag::CutRefused)?;
+    let mut result = Body::new();
+    for component in components {
+        let loops = planar_intersection_component_loops(body, &component, base, tolerance)
+            .ok_or(super::Snag::CutRefused)?;
+        let sheet = planar_region(*base, &loops).ok_or(super::Snag::CutRefused)?;
+        let lump = result.lumps.insert(super::Lump {
+            shells: Vec::new(),
+            provenance: super::Provenance::Synthesized,
+        });
+        let shell = result.shells.insert(super::Shell {
+            faces: Vec::new(),
+            owner: lump,
+            provenance: super::Provenance::Synthesized,
+        });
+        result
+            .lumps
+            .get_mut(lump)
+            .ok_or(super::Snag::CutRefused)?
+            .shells
+            .push(shell);
+        result.roots.push(lump);
+        for face in sheet.face_keys() {
+            super::boolean::copy_face(&mut result, &sheet, face, shell, false)?;
+        }
+    }
+    if result.validate().is_empty() {
+        Ok(result)
+    } else {
+        Err(super::Snag::CutRefused)
+    }
+}
+
+fn planar_intersection_plane_transform(base: &Plane, source: &Plane) -> Option<Transform> {
+    Some(Transform {
+        origin: base.project(source.origin)?.into(),
+        x_axis: base.project_vector(source.x_axis)?.into(),
+        y_axis: base.project_vector(source.y_axis)?.into(),
+    })
+}
+
+fn planar_intersection_component_loops(
+    body: &Body,
+    faces: &[FaceKey],
+    base: &Plane,
+    tolerance: f64,
+) -> Option<Vec<Vec<Curve>>> {
+    let face_set = faces.iter().copied().collect::<HashSet<_>>();
+    let mut pending = Vec::new();
+    for face in faces {
+        let node = body.faces.get(*face)?;
+        let Surface::Plane(plane) = body.surfaces.get(node.surface)? else {
+            return None;
+        };
+        let transform = planar_intersection_plane_transform(base, plane)?;
+        for (coedge, curve) in super::pcurve::face_boundary_parts(body, *face, tolerance)? {
+            let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
+            let internal = edge.coedges.iter().any(|candidate| {
+                if *candidate == coedge {
+                    return false;
+                }
+                body.coedges
+                    .get(*candidate)
+                    .and_then(|node| body.loops.get(node.owner))
+                    .is_some_and(|ring| face_set.contains(&ring.owner))
+            });
+            if !internal {
+                pending.push(curve.transformed(&transform)?);
+            }
+        }
+    }
+
+    let mut loops = Vec::new();
+    while !pending.is_empty() {
+        let order = planar_intersection_closed_curve_order(&pending, tolerance)?;
+        let ring = order
+            .iter()
+            .map(|(index, forward)| {
+                if *forward {
+                    Some(pending[*index].clone())
+                } else {
+                    planar_intersection_reversed_curve(&pending[*index])
+                }
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut remove = order
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        remove.sort_unstable();
+        for index in remove.into_iter().rev() {
+            pending.remove(index);
+        }
+        loops.push(ring);
+    }
+    loops.sort_by(|a, b| boundary_area(b).abs().total_cmp(&boundary_area(a).abs()));
+    Some(loops)
+}
+
+fn planar_intersection_reversed_curve(curve: &Curve) -> Option<Curve> {
+    match curve {
+        Curve::Line(line) => Some(Curve::Line(Line {
+            start: line.end,
+            end: line.start,
+        })),
+        Curve::Polyline(polyline) => {
+            let count = polyline.vertices.len();
+            let vertices = (0..count)
+                .rev()
+                .map(|index| {
+                    let bulge = if index > 0 {
+                        -polyline.vertices[index - 1].bulge
+                    } else if polyline.closed && count > 0 {
+                        -polyline.vertices[count - 1].bulge
+                    } else {
+                        0.0
+                    };
+                    PolylineVertex {
+                        position: polyline.vertices[index].position,
+                        bulge,
+                    }
+                })
+                .collect();
+            Some(Curve::Polyline(Polyline {
+                vertices,
+                closed: polyline.closed,
+            }))
+        }
+        Curve::Nurbs(curve) => Some(Curve::Nurbs(curve.reversed())),
+        Curve::Circle(circle) => Some(Curve::Circle(*circle)),
+        Curve::Arc(_) | Curve::Ellipse(_) => Some(Curve::Nurbs(
+            RationalCurve2::from_curve(curve)?.reversed().curve()?,
+        )),
+        Curve::Ray(_) | Curve::XLine(_) => None,
+    }
+}
+
+fn planar_intersection_closed_curve_order(
+    curves: &[Curve],
+    tolerance: f64,
+) -> Option<Vec<(usize, bool)>> {
+    let near = |a: [f64; 2], b: [f64; 2]| {
+        (a[0] - b[0]).hypot(a[1] - b[1]) <= tolerance * 4.0
+    };
+    [true, false].into_iter().find_map(|first_forward| {
+        let first = curves.first()?;
+        let start = first.point_at(if first_forward { 0.0 } else { 1.0 });
+        let mut head = first.point_at(if first_forward { 1.0 } else { 0.0 });
+        let mut used = vec![false; curves.len()];
+        used[0] = true;
+        let mut order = vec![(0, first_forward)];
+        while !near(head, start) {
+            let (next, forward) = curves.iter().enumerate().find_map(|(index, curve)| {
+                if used[index] {
+                    return None;
+                }
+                if near(head, curve.point_at(0.0)) {
+                    Some((index, true))
+                } else if near(head, curve.point_at(1.0)) {
+                    Some((index, false))
+                } else {
+                    None
+                }
+            })?;
+            used[next] = true;
+            order.push((next, forward));
+            head = curves[next].point_at(if forward { 1.0 } else { 0.0 });
+        }
+        Some(order)
+    })
 }
 
 /// Splits complete conics into exact bounded pieces for extrusion builders.
