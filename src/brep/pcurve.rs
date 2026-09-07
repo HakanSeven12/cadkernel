@@ -907,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sphere_is_not_claimed_to_be_understood() {
+    fn a_spheres_equator_becomes_a_straight_band() {
         let surface = Surface::Sphere(Sphere {
             frame: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
             radius: 5.0,
@@ -916,7 +916,13 @@ mod tests {
             plane: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
             radius: 5.0,
         });
-        assert!(project(&surface, &equator, TOL).is_none());
+        let flat = project(&surface, &equator, TOL).expect("the equator on its own sphere");
+        let Curve::Line(line) = &flat else {
+            panic!("expected a line in (u, v), got {flat:?}");
+        };
+        assert!(line.start[1].abs() < 1e-12, "the latitude is zero");
+        assert!((line.end[0] - TAU).abs() < 1e-12, "one full longitude turn");
+        assert_round_trips(&surface, &equator, &flat, (0.0, 1.0));
     }
 
     #[test]
