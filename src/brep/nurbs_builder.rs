@@ -1,6 +1,6 @@
 use crate::geom2d::{Curve, Ellipse, NurbsCurve};
 use crate::space::{NurbsCurve3, NurbsSurface3, Plane, Vec3};
-use std::f64::consts::FRAC_PI_2;
+use std::f64::consts::{FRAC_PI_2, TAU};
 
 #[derive(Clone)]
 pub(crate) struct RationalCurve2 {
@@ -27,6 +27,16 @@ impl RationalCurve2 {
                 points: vec![line.start, line.end],
                 weights: vec![1.0; 2],
             }),
+            Curve::Circle(circle) => conic(
+                Ellipse {
+                    centre: circle.centre,
+                    major_radius: circle.radius,
+                    minor_radius: circle.radius,
+                    major_axis: [1.0, 0.0],
+                },
+                0.0,
+                TAU,
+            ),
             Curve::Arc(arc) => conic(
                 Ellipse {
                     centre: arc.centre,
@@ -54,6 +64,15 @@ impl RationalCurve2 {
             points: self.points.iter().rev().copied().collect(),
             weights: self.weights.iter().rev().copied().collect(),
         }
+    }
+
+    pub fn curve(&self) -> Option<NurbsCurve> {
+        NurbsCurve::new_strict(
+            self.degree,
+            self.points.clone(),
+            self.knots.clone(),
+            self.weights.clone(),
+        )
     }
 
     pub fn unit_arc(sweep: f64) -> Option<Self> {

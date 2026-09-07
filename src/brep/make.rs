@@ -19,6 +19,7 @@ use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use super::Provenance;
 use crate::geom2d::{Arc, Curve as Curve2, Ellipse, EllipseArc, Line as Line2};
 use crate::space::{Plane, Vec3};
+use std::collections::{HashMap, VecDeque};
 
 /// A rectangular box with one corner at `origin` and the opposite at
 /// `origin + size`.
@@ -152,6 +153,248 @@ pub fn cuboid(origin: [f64; 3], size: [f64; 3]) -> Option<Body> {
     body.lumps.get_mut(lump)?.shells = vec![shell];
     body.roots = vec![lump];
     Some(body)
+}
+
+/// Builds a closed planar-faced solid from an indexed polygon mesh.
+///
+/// Face winding is made consistent across every connected component and then
+/// oriented to the kernel's inward-loop convention. Every undirected edge
+/// must be shared by exactly two faces; open and non-manifold meshes are
+/// rejected without producing a partial body.
+pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body> {
+    if vertices.len() < 4
+        || faces.len() < 4
+        || vertices.iter().flatten().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let mut faces = faces
+        .iter()
+        .map(|source| {
+            let mut face = Vec::with_capacity(source.len());
+            for &index in source {
+                if index >= vertices.len() {
+                    return None;
+                }
+                if face.last().copied() != Some(index) {
+                    face.push(index);
+                }
+            }
+            if face.first() == face.last() {
+                face.pop();
+            }
+            (face.len() >= 3).then_some(face)
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    type EdgeUse = (usize, bool);
+    let edge_uses = |rings: &[Vec<usize>]| -> Option<HashMap<(usize, usize), Vec<EdgeUse>>> {
+        let mut uses = HashMap::<(usize, usize), Vec<EdgeUse>>::new();
+        for (face, ring) in rings.iter().enumerate() {
+            for corner in 0..ring.len() {
+                let from = ring[corner];
+                let to = ring[(corner + 1) % ring.len()];
+                if from == to {
+                    return None;
+                }
+                let key = if from < to { (from, to) } else { (to, from) };
+                uses.entry(key).or_default().push((face, from < to));
+            }
+        }
+        uses.values().all(|entries| entries.len() == 2).then_some(uses)
+    };
+
+    let uses = edge_uses(&faces)?;
+    let mut flips = vec![None; faces.len()];
+    let mut components = Vec::<Vec<usize>>::new();
+    for start in 0..faces.len() {
+        if flips[start].is_some() {
+            continue;
+        }
+        flips[start] = Some(false);
+        let mut queue = VecDeque::from([start]);
+        let mut component = Vec::new();
+        while let Some(face) = queue.pop_front() {
+            component.push(face);
+            let flip = flips[face]?;
+            let ring = &faces[face];
+            for corner in 0..ring.len() {
+                let from = ring[corner];
+                let to = ring[(corner + 1) % ring.len()];
+                let key = if from < to { (from, to) } else { (to, from) };
+                let forward = from < to;
+                for &(other, other_forward) in uses.get(&key)? {
+                    if other == face {
+                        continue;
+                    }
+                    let required = flip ^ (forward == other_forward);
+                    match flips[other] {
+                        Some(existing) if existing != required => return None,
+                        Some(_) => {}
+                        None => {
+                            flips[other] = Some(required);
+                            queue.push_back(other);
+                        }
+                    }
+                }
+            }
+        }
+        components.push(component);
+    }
+    // A disconnected or nested shell needs explicit lump/cavity containment.
+    // Until that topology is represented, accept only one closed shell so a
+    // cavity can never be silently converted into filled material.
+    if components.len() != 1 {
+        return None;
+    }
+    for (face, flip) in faces.iter_mut().zip(flips) {
+        if flip? {
+            face.reverse();
+        }
+    }
+
+    for component in &components {
+        let pivot = Vec3::from(vertices[faces[*component.first()?][0]]);
+        let scale = component
+            .iter()
+            .flat_map(|&face| faces[face].iter().copied())
+            .map(|vertex| (Vec3::from(vertices[vertex]) - pivot).length())
+            .fold(0.0_f64, f64::max)
+            .max(1e-12);
+        let signed_volume = component
+            .iter()
+            .map(|&face| {
+                let ring = &faces[face];
+                let origin = Vec3::from(vertices[ring[0]]) - pivot;
+                (1..ring.len() - 1)
+                    .map(|corner| {
+                        origin.dot(
+                            (Vec3::from(vertices[ring[corner]]) - pivot)
+                                .cross(Vec3::from(vertices[ring[corner + 1]]) - pivot),
+                        ) / 6.0
+                    })
+                    .sum::<f64>()
+            })
+            .sum::<f64>();
+        if !signed_volume.is_finite() || signed_volume.abs() <= scale.powi(3) * 1e-12 {
+            return None;
+        }
+        if signed_volume > 0.0 {
+            for &face in component {
+                faces[face].reverse();
+            }
+        }
+    }
+
+    let uses = edge_uses(&faces)?;
+    if uses
+        .values()
+        .any(|entries| entries[0].1 == entries[1].1)
+    {
+        return None;
+    }
+
+    let mut body = Body::new();
+    let vertex_keys = vertices
+        .iter()
+        .map(|&point| {
+            body.vertices.insert(Vertex {
+                point,
+                provenance: Provenance::Synthesized,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut edge_keys = HashMap::new();
+    for &(from, to) in uses.keys() {
+        let curve = body.curves.insert(Curve3::Line(Line3 {
+            origin: vertices[from],
+            direction: (Vec3::from(vertices[to]) - Vec3::from(vertices[from])).to_array(),
+        }));
+        let edge = body.edges.insert(Edge {
+            curve,
+            start_parameter: 0.0,
+            end_parameter: 1.0,
+            start: vertex_keys[from],
+            end: vertex_keys[to],
+            coedges: Vec::new(),
+            provenance: Provenance::Synthesized,
+        });
+        edge_keys.insert((from, to), edge);
+    }
+
+    for component in components {
+        let lump = body.lumps.insert(Lump {
+            shells: Vec::new(),
+            provenance: Provenance::Synthesized,
+        });
+        let shell = body.shells.insert(Shell {
+            faces: Vec::new(),
+            owner: lump,
+            provenance: Provenance::Synthesized,
+        });
+        for face_index in component {
+            let ring = &faces[face_index];
+            let points = ring.iter().map(|&index| vertices[index]).collect::<Vec<_>>();
+            let standard_normal = crate::space::polygon::normal(&points)?;
+            let origin = Vec3::from(points[0]);
+            let along = points[1..]
+                .iter()
+                .map(|point| Vec3::from(*point) - origin)
+                .find(|vector| vector.length() > 1e-12)?;
+            let plane = Plane::orthonormal(
+                points[0],
+                along.to_array(),
+                (-Vec3::from(standard_normal)).to_array(),
+            )?;
+            if points
+                .iter()
+                .any(|point| plane.distance_to(*point).is_none_or(|gap| gap.abs() > 1e-8))
+            {
+                return None;
+            }
+            let surface = body.surfaces.insert(Surface::Plane(plane));
+            let face = body.faces.insert(Face {
+                surface,
+                forward: true,
+                loops: Vec::new(),
+                owner: shell,
+                provenance: Provenance::Synthesized,
+            });
+            let boundary = body.loops.insert(Loop {
+                coedges: Vec::new(),
+                owner: face,
+                provenance: Provenance::Synthesized,
+            });
+            let mut coedges = Vec::with_capacity(ring.len());
+            for corner in 0..ring.len() {
+                let from = ring[corner];
+                let to = ring[(corner + 1) % ring.len()];
+                let (key, forward) = if from < to {
+                    ((from, to), true)
+                } else {
+                    ((to, from), false)
+                };
+                let edge = *edge_keys.get(&key)?;
+                let coedge = body.coedges.insert(Coedge {
+                    edge,
+                    forward,
+                    pcurve: None,
+                    owner: boundary,
+                    provenance: Provenance::Synthesized,
+                });
+                body.edges.get_mut(edge)?.coedges.push(coedge);
+                coedges.push(coedge);
+            }
+            body.loops.get_mut(boundary)?.coedges = coedges;
+            body.faces.get_mut(face)?.loops = vec![boundary];
+            body.shells.get_mut(shell)?.faces.push(face);
+        }
+        body.lumps.get_mut(lump)?.shells = vec![shell];
+        body.roots.push(lump);
+    }
+
+    body.validate().is_empty().then_some(body)
 }
 
 /// A right circular cylinder standing on `base`, `height` tall.
