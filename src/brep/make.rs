@@ -249,22 +249,29 @@ pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body
     }
 
     for component in &components {
+        let pivot = Vec3::from(vertices[faces[*component.first()?][0]]);
+        let scale = component
+            .iter()
+            .flat_map(|&face| faces[face].iter().copied())
+            .map(|vertex| (Vec3::from(vertices[vertex]) - pivot).length())
+            .fold(0.0_f64, f64::max)
+            .max(1e-12);
         let signed_volume = component
             .iter()
             .map(|&face| {
                 let ring = &faces[face];
-                let origin = Vec3::from(vertices[ring[0]]);
+                let origin = Vec3::from(vertices[ring[0]]) - pivot;
                 (1..ring.len() - 1)
                     .map(|corner| {
                         origin.dot(
-                            Vec3::from(vertices[ring[corner]])
-                                .cross(Vec3::from(vertices[ring[corner + 1]])),
+                            (Vec3::from(vertices[ring[corner]]) - pivot)
+                                .cross(Vec3::from(vertices[ring[corner + 1]]) - pivot),
                         ) / 6.0
                     })
                     .sum::<f64>()
             })
             .sum::<f64>();
-        if !signed_volume.is_finite() || signed_volume.abs() <= 1e-15 {
+        if !signed_volume.is_finite() || signed_volume.abs() <= scale.powi(3) * 1e-12 {
             return None;
         }
         if signed_volume > 0.0 {
