@@ -347,3 +347,41 @@ fn half_boxes(
         super::transform(&positive, &placement).ok_or(Snag::CutRefused)?,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brep::{body_bounds, make::cuboid};
+
+    #[test]
+    fn a_plane_splits_a_box_into_two_valid_solids() {
+        let body = cuboid([0.0; 3], [4.0, 2.0, 2.0]).unwrap();
+        let plane = Plane::orthonormal(
+            [1.5, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        )
+        .unwrap();
+
+        let sliced = slice_by_plane(&body, plane).unwrap().unwrap();
+        assert!(sliced.negative.validate().is_empty());
+        assert!(sliced.positive.validate().is_empty());
+        let negative = body_bounds(&sliced.negative).unwrap();
+        let positive = body_bounds(&sliced.positive).unwrap();
+        assert!((negative.max[0] - 1.5).abs() < 1e-8, "{negative:?}");
+        assert!((positive.min[0] - 1.5).abs() < 1e-8, "{positive:?}");
+    }
+
+    #[test]
+    fn a_tangent_plane_does_not_split_a_box() {
+        let body = cuboid([0.0; 3], [4.0, 2.0, 2.0]).unwrap();
+        let plane = Plane::orthonormal(
+            [4.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        )
+        .unwrap();
+
+        assert!(slice_by_plane(&body, plane).unwrap().is_none());
+    }
+}

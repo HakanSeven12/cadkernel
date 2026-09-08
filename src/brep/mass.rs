@@ -217,3 +217,36 @@ fn assemble(
         radii_of_gyration,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brep::make;
+
+    #[test]
+    fn a_translated_sphere_has_exact_mass_properties() {
+        let body = make::sphere([2.0, -3.0, 5.0], 2.0).unwrap();
+        let properties = analytic_mass_properties(&body).unwrap();
+
+        assert!((properties.volume - 32.0 * PI / 3.0).abs() < 1e-10);
+        assert_eq!(properties.centroid, [2.0, -3.0, 5.0]);
+        let central = 2.0 * properties.volume * 4.0 / 5.0;
+        assert!(properties
+            .principal_moments
+            .iter()
+            .all(|moment| (*moment - central).abs() < 1e-10));
+    }
+
+    #[test]
+    fn a_cylinder_has_exact_volume_centroid_and_principal_moments() {
+        let body = make::cylinder([1.0, 2.0, 3.0], 2.0, 6.0).unwrap();
+        let properties = analytic_mass_properties(&body).unwrap();
+
+        let volume = 24.0 * PI;
+        assert!((properties.volume - volume).abs() < 1e-10);
+        assert_eq!(properties.centroid, [1.0, 2.0, 6.0]);
+        assert!((properties.principal_moments[0] - 4.0 * volume).abs() < 1e-10);
+        assert!((properties.principal_moments[1] - 4.0 * volume).abs() < 1e-10);
+        assert!((properties.principal_moments[2] - 2.0 * volume).abs() < 1e-10);
+    }
+}

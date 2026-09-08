@@ -1544,3 +1544,39 @@ fn remove_collinear(indices: &mut Vec<usize>, points: &[Vec3], tolerance: f64) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brep::make::cuboid;
+
+    fn opposite_edges_on_one_face(body: &Body) -> (FaceKey, [EdgeKey; 2]) {
+        let face = body.face_keys().next().unwrap();
+        let edges = body
+            .face_coedges(face)
+            .into_iter()
+            .map(|coedge| body.coedges.get(coedge).unwrap().edge)
+            .collect::<Vec<_>>();
+        (face, [edges[0], edges[2]])
+    }
+
+    #[test]
+    fn opposite_box_edges_are_filleted_atomically() {
+        let body = cuboid([0.0; 3], [8.0, 6.0, 4.0]).unwrap();
+        let (_, edges) = opposite_edges_on_one_face(&body);
+        let result = fillet_edges(&body, &edges, 0.5).unwrap();
+
+        assert!(result.validate().is_empty());
+        assert!(result.faces.len() > body.faces.len());
+    }
+
+    #[test]
+    fn opposite_box_edges_are_chamfered_atomically() {
+        let body = cuboid([0.0; 3], [8.0, 6.0, 4.0]).unwrap();
+        let (face, edges) = opposite_edges_on_one_face(&body);
+        let result = chamfer_edges(&body, &edges, face, 0.5, 0.75).unwrap();
+
+        assert!(result.validate().is_empty());
+        assert!(result.faces.len() > body.faces.len());
+    }
+}
