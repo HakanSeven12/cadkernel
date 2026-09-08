@@ -478,8 +478,11 @@ fn corner_blends(
             let normal = sum.normalize().ok_or(unsupported)?;
             let origin = centre + normals[0] * radius;
             if normal.dot(point - origin) <= tolerance { return Err(unsupported); }
-            let frame = Plane::orthonormal(centre.to_array(), normals[0].to_array(),
-                normal.to_array()).ok_or(unsupported)?;
+            // Keep both parameter poles and the longitude seam outside the
+            // trimmed patch so downstream meshing has a regular UV domain.
+            let pole = (normals[0] - normals[1]).normalize().ok_or(unsupported)?;
+            let frame = Plane::orthonormal(centre.to_array(), normal.to_array(),
+                pole.to_array()).ok_or(unsupported)?;
             corners.push((Halfspace { origin, normal, offset: normal.dot(origin), added: true },
                 Sphere { frame, radius }));
         }
