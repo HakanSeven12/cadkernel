@@ -114,7 +114,8 @@ pub(super) fn fillet_prismatic(
             for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
                 let point = curve.point_at(edge.start_parameter
                     + fraction * (edge.end_parameter - edge.start_parameter));
-                if surface.distance_to(point).abs() > tolerance { return None; }
+                let distance = surface.distance_to(point);
+                if !distance.is_finite() || distance.abs() > tolerance { return None; }
             }
         }
     }
