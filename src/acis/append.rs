@@ -410,7 +410,7 @@ fn add_pcurve(
     curve: &Curve2,
     support_surface: i32,
 ) -> Option<i32> {
-    let (degree, knots, controls, weights, rational, closed, range) = match curve {
+    let (degree, knots, controls, weights, rational, closed) = match curve {
         Curve2::Line(line) => (
             1,
             vec![0.0, 0.0, 1.0, 1.0],
@@ -418,7 +418,6 @@ fn add_pcurve(
             vec![1.0, 1.0],
             false,
             false,
-            (0.0, 1.0),
         ),
         Curve2::Nurbs(curve) => (
             curve.degree(),
@@ -427,7 +426,6 @@ fn add_pcurve(
             curve.weights().to_vec(),
             curve.is_rational(),
             curve.point_at_knot(curve.domain().0) == curve.point_at_knot(curve.domain().1),
-            curve.domain(),
         ),
         _ => return None,
     };
@@ -440,7 +438,9 @@ fn add_pcurve(
         rational.then_some(weights.as_slice()),
         0.0,
         support_surface,
-        range,
+        // The spline knots carry the parameter interval. These are UV
+        // translations on the support surface, not edge-domain endpoints.
+        (0.0, 0.0),
     ))
 }
 
