@@ -1505,7 +1505,9 @@ pub fn rebuild_history(
                     .ok_or(HistoryRebuildError::InvalidParameters)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        body = brep::fillet_edges(&body, &selected, radius)?;
+        let filleted = brep::fillet_edges(&body, &selected, radius)?;
+        body = brep::transform(&filleted, &placement(value.base.transform)?)
+            .ok_or(HistoryRebuildError::InvalidTransform)?;
     }
     Ok(body)
 }
