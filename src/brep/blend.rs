@@ -1,11 +1,13 @@
 //! Constant edge chamfers and fillets on convex planar solids.
 
+use super::bounds::operation_tolerance;
 use super::geometry::{Circle3, Curve3, Cylinder, Line3, Surface};
 use super::topology::{Body, Coedge, Edge, EdgeKey, Face, FaceKey, Loop, Lump, Shell, Vertex};
 use super::Provenance;
 use crate::space::{Plane, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::{PI, TAU};
+use std::fmt;
 
 #[derive(Clone, Copy)]
 struct Halfspace {
@@ -32,6 +34,94 @@ struct ExistingFillet {
     forward: bool,
 }
 
+/// Why one or more selected edges could not be filleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilletError {
+    /// No edges were selected.
+    EmptySelection,
+    /// Radius was zero, negative, NaN or infinite.
+    InvalidRadius,
+    /// At least one selected key does not name an edge in this body.
+    UnknownEdge,
+    /// The input body's ownership or adjacency is inconsistent.
+    InvalidBodyTopology,
+    /// This operation currently accepts one lump, one shell and no face holes.
+    UnsupportedBodyTopology,
+    /// A selected edge is not straight.
+    UnsupportedEdgeCurve(EdgeKey),
+    /// A selected edge is not shared by exactly two faces.
+    NonManifoldEdge(EdgeKey),
+    /// A selected edge is not bounded by two planar faces.
+    UnsupportedAdjacentSurface(EdgeKey),
+    /// An edge or one of its adjacent surface frames is degenerate.
+    DegenerateGeometry(EdgeKey),
+    /// Adjacent selected edges need a corner-blend solver.
+    AdjacentSelections(EdgeKey, EdgeKey),
+    /// The body contains a surface this convex planar operation cannot preserve.
+    UnsupportedBodySurface,
+    /// The planar body is not the intersection of its face halfspaces.
+    NonConvexBody,
+    /// A previously created fillet does not have the supported cylindrical form.
+    UnsupportedExistingFillet,
+    /// Radius removes the body or makes selected blend regions meet.
+    RadiusTooLargeOrInteracting,
+    /// An end of the selected edge needs a non-circular cylinder section.
+    UnsupportedEndCondition(EdgeKey),
+    /// Constructed topology or edge geometry did not validate.
+    InvalidResult,
+}
+
+impl fmt::Display for FilletError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySelection => formatter.write_str("no edges were selected"),
+            Self::InvalidRadius => formatter.write_str("fillet radius must be finite and positive"),
+            Self::UnknownEdge => formatter.write_str("a selected edge does not belong to the body"),
+            Self::InvalidBodyTopology => formatter.write_str("the input body has invalid topology"),
+            Self::UnsupportedBodyTopology => formatter.write_str(
+                "filleting currently requires one lump, one shell and faces without holes",
+            ),
+            Self::UnsupportedEdgeCurve(edge) => {
+                write!(formatter, "selected edge {edge:?} is not straight")
+            }
+            Self::NonManifoldEdge(edge) => write!(
+                formatter,
+                "selected edge {edge:?} is not shared by exactly two faces"
+            ),
+            Self::UnsupportedAdjacentSurface(edge) => write!(
+                formatter,
+                "selected edge {edge:?} is not bounded by two planar faces"
+            ),
+            Self::DegenerateGeometry(edge) => {
+                write!(formatter, "selected edge {edge:?} has degenerate geometry")
+            }
+            Self::AdjacentSelections(first, second) => write!(
+                formatter,
+                "selected edges {first:?} and {second:?} meet; corner blends are unsupported"
+            ),
+            Self::UnsupportedBodySurface => formatter.write_str(
+                "the body contains a surface this convex planar fillet cannot preserve",
+            ),
+            Self::NonConvexBody => {
+                formatter.write_str("the body is not a convex intersection of planar halfspaces")
+            }
+            Self::UnsupportedExistingFillet => formatter.write_str(
+                "an existing cylindrical face is not a supported constant edge fillet",
+            ),
+            Self::RadiusTooLargeOrInteracting => formatter.write_str(
+                "the radius removes the body or makes selected fillet regions interact",
+            ),
+            Self::UnsupportedEndCondition(edge) => write!(
+                formatter,
+                "selected edge {edge:?} needs an unsupported fillet end condition"
+            ),
+            Self::InvalidResult => formatter.write_str("the filleted body did not validate"),
+        }
+    }
+}
+
+impl std::error::Error for FilletError {}
+
 /// Cuts a symmetric chamfer at one straight edge.
 pub fn chamfer(body: &Body, edge: EdgeKey, distance: f64) -> Option<Body> {
     if !distance.is_finite() || distance <= 0.0 {
@@ -39,48 +129,119 @@ pub fn chamfer(body: &Body, edge: EdgeKey, distance: f64) -> Option<Body> {
     }
     let existing = existing_fillets(body)?;
     let frame = edge_frame(body, edge)?;
-    let (_, mut result, _) = cut(&frame, distance)?;
-    restore_fillets(&mut result, &existing)?;
+    let tolerance = operation_tolerance(&[body]);
+    let (_, mut result, _) = cut(&frame, distance, tolerance)?;
+    restore_fillets(&mut result, &existing, tolerance)?;
     Some(result)
 }
 
 /// Rounds one straight edge with a constant-radius cylindrical face.
 pub fn fillet(body: &Body, edge: EdgeKey, radius: f64) -> Option<Body> {
-    if !radius.is_finite() || radius <= 0.0 {
-        return None;
-    }
-    let existing = existing_fillets(body)?;
-    let frame = edge_frame(body, edge)?;
-    let normals_angle = frame
-        .first_normal
-        .dot(frame.second_normal)
-        .clamp(-1.0, 1.0)
-        .acos();
-    let interior = PI - normals_angle;
-    let setback = radius / (interior * 0.5).tan();
-    let (cut_plane, mut result, cut_face) = cut(&frame, setback)?;
+    fillet_edges(body, &[edge], radius).ok()
+}
 
-    let tangent = frame.point + frame.first_inward * setback;
-    let centre = tangent - frame.first_normal * radius;
-    let cylinder_plane = Plane::orthonormal(
-        centre.to_array(),
-        frame.first_normal.to_array(),
-        frame.axis.to_array(),
-    )?;
-    let cylinder = Cylinder {
-        base: cylinder_plane,
-        radius,
-    };
-    restore_fillets(&mut result, &existing)?;
-    if round_face(&mut result, cut_face, &cylinder, true)? != 2
-        || cut_plane.normal.dot(frame.first_normal + frame.second_normal) <= 0.0
-    {
-        return None;
+/// Rounds several independent straight edges in one atomic operation.
+///
+/// Selection order and duplicate keys do not affect the result. Edges sharing
+/// a vertex are refused because joining their cylindrical faces needs a corner
+/// blend surface; returning an error is safer than emitting intersecting faces.
+pub fn fillet_edges(
+    body: &Body,
+    selected: &[EdgeKey],
+    radius: f64,
+) -> Result<Body, FilletError> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err(FilletError::InvalidRadius);
     }
-    if !result.validate().is_empty() || result.worst_vertex_gap() > tolerance_body(&result) {
-        return None;
+    if selected.is_empty() {
+        return Err(FilletError::EmptySelection);
     }
-    Some(result)
+    if !body.validate().is_empty() {
+        return Err(FilletError::InvalidBodyTopology);
+    }
+    if selected.iter().any(|edge| !body.edges.contains(*edge)) {
+        return Err(FilletError::UnknownEdge);
+    }
+
+    let mut selected = selected.to_vec();
+    selected.sort_by_key(EdgeKey::slot);
+    selected.dedup();
+    reject_adjacent_selections(body, &selected)?;
+
+    let tolerance = operation_tolerance(&[body]);
+    let existing = existing_fillets(body).ok_or(FilletError::UnsupportedExistingFillet)?;
+    validate_supported_body(body, &existing, tolerance)?;
+
+    let mut frames = Vec::with_capacity(selected.len());
+    for edge in &selected {
+        validate_selected_edge(body, *edge)?;
+        let frame = edge_frame(body, *edge).ok_or(FilletError::DegenerateGeometry(*edge))?;
+        frames.push((*edge, frame));
+    }
+    reject_interacting_regions(body, &selected, radius, tolerance)?;
+
+    let mut halfspaces = frames[0].1.halfspaces.clone();
+    let mut blends = Vec::with_capacity(frames.len());
+    for (edge, frame) in &frames {
+        let (cut, cylinder) = fillet_geometry(frame, radius, tolerance)
+            .ok_or(FilletError::DegenerateGeometry(*edge))?;
+        halfspaces.push(cut);
+        blends.push((*edge, cut, cylinder));
+    }
+    let (mut result, _) = convex_body(&halfspaces, tolerance)
+        .ok_or(FilletError::RadiusTooLargeOrInteracting)?;
+
+    let mut occupied = HashSet::new();
+    let mut existing_faces = Vec::with_capacity(existing.len());
+    for old in &existing {
+        let face = face_on(&result, old.cut, tolerance)
+            .ok_or(FilletError::RadiusTooLargeOrInteracting)?;
+        if !occupied.insert(face)
+            || existing_faces
+                .iter()
+                .any(|existing| faces_touch(&result, *existing, face))
+        {
+            return Err(FilletError::RadiusTooLargeOrInteracting);
+        }
+        existing_faces.push(face);
+    }
+    let mut targets = Vec::with_capacity(blends.len());
+    for (edge, cut, cylinder) in blends {
+        let face = face_on(&result, cut, tolerance)
+            .ok_or(FilletError::RadiusTooLargeOrInteracting)?;
+        if !occupied.insert(face) {
+            return Err(FilletError::RadiusTooLargeOrInteracting);
+        }
+        if existing_faces
+            .iter()
+            .any(|existing| faces_touch(&result, *existing, face))
+        {
+            return Err(FilletError::RadiusTooLargeOrInteracting);
+        }
+        targets.push((edge, face, cylinder));
+    }
+    for first in 0..targets.len() {
+        for second in first + 1..targets.len() {
+            if faces_touch(&result, targets[first].1, targets[second].1) {
+                return Err(FilletError::RadiusTooLargeOrInteracting);
+            }
+        }
+    }
+
+    restore_fillets(&mut result, &existing, tolerance)
+        .ok_or(FilletError::UnsupportedExistingFillet)?;
+    for (edge, face, cylinder) in targets {
+        if round_face(&mut result, face, &cylinder, true, tolerance)
+            .filter(|rounded| *rounded == 2)
+            .is_none()
+        {
+            return Err(FilletError::UnsupportedEndCondition(edge));
+        }
+    }
+    if !result.validate().is_empty() || result.worst_vertex_gap() > tolerance {
+        return Err(FilletError::InvalidResult);
+    }
+    Ok(result)
 }
 
 /// Moves a planar face while extending or trimming its neighbouring surfaces.
@@ -98,7 +259,19 @@ fn circle_parameters(plane: &Plane, start: Vec3, end: Vec3) -> Option<(f64, f64)
     (span > 1e-12).then_some((start, start + span))
 }
 
-fn cut(frame: &EdgeFrame, setback: f64) -> Option<(Halfspace, Body, FaceKey)> {
+fn cut(
+    frame: &EdgeFrame,
+    setback: f64,
+    tolerance: f64,
+) -> Option<(Halfspace, Body, FaceKey)> {
+    let added = cut_halfspace(frame, setback, tolerance)?;
+    let mut halfspaces = frame.halfspaces.clone();
+    halfspaces.push(added);
+    let (result, face) = convex_body(&halfspaces, tolerance)?;
+    Some((added, result, face))
+}
+
+fn cut_halfspace(frame: &EdgeFrame, setback: f64, tolerance: f64) -> Option<Halfspace> {
     if !setback.is_finite() || setback <= 0.0 {
         return None;
     }
@@ -112,13 +285,36 @@ fn cut(frame: &EdgeFrame, setback: f64) -> Option<(Halfspace, Body, FaceKey)> {
         offset,
         added: true,
     };
-    if normal.dot(frame.point) <= offset + tolerance(&[frame.point, first, second]) {
+    if normal.dot(frame.point) <= offset + tolerance {
         return None;
     }
-    let mut halfspaces = frame.halfspaces.clone();
-    halfspaces.push(added);
-    let (result, face) = convex_body(&halfspaces)?;
-    Some((added, result, face))
+    Some(added)
+}
+
+fn fillet_geometry(
+    frame: &EdgeFrame,
+    radius: f64,
+    tolerance: f64,
+) -> Option<(Halfspace, Cylinder)> {
+    let normals_angle = frame
+        .first_normal
+        .dot(frame.second_normal)
+        .clamp(-1.0, 1.0)
+        .acos();
+    let interior = PI - normals_angle;
+    let setback = radius / (interior * 0.5).tan();
+    let cut = cut_halfspace(frame, setback, tolerance)?;
+    if cut.normal.dot(frame.first_normal + frame.second_normal) <= 0.0 {
+        return None;
+    }
+    let tangent = frame.point + frame.first_inward * setback;
+    let centre = tangent - frame.first_normal * radius;
+    let base = Plane::orthonormal(
+        centre.to_array(),
+        frame.first_normal.to_array(),
+        frame.axis.to_array(),
+    )?;
+    Some((cut, Cylinder { base, radius }))
 }
 
 fn edge_frame(body: &Body, edge_key: EdgeKey) -> Option<EdgeFrame> {
@@ -181,6 +377,187 @@ fn edge_frame(body: &Body, edge_key: EdgeKey) -> Option<EdgeFrame> {
     })
 }
 
+fn validate_selected_edge(body: &Body, edge_key: EdgeKey) -> Result<(), FilletError> {
+    let edge = body.edges.get(edge_key).ok_or(FilletError::UnknownEdge)?;
+    if !matches!(body.curves.get(edge.curve), Some(Curve3::Line(_))) {
+        return Err(FilletError::UnsupportedEdgeCurve(edge_key));
+    }
+    if edge.coedges.len() != 2 {
+        return Err(FilletError::NonManifoldEdge(edge_key));
+    }
+    let start = body
+        .vertices
+        .get(edge.start)
+        .ok_or(FilletError::InvalidBodyTopology)?;
+    let end = body
+        .vertices
+        .get(edge.end)
+        .ok_or(FilletError::InvalidBodyTopology)?;
+    if (Vec3::from(end.point) - Vec3::from(start.point))
+        .normalize()
+        .is_none()
+    {
+        return Err(FilletError::DegenerateGeometry(edge_key));
+    }
+    for coedge in &edge.coedges {
+        let coedge = body
+            .coedges
+            .get(*coedge)
+            .ok_or(FilletError::InvalidBodyTopology)?;
+        let ring = body
+            .loops
+            .get(coedge.owner)
+            .ok_or(FilletError::InvalidBodyTopology)?;
+        let face = body
+            .faces
+            .get(ring.owner)
+            .ok_or(FilletError::InvalidBodyTopology)?;
+        let Some(Surface::Plane(plane)) = body.surfaces.get(face.surface) else {
+            return Err(FilletError::UnsupportedAdjacentSurface(edge_key));
+        };
+        if plane.normal().is_none() {
+            return Err(FilletError::DegenerateGeometry(edge_key));
+        }
+    }
+    Ok(())
+}
+
+fn reject_adjacent_selections(body: &Body, selected: &[EdgeKey]) -> Result<(), FilletError> {
+    let mut owner = HashMap::new();
+    for edge_key in selected {
+        let edge = body.edges.get(*edge_key).ok_or(FilletError::UnknownEdge)?;
+        for vertex in [edge.start, edge.end] {
+            if let Some(first) = owner.insert(vertex, *edge_key) {
+                return Err(FilletError::AdjacentSelections(first, *edge_key));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_interacting_regions(
+    body: &Body,
+    selected: &[EdgeKey],
+    radius: f64,
+    tolerance: f64,
+) -> Result<(), FilletError> {
+    let segments = selected
+        .iter()
+        .map(|edge_key| {
+            let edge = body.edges.get(*edge_key).ok_or(FilletError::UnknownEdge)?;
+            let start = body
+                .vertices
+                .get(edge.start)
+                .ok_or(FilletError::InvalidBodyTopology)?;
+            let end = body
+                .vertices
+                .get(edge.end)
+                .ok_or(FilletError::InvalidBodyTopology)?;
+            Ok((Vec3::from(start.point), Vec3::from(end.point)))
+        })
+        .collect::<Result<Vec<_>, FilletError>>()?;
+    for first in 0..segments.len() {
+        for second in first + 1..segments.len() {
+            if segment_distance(segments[first], segments[second])
+                <= radius * 2.0 + tolerance
+            {
+                return Err(FilletError::RadiusTooLargeOrInteracting);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn segment_distance(first: (Vec3, Vec3), second: (Vec3, Vec3)) -> f64 {
+    let first_direction = first.1 - first.0;
+    let second_direction = second.1 - second.0;
+    let offset = first.0 - second.0;
+    let first_length = first_direction.dot(first_direction);
+    let second_length = second_direction.dot(second_direction);
+    let cross = first_direction.dot(second_direction);
+    let first_offset = first_direction.dot(offset);
+    let second_offset = second_direction.dot(offset);
+    let denominator = first_length * second_length - cross * cross;
+    let mut first_parameter;
+    let mut second_parameter;
+    if denominator > f64::EPSILON * first_length.max(second_length).max(1.0) {
+        first_parameter = (cross * second_offset - second_length * first_offset) / denominator;
+        first_parameter = first_parameter.clamp(0.0, 1.0);
+    } else {
+        first_parameter = 0.0;
+    }
+    second_parameter = (cross * first_parameter + second_offset) / second_length;
+    if second_parameter < 0.0 {
+        second_parameter = 0.0;
+        first_parameter = (-first_offset / first_length).clamp(0.0, 1.0);
+    } else if second_parameter > 1.0 {
+        second_parameter = 1.0;
+        first_parameter = ((cross - first_offset) / first_length).clamp(0.0, 1.0);
+    }
+    (offset + first_direction * first_parameter - second_direction * second_parameter).length()
+}
+
+fn validate_supported_body(
+    body: &Body,
+    existing: &[ExistingFillet],
+    tolerance: f64,
+) -> Result<(), FilletError> {
+    if body.roots.len() != 1 {
+        return Err(FilletError::UnsupportedBodyTopology);
+    }
+    let lump = body
+        .lumps
+        .get(body.roots[0])
+        .ok_or(FilletError::InvalidBodyTopology)?;
+    if lump.shells.len() != 1 {
+        return Err(FilletError::UnsupportedBodyTopology);
+    }
+    let shell = body
+        .shells
+        .get(lump.shells[0])
+        .ok_or(FilletError::InvalidBodyTopology)?;
+    if shell.faces.len() != body.faces.len()
+        || body.faces.iter().any(|(_, face)| face.loops.len() != 1)
+    {
+        return Err(FilletError::UnsupportedBodyTopology);
+    }
+    let cylinders = body
+        .faces
+        .iter()
+        .filter(|(_, face)| {
+            matches!(body.surfaces.get(face.surface), Some(Surface::Cylinder(_)))
+        })
+        .count();
+    if cylinders != existing.len() {
+        return Err(FilletError::UnsupportedExistingFillet);
+    }
+    if body.faces.iter().any(|(_, face)| {
+        !matches!(
+            body.surfaces.get(face.surface),
+            Some(Surface::Plane(_) | Surface::Cylinder(_))
+        )
+    }) {
+        return Err(FilletError::UnsupportedBodySurface);
+    }
+
+    for (_, face) in body.faces.iter() {
+        let Some(Surface::Plane(plane)) = body.surfaces.get(face.surface) else {
+            continue;
+        };
+        let Some(normal) = plane.normal().map(Vec3::from) else {
+            return Err(FilletError::UnsupportedBodySurface);
+        };
+        let normal = if face.forward { normal } else { -normal };
+        let offset = normal.dot(Vec3::from(plane.origin));
+        if body.vertices.iter().any(|(_, vertex)| {
+            normal.dot(Vec3::from(vertex.point)) > offset + tolerance
+        }) {
+            return Err(FilletError::NonConvexBody);
+        }
+    }
+    Ok(())
+}
+
 fn existing_fillets(body: &Body) -> Option<Vec<ExistingFillet>> {
     let mut found = Vec::new();
     for (face_key, face) in body.faces.iter() {
@@ -236,17 +613,21 @@ fn existing_fillets(body: &Body) -> Option<Vec<ExistingFillet>> {
     Some(found)
 }
 
-fn restore_fillets(body: &mut Body, fillets: &[ExistingFillet]) -> Option<()> {
+fn restore_fillets(
+    body: &mut Body,
+    fillets: &[ExistingFillet],
+    tolerance: f64,
+) -> Option<()> {
     for fillet in fillets {
-        let face = face_on(body, fillet.cut)?;
-        if round_face(body, face, &fillet.cylinder, fillet.forward)? != 2 {
+        let face = face_on(body, fillet.cut, tolerance)?;
+        if round_face(body, face, &fillet.cylinder, fillet.forward, tolerance)? != 2 {
             return None;
         }
     }
     Some(())
 }
 
-fn face_on(body: &Body, halfspace: Halfspace) -> Option<FaceKey> {
+fn face_on(body: &Body, halfspace: Halfspace, tolerance: f64) -> Option<FaceKey> {
     body.faces.iter().find_map(|(key, face)| {
         let Surface::Plane(plane) = body.surfaces.get(face.surface)? else {
             return None;
@@ -255,11 +636,23 @@ fn face_on(body: &Body, halfspace: Halfspace) -> Option<FaceKey> {
         if !face.forward {
             normal = -normal;
         }
-        let scale = halfspace.offset.abs().max(1.0);
         (normal.dot(halfspace.normal) > 1.0 - 1e-8
-            && (normal.dot(Vec3::from(plane.origin)) - halfspace.offset).abs() <= scale * 1e-8)
+            && (normal.dot(Vec3::from(plane.origin)) - halfspace.offset).abs() <= tolerance)
             .then_some(key)
     })
+}
+
+fn faces_touch(body: &Body, first: FaceKey, second: FaceKey) -> bool {
+    let vertices = |face| {
+        body.face_coedges(face)
+            .into_iter()
+            .filter_map(|coedge| body.coedges.get(coedge))
+            .filter_map(|coedge| body.edges.get(coedge.edge))
+            .flat_map(|edge| [edge.start, edge.end])
+            .collect::<HashSet<_>>()
+    };
+    let first = vertices(first);
+    vertices(second).iter().any(|vertex| first.contains(vertex))
 }
 
 fn round_face(
@@ -267,6 +660,7 @@ fn round_face(
     face: FaceKey,
     cylinder: &Cylinder,
     forward: bool,
+    tolerance: f64,
 ) -> Option<usize> {
     let axis = Vec3::from(cylinder.base.normal()?);
     let centre = Vec3::from(cylinder.base.origin);
@@ -291,7 +685,7 @@ fn round_face(
         }
         let start_height = (start - centre).dot(axis);
         let end_height = (end - centre).dot(axis);
-        if (start_height - end_height).abs() > tolerance(&[start, end, centre]) {
+        if (start_height - end_height).abs() > tolerance {
             return None;
         }
         let cross_centre = centre + axis * ((start_height + end_height) * 0.5);
@@ -321,12 +715,7 @@ fn round_face(
     Some(rounded)
 }
 
-fn convex_body(halfspaces: &[Halfspace]) -> Option<(Body, FaceKey)> {
-    let scale = halfspaces
-        .iter()
-        .map(|plane| plane.origin.length().max(plane.offset.abs()))
-        .fold(1.0_f64, f64::max);
-    let tol = scale * 1e-9;
+fn convex_body(halfspaces: &[Halfspace], tolerance: f64) -> Option<(Body, FaceKey)> {
     let mut points = Vec::<Vec3>::new();
     for first in 0..halfspaces.len() {
         for second in first + 1..halfspaces.len() {
@@ -340,11 +729,14 @@ fn convex_body(halfspaces: &[Halfspace]) -> Option<(Body, FaceKey)> {
                 };
                 if halfspaces
                     .iter()
-                    .any(|plane| plane.normal.dot(point) > plane.offset + tol)
+                    .any(|plane| plane.normal.dot(point) > plane.offset + tolerance)
                 {
                     continue;
                 }
-                if points.iter().all(|other| other.distance(point) > tol) {
+                if points
+                    .iter()
+                    .all(|other| other.distance(point) > tolerance)
+                {
                     points.push(point);
                 }
             }
@@ -380,7 +772,7 @@ fn convex_body(halfspaces: &[Halfspace]) -> Option<(Body, FaceKey)> {
             .iter()
             .enumerate()
             .filter_map(|(index, point)| {
-                ((halfspace.normal.dot(*point) - halfspace.offset).abs() <= tol)
+                ((halfspace.normal.dot(*point) - halfspace.offset).abs() <= tolerance)
                     .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -405,7 +797,7 @@ fn convex_body(halfspaces: &[Halfspace]) -> Option<(Body, FaceKey)> {
             };
             angle(*a).total_cmp(&angle(*b))
         });
-        remove_collinear(&mut indices, &points, tol);
+        remove_collinear(&mut indices, &points, tolerance);
         if indices.len() < 3 {
             continue;
         }
@@ -507,20 +899,4 @@ fn remove_collinear(indices: &mut Vec<usize>, points: &[Vec3], tolerance: f64) {
             break;
         }
     }
-}
-
-fn tolerance(points: &[Vec3]) -> f64 {
-    points
-        .iter()
-        .map(|point| point.length())
-        .fold(1.0_f64, f64::max)
-        * 1e-8
-}
-
-fn tolerance_body(body: &Body) -> f64 {
-    body.vertices
-        .iter()
-        .map(|(_, vertex)| Vec3::from(vertex.point).length())
-        .fold(1.0_f64, f64::max)
-        * 1e-8
 }

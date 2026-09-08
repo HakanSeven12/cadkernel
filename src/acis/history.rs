@@ -17,20 +17,35 @@ pub enum HistoryRebuildError {
     InvalidParameters,
     InvalidTransform,
     InvalidBrep,
+    Fillet(brep::FilletError),
 }
 
 impl std::fmt::Display for HistoryRebuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Unsupported => "unsupported solid history operation",
-            Self::InvalidParameters => "invalid solid history parameters",
-            Self::InvalidTransform => "invalid solid history transform",
-            Self::InvalidBrep => "invalid solid history B-rep",
-        })
+        match self {
+            Self::Unsupported => formatter.write_str("unsupported solid history operation"),
+            Self::InvalidParameters => formatter.write_str("invalid solid history parameters"),
+            Self::InvalidTransform => formatter.write_str("invalid solid history transform"),
+            Self::InvalidBrep => formatter.write_str("invalid solid history B-rep"),
+            Self::Fillet(error) => write!(formatter, "solid history fillet failed: {error}"),
+        }
     }
 }
 
-impl std::error::Error for HistoryRebuildError {}
+impl std::error::Error for HistoryRebuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fillet(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<brep::FilletError> for HistoryRebuildError {
+    fn from(error: brep::FilletError) -> Self {
+        Self::Fillet(error)
+    }
+}
 
 fn placement(matrix: [f64; 16]) -> Result<Placement, HistoryRebuildError> {
     if matrix.iter().any(|value| !value.is_finite())
@@ -1457,4 +1472,40 @@ pub fn rebuild_body(
         SolidHistoryOperation::Revolve(value) => rebuild_revolve(value),
         _ => Err(HistoryRebuildError::Unsupported),
     }
+}
+
+/// Rebuilds a creation operation followed by its recorded fillet operations.
+///
+/// Fillet edge references are zero-based ordinals into the current body's
+/// deterministic [`Body::edge_keys`] order. Each fillet step is atomic: its
+/// result replaces the current body only after every selected edge succeeds.
+pub fn rebuild_history(
+    operations: &[SolidHistoryOperation],
+) -> Result<Body, HistoryRebuildError> {
+    let (first, following) = operations
+        .split_first()
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let mut body = rebuild_body(first)?;
+    for operation in following {
+        let SolidHistoryOperation::Fillet(value) = operation else {
+            return Err(HistoryRebuildError::Unsupported);
+        };
+        let radius = *value
+            .radii
+            .first()
+            .ok_or(HistoryRebuildError::InvalidParameters)?;
+        let current_edges = body.edge_keys().collect::<Vec<_>>();
+        let selected = value
+            .edges
+            .iter()
+            .map(|ordinal| {
+                usize::try_from(*ordinal)
+                    .ok()
+                    .and_then(|ordinal| current_edges.get(ordinal).copied())
+                    .ok_or(HistoryRebuildError::InvalidParameters)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        body = brep::fillet_edges(&body, &selected, radius)?;
+    }
+    Ok(body)
 }
