@@ -41,6 +41,7 @@ pub mod imprint;
 pub mod intersect;
 pub mod loft;
 pub mod loft_general;
+pub mod mass;
 pub mod make;
 pub mod mesh;
 pub(crate) mod nurbs_builder;
@@ -48,6 +49,7 @@ pub mod pcurve;
 pub mod place;
 pub mod presspull;
 pub mod slice;
+pub mod shell;
 pub mod split;
 pub mod sweep;
 pub mod sweep_path;
@@ -63,6 +65,7 @@ pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};
 pub use loft::loft;
 pub use loft_general::{loft_with_options, LoftError, LoftOptions, LoftSection};
+pub use mass::{analytic_mass_properties, MassProperties};
 pub use mesh::{body as mesh_body, Mesh};
 pub use place::{edge_points, edge_polylines, transform, Placement};
 pub use presspull::{
@@ -71,6 +74,7 @@ pub use presspull::{
     PlanarFaceProfile, PlanarIntersection, PresspullMode,
 };
 pub use slice::{slice_by_plane, slice_by_surface, surface_side, PlaneSlice};
+pub use shell::{shell, ShellError};
 pub use sweep::{
     extrude, extrude_region, extrude_surface, extrude_surface_region, revolve, revolve_region,
     revolve_surface, revolve_surface_region, sweep_along, sweep_along_deformed,
