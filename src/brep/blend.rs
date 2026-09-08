@@ -235,6 +235,24 @@ pub fn chamfer_edges(
     let mut selected = selected.to_vec();
     selected.sort_by_key(EdgeKey::slot);
     selected.dedup();
+    if let Some(result) = super::chamfer_circular::chamfer_circular(
+        body,
+        &selected,
+        base_face,
+        base_distance,
+        other_distance,
+    ) {
+        return result;
+    }
+    if let Some(result) = super::chamfer_prismatic::chamfer_prismatic(
+        body,
+        &selected,
+        base_face,
+        base_distance,
+        other_distance,
+    ) {
+        return result;
+    }
     let tolerance = operation_tolerance(&[body]);
     if is_open_sheet(body) {
         return chamfer_sheet(
