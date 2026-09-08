@@ -182,6 +182,8 @@ fn copy_closed_side(
     {
         return Err(Snag::CutRefused);
     }
+    let tolerance = operation_tolerance(&[&result]);
+    super::boolean::regroup_shells(&mut result, tolerance)?;
     Ok(result)
 }
 

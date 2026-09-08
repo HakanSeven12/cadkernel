@@ -118,7 +118,7 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
 /// A Boolean initially sews all retained faces into one provisional shell.
 /// Restore connected shells and attach inward-facing cavity shells to the
 /// containing outer lump, rather than turning a void into a separate solid.
-fn regroup_shells(body: &mut Body, tolerance: f64) -> Result<(), Snag> {
+pub(super) fn regroup_shells(body: &mut Body, tolerance: f64) -> Result<(), Snag> {
     let faces = body.face_keys().collect::<Vec<_>>();
     let components = super::sweep::face_components(body, &faces).ok_or(Snag::CutRefused)?;
     if components.len() <= 1 { return Ok(()); }
