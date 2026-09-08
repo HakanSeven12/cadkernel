@@ -36,6 +36,7 @@ pub mod imprint;
 pub mod intersect;
 pub mod loft;
 pub mod loft_general;
+pub mod mass;
 pub mod make;
 pub mod mesh;
 pub(crate) mod nurbs_builder;
@@ -58,6 +59,7 @@ pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};
 pub use loft::loft;
 pub use loft_general::{loft_with_options, LoftError, LoftOptions, LoftSection};
+pub use mass::{analytic_mass_properties, MassProperties};
 pub use mesh::{body as mesh_body, Mesh};
 pub use place::{edge_points, edge_polylines, transform, Placement};
 pub use presspull::{
