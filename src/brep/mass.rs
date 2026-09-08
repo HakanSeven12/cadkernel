@@ -20,18 +20,18 @@ impl MassProperties {
     pub fn translated(mut self, delta: [f64; 3]) -> Self {
         let old = self.centroid;
         let new = [old[0] + delta[0], old[1] + delta[1], old[2] + delta[2]];
-        self.moment_of_inertia[0] += self.volume
-            * (new[1] * new[1] + new[2] * new[2] - old[1] * old[1] - old[2] * old[2]);
-        self.moment_of_inertia[1] += self.volume
-            * (new[0] * new[0] + new[2] * new[2] - old[0] * old[0] - old[2] * old[2]);
-        self.moment_of_inertia[2] += self.volume
-            * (new[0] * new[0] + new[1] * new[1] - old[0] * old[0] - old[1] * old[1]);
-        self.product_of_inertia[0] -=
-            self.volume * (new[0] * new[1] - old[0] * old[1]);
-        self.product_of_inertia[1] -=
-            self.volume * (new[1] * new[2] - old[1] * old[2]);
-        self.product_of_inertia[2] -=
-            self.volume * (new[2] * new[0] - old[2] * old[0]);
+        let square_change = |axis| delta[axis] * (2.0 * old[axis] + delta[axis]);
+        self.moment_of_inertia[0] += self.volume * (square_change(1) + square_change(2));
+        self.moment_of_inertia[1] += self.volume * (square_change(0) + square_change(2));
+        self.moment_of_inertia[2] += self.volume * (square_change(0) + square_change(1));
+        let product_change = |first, second| {
+            old[first] * delta[second]
+                + old[second] * delta[first]
+                + delta[first] * delta[second]
+        };
+        self.product_of_inertia[0] -= self.volume * product_change(0, 1);
+        self.product_of_inertia[1] -= self.volume * product_change(1, 2);
+        self.product_of_inertia[2] -= self.volume * product_change(2, 0);
         self.radii_of_gyration = self
             .moment_of_inertia
             .map(|moment| (moment.max(0.0) / self.volume).sqrt());
@@ -277,5 +277,29 @@ mod tests {
         assert!((properties.principal_moments[0] - 4.0 * volume).abs() < 1e-10);
         assert!((properties.principal_moments[1] - 4.0 * volume).abs() < 1e-10);
         assert!((properties.principal_moments[2] - 2.0 * volume).abs() < 1e-10);
+    }
+
+    #[test]
+    fn translating_properties_matches_translating_the_body() {
+        let properties = analytic_mass_properties(&make::sphere([2.0, -3.0, 5.0], 2.0).unwrap())
+            .unwrap()
+            .translated([7.0, 11.0, -13.0]);
+        let expected = analytic_mass_properties(&make::sphere([9.0, 8.0, -8.0], 2.0).unwrap())
+            .unwrap();
+
+        assert_eq!(properties.centroid, expected.centroid);
+        for (actual, expected) in properties
+            .moment_of_inertia
+            .into_iter()
+            .chain(properties.product_of_inertia)
+            .zip(
+                expected
+                    .moment_of_inertia
+                    .into_iter()
+                    .chain(expected.product_of_inertia),
+            )
+        {
+            assert!((actual - expected).abs() < 1e-9);
+        }
     }
 }
