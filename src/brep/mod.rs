@@ -48,7 +48,7 @@ pub mod sweep_path;
 pub mod topology;
 
 pub use arena::{Arena, Key};
-pub use blend::{chamfer, fillet, presspull};
+pub use blend::{chamfer, fillet, fillet_edges, presspull, FilletError};
 pub use boolean::{combine, Operation};
 pub use bounds::{body_bounds, face_bounds, operation_tolerance, Aabb};
 pub use classify::{contains_point, Containment};
