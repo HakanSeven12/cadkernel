@@ -163,15 +163,28 @@ impl Mesh {
 
     /// Area of all triangles in the mesh.
     pub fn surface_area(&self) -> Option<f64> {
+        self.surface_properties().map(|(area, _)| area)
+    }
+
+    /// Area and area-weighted centroid of all triangles in the mesh.
+    pub fn surface_properties(&self) -> Option<(f64, [f64; 3])> {
+        let reference = Vec3::from(*self.positions.first()?);
+        let mut moment = Vec3::ZERO;
         self.triangles
             .iter()
             .try_fold(0.0, |area, triangle| {
-                let a = Vec3::from(*self.positions.get(triangle[0])?);
-                let b = Vec3::from(*self.positions.get(triangle[1])?);
-                let c = Vec3::from(*self.positions.get(triangle[2])?);
+                let a = Vec3::from(*self.positions.get(triangle[0])?) - reference;
+                let b = Vec3::from(*self.positions.get(triangle[1])?) - reference;
+                let c = Vec3::from(*self.positions.get(triangle[2])?) - reference;
                 let triangle_area = (b - a).cross(c - a).length() * 0.5;
-                triangle_area.is_finite().then_some(area + triangle_area)
+                if !triangle_area.is_finite() {
+                    return None;
+                }
+                moment = moment + (a + b + c) * (triangle_area / 3.0);
+                Some(area + triangle_area)
             })
+            .filter(|area| *area > 0.0)
+            .map(|area| (area, (reference + moment / area).to_array()))
     }
 
     /// How many triangles it holds.
