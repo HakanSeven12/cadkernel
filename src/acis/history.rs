@@ -18,6 +18,7 @@ pub enum HistoryRebuildError {
     InvalidTransform,
     InvalidBrep,
     Fillet(brep::FilletError),
+    Chamfer(brep::ChamferError),
 }
 
 impl std::fmt::Display for HistoryRebuildError {
@@ -28,6 +29,7 @@ impl std::fmt::Display for HistoryRebuildError {
             Self::InvalidTransform => formatter.write_str("invalid solid history transform"),
             Self::InvalidBrep => formatter.write_str("invalid solid history B-rep"),
             Self::Fillet(error) => write!(formatter, "solid history fillet failed: {error}"),
+            Self::Chamfer(error) => write!(formatter, "solid history chamfer failed: {error}"),
         }
     }
 }
@@ -36,6 +38,7 @@ impl std::error::Error for HistoryRebuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Fillet(error) => Some(error),
+            Self::Chamfer(error) => Some(error),
             _ => None,
         }
     }
@@ -44,6 +47,12 @@ impl std::error::Error for HistoryRebuildError {
 impl From<brep::FilletError> for HistoryRebuildError {
     fn from(error: brep::FilletError) -> Self {
         Self::Fillet(error)
+    }
+}
+
+impl From<brep::ChamferError> for HistoryRebuildError {
+    fn from(error: brep::ChamferError) -> Self {
+        Self::Chamfer(error)
     }
 }
 
