@@ -236,6 +236,16 @@ pub fn chamfer_edges(
     selected.sort_by_key(EdgeKey::slot);
     selected.dedup();
     let tolerance = operation_tolerance(&[body]);
+    if is_open_sheet(body) {
+        return chamfer_sheet(
+            body,
+            &selected,
+            base_face,
+            base_distance,
+            other_distance,
+            tolerance,
+        );
+    }
     let existing = existing_fillets(body).ok_or(ChamferError::UnsupportedExistingFillet)?;
     let corners = existing_corners(body).ok_or(ChamferError::UnsupportedExistingFillet)?;
     validate_chamfer_body(body, &existing, tolerance)?;
@@ -272,6 +282,219 @@ pub fn chamfer_edges(
         return Err(ChamferError::InvalidResult);
     }
     Ok(result)
+}
+
+fn is_open_sheet(body: &Body) -> bool {
+    body.edges.iter().any(|(_, edge)| edge.coedges.len() == 1)
+        && body.edges.iter().all(|(_, edge)| !edge.coedges.is_empty() && edge.coedges.len() <= 2)
+}
+
+fn chamfer_sheet(
+    body: &Body,
+    selected: &[EdgeKey],
+    base_face: FaceKey,
+    base_distance: f64,
+    other_distance: f64,
+    tolerance: f64,
+) -> Result<Body, ChamferError> {
+    if body.roots.len() != 1
+        || body
+            .lumps
+            .get(body.roots[0])
+            .is_none_or(|lump| lump.shells.len() != 1)
+        || body.faces.iter().any(|(_, face)| face.loops.len() != 1)
+        || body.faces.iter().any(|(_, face)| {
+            !matches!(body.surfaces.get(face.surface), Some(Surface::Plane(_)))
+        })
+    {
+        return Err(ChamferError::UnsupportedBodyTopology);
+    }
+    let (supports, boundaries) = sheet_halfspaces(body, tolerance)
+        .ok_or(ChamferError::UnsupportedBodySurface)?;
+    let mut halfspaces = supports
+        .iter()
+        .map(|(_, halfspace)| *halfspace)
+        .chain(boundaries)
+        .collect::<Vec<_>>();
+    let mut cuts = Vec::with_capacity(selected.len());
+    for edge in selected {
+        validate_chamfer_edge(body, *edge)?;
+        let frame = sheet_edge_frame(body, *edge, &supports, halfspaces.clone())
+            .ok_or(ChamferError::DegenerateGeometry(*edge))?;
+        if !frame.faces.contains(&base_face) {
+            return Err(ChamferError::EdgeOutsideBaseFace(*edge));
+        }
+        let distances = if frame.faces[0] == base_face {
+            (base_distance, other_distance)
+        } else {
+            (other_distance, base_distance)
+        };
+        let cut = cut_halfspace_distances(&frame, distances.0, distances.1, tolerance)
+            .ok_or(ChamferError::DegenerateGeometry(*edge))?;
+        halfspaces.push(cut);
+        cuts.push(cut);
+    }
+    let (closed, _) = convex_body(&halfspaces, tolerance)
+        .ok_or(ChamferError::DistanceTooLargeOrInteracting)?;
+    let kept = supports
+        .iter()
+        .map(|(_, halfspace)| *halfspace)
+        .chain(cuts)
+        .filter_map(|halfspace| face_on(&closed, halfspace, tolerance))
+        .collect::<HashSet<_>>();
+    if kept.len() < supports.len() + selected.len() {
+        return Err(ChamferError::DistanceTooLargeOrInteracting);
+    }
+
+    let mut result = Body::new();
+    let lump = result.lumps.insert(Lump {
+        shells: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let shell = result.shells.insert(Shell {
+        faces: Vec::new(),
+        owner: lump,
+        provenance: Provenance::Synthesized,
+    });
+    let mut kept = kept.into_iter().collect::<Vec<_>>();
+    kept.sort_by_key(FaceKey::slot);
+    for face in kept {
+        super::boolean::copy_face(&mut result, &closed, face, shell, false)
+            .map_err(|_| ChamferError::InvalidResult)?;
+    }
+    result.lumps.get_mut(lump).ok_or(ChamferError::InvalidResult)?.shells = vec![shell];
+    result.roots = vec![lump];
+    if !result.validate().is_empty()
+        || result.worst_vertex_gap() > tolerance
+        || !blend_boundaries_fit(&result, tolerance)
+    {
+        return Err(ChamferError::InvalidResult);
+    }
+    Ok(result)
+}
+
+fn sheet_halfspaces(
+    body: &Body,
+    tolerance: f64,
+) -> Option<(Vec<(FaceKey, Halfspace)>, Vec<Halfspace>)> {
+    let points = body
+        .vertices
+        .iter()
+        .map(|(_, vertex)| Vec3::from(vertex.point))
+        .collect::<Vec<_>>();
+    let centre = points.iter().copied().fold(Vec3::ZERO, |sum, point| sum + point)
+        / points.len() as f64;
+    let mut supports = Vec::new();
+    for (face_key, face) in body.faces.iter() {
+        let Surface::Plane(plane) = body.surfaces.get(face.surface)? else {
+            return None;
+        };
+        let mut normal = Vec3::from(plane.normal()?);
+        let mut offset = normal.dot(Vec3::from(plane.origin));
+        if normal.dot(centre) > offset {
+            normal = -normal;
+            offset = -offset;
+        }
+        supports.push((face_key, Halfspace {
+            origin: Vec3::from(plane.origin),
+            normal,
+            offset,
+            added: false,
+        }));
+    }
+
+    let mut boundaries = Vec::new();
+    for (_, edge) in body.edges.iter().filter(|(_, edge)| edge.coedges.len() == 1) {
+        let coedge = body.coedges.get(edge.coedges[0])?;
+        let face = body.loops.get(coedge.owner)?.owner;
+        let face_normal = supports.iter().find(|(key, _)| *key == face)?.1.normal;
+        let start = Vec3::from(body.vertices.get(edge.start)?.point);
+        let end = Vec3::from(body.vertices.get(edge.end)?.point);
+        let axis = (end - start).normalize()?;
+        let face_points = body
+            .face_coedges(face)
+            .into_iter()
+            .filter_map(|key| body.coedges.get(key))
+            .filter_map(|coedge| body.edges.get(coedge.edge))
+            .flat_map(|edge| [edge.start, edge.end])
+            .filter_map(|vertex| body.vertices.get(vertex))
+            .map(|vertex| Vec3::from(vertex.point))
+            .collect::<Vec<_>>();
+        let face_centre = face_points
+            .iter()
+            .copied()
+            .fold(Vec3::ZERO, |sum, point| sum + point)
+            / face_points.len() as f64;
+        let mut normal = face_normal.cross(axis).normalize()?;
+        let mut offset = normal.dot(start);
+        if normal.dot(face_centre) > offset + tolerance {
+            normal = -normal;
+            offset = -offset;
+        }
+        if supports.iter().any(|(_, candidate)| same_halfspace(*candidate, normal, offset, tolerance))
+            || boundaries
+                .iter()
+                .any(|candidate| same_halfspace(*candidate, normal, offset, tolerance))
+        {
+            continue;
+        }
+        boundaries.push(Halfspace {
+            origin: start,
+            normal,
+            offset,
+            added: false,
+        });
+    }
+    Some((supports, boundaries))
+}
+
+fn same_halfspace(
+    candidate: Halfspace,
+    normal: Vec3,
+    offset: f64,
+    tolerance: f64,
+) -> bool {
+    candidate.normal.dot(normal) > 1.0 - 1.0e-8
+        && (candidate.offset - offset).abs() <= tolerance
+}
+
+fn sheet_edge_frame(
+    body: &Body,
+    edge_key: EdgeKey,
+    supports: &[(FaceKey, Halfspace)],
+    halfspaces: Vec<Halfspace>,
+) -> Option<EdgeFrame> {
+    let edge = body.edges.get(edge_key)?;
+    if !matches!(body.curves.get(edge.curve)?, Curve3::Line(_)) || edge.coedges.len() != 2 {
+        return None;
+    }
+    let start = Vec3::from(body.vertices.get(edge.start)?.point);
+    let end = Vec3::from(body.vertices.get(edge.end)?.point);
+    let axis = (end - start).normalize()?;
+    let face_of = |coedge| {
+        let loop_key = body.coedges.get(coedge)?.owner;
+        Some(body.loops.get(loop_key)?.owner)
+    };
+    let faces = [face_of(edge.coedges[0])?, face_of(edge.coedges[1])?];
+    let normal_of = |face| supports.iter().find(|(key, _)| *key == face).map(|(_, value)| value.normal);
+    let first_normal = normal_of(faces[0])?;
+    let second_normal = normal_of(faces[1])?;
+    let dot = first_normal.dot(second_normal);
+    if dot.abs() > 1.0 - 1.0e-9 {
+        return None;
+    }
+    let first_inward = -(second_normal - first_normal * dot).normalize()?;
+    let second_inward = -(first_normal - second_normal * dot).normalize()?;
+    Some(EdgeFrame {
+        point: start,
+        axis,
+        faces,
+        first_normal,
+        second_normal,
+        first_inward,
+        second_inward,
+        halfspaces,
+    })
 }
 
 /// Rounds one straight edge with a constant-radius cylindrical face.
