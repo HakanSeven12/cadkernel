@@ -42,6 +42,7 @@ pub(crate) mod nurbs_builder;
 pub mod pcurve;
 pub mod place;
 pub mod presspull;
+pub mod slice;
 pub mod split;
 pub mod sweep;
 pub mod sweep_path;
@@ -64,6 +65,7 @@ pub use presspull::{
     planar_region, presspull_face, presspull_region, subtract_planar_regions, union_planar_regions,
     PlanarFaceProfile, PlanarIntersection, PresspullMode,
 };
+pub use slice::{slice_by_plane, PlaneSlice};
 pub use sweep::{
     extrude, extrude_region, extrude_surface, extrude_surface_region, revolve, revolve_region,
     revolve_surface, revolve_surface_region, sweep_along, sweep_along_deformed,
