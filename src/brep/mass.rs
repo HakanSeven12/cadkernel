@@ -69,7 +69,7 @@ fn cylinder_properties(body: &Body) -> Option<MassProperties> {
             _ => return None,
         }
     }
-    if !(1..=2).contains(&cylinders.len()) || planes.len() != cylinders.len() * 2 {
+    if cylinders.is_empty() || planes.is_empty() {
         return None;
     }
     cylinders.sort_by(|left, right| right.radius.total_cmp(&left.radius));
@@ -96,6 +96,10 @@ fn cylinder_properties(body: &Body) -> Option<MassProperties> {
         candidate_axis.dot(axis).abs() < 1.0 - 1e-8
             || lateral.distance(reference_lateral) > scale * 1e-8
     }) {
+        return None;
+    }
+    cylinders.dedup_by(|left, right| (left.radius - right.radius).abs() <= scale * 1e-8);
+    if !(1..=2).contains(&cylinders.len()) {
         return None;
     }
     let mut positions = planes
