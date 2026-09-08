@@ -76,7 +76,7 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 .and_then(|ring| body.faces.get(ring.owner))
                 .ok_or(Unappendable::Inconsistent)?;
             let needs_curve = matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_)));
-            match add_pcurve(document, curve) {
+            match add_pcurve(document, curve, ids.surface(face.surface)) {
                 Some(id) => {
                     ids.pcurves.insert(key, id);
                 }
@@ -405,8 +405,12 @@ fn add_curve(document: &mut SatDocument, curve: &Curve3) -> Option<i32> {
     ))
 }
 
-fn add_pcurve(document: &mut SatDocument, curve: &Curve2) -> Option<i32> {
-    let (degree, knots, controls, weights, rational, closed, range) = match curve {
+fn add_pcurve(
+    document: &mut SatDocument,
+    curve: &Curve2,
+    support_surface: i32,
+) -> Option<i32> {
+    let (degree, knots, controls, weights, rational, closed) = match curve {
         Curve2::Line(line) => (
             1,
             vec![0.0, 0.0, 1.0, 1.0],
@@ -414,7 +418,6 @@ fn add_pcurve(document: &mut SatDocument, curve: &Curve2) -> Option<i32> {
             vec![1.0, 1.0],
             false,
             false,
-            (0.0, 1.0),
         ),
         Curve2::Nurbs(curve) => (
             curve.degree(),
@@ -423,7 +426,6 @@ fn add_pcurve(document: &mut SatDocument, curve: &Curve2) -> Option<i32> {
             curve.weights().to_vec(),
             curve.is_rational(),
             curve.point_at_knot(curve.domain().0) == curve.point_at_knot(curve.domain().1),
-            curve.domain(),
         ),
         _ => return None,
     };
@@ -435,7 +437,10 @@ fn add_pcurve(document: &mut SatDocument, curve: &Curve2) -> Option<i32> {
         &controls,
         rational.then_some(weights.as_slice()),
         0.0,
-        range,
+        support_surface,
+        // The spline knots carry the parameter interval. These are UV
+        // translations on the support surface, not edge-domain endpoints.
+        (0.0, 0.0),
     ))
 }
 
