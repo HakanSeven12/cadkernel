@@ -17,20 +17,44 @@ pub enum HistoryRebuildError {
     InvalidParameters,
     InvalidTransform,
     InvalidBrep,
+    Fillet(brep::FilletError),
+    Chamfer(brep::ChamferError),
 }
 
 impl std::fmt::Display for HistoryRebuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Unsupported => "unsupported solid history operation",
-            Self::InvalidParameters => "invalid solid history parameters",
-            Self::InvalidTransform => "invalid solid history transform",
-            Self::InvalidBrep => "invalid solid history B-rep",
-        })
+        match self {
+            Self::Unsupported => formatter.write_str("unsupported solid history operation"),
+            Self::InvalidParameters => formatter.write_str("invalid solid history parameters"),
+            Self::InvalidTransform => formatter.write_str("invalid solid history transform"),
+            Self::InvalidBrep => formatter.write_str("invalid solid history B-rep"),
+            Self::Fillet(error) => write!(formatter, "solid history fillet failed: {error}"),
+            Self::Chamfer(error) => write!(formatter, "solid history chamfer failed: {error}"),
+        }
     }
 }
 
-impl std::error::Error for HistoryRebuildError {}
+impl std::error::Error for HistoryRebuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fillet(error) => Some(error),
+            Self::Chamfer(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<brep::FilletError> for HistoryRebuildError {
+    fn from(error: brep::FilletError) -> Self {
+        Self::Fillet(error)
+    }
+}
+
+impl From<brep::ChamferError> for HistoryRebuildError {
+    fn from(error: brep::ChamferError) -> Self {
+        Self::Chamfer(error)
+    }
+}
 
 fn placement(matrix: [f64; 16]) -> Result<Placement, HistoryRebuildError> {
     if matrix.iter().any(|value| !value.is_finite())
@@ -1464,4 +1488,65 @@ pub fn rebuild_body(
         SolidHistoryOperation::Revolve(value) => rebuild_revolve(value),
         _ => Err(HistoryRebuildError::Unsupported),
     }
+}
+
+/// Rebuilds a creation operation followed by its recorded edge operations.
+///
+/// Edge and face references are zero-based ordinals into the current body's
+/// deterministic key order. Each operation is atomic: its result replaces the
+/// current body only after every selected edge succeeds.
+pub fn rebuild_history(
+    operations: &[SolidHistoryOperation],
+) -> Result<Body, HistoryRebuildError> {
+    let (first, following) = operations
+        .split_first()
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let mut body = rebuild_body(first)?;
+    for operation in following {
+        let current_edges = body.edge_keys().collect::<Vec<_>>();
+        let selected_edges = |ordinals: &[i32]| {
+            ordinals
+                .iter()
+                .map(|ordinal| {
+                    usize::try_from(*ordinal)
+                        .ok()
+                        .and_then(|ordinal| current_edges.get(ordinal).copied())
+                        .ok_or(HistoryRebuildError::InvalidParameters)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let (rebuilt, transform) = match operation {
+            SolidHistoryOperation::Fillet(value) => {
+                let radius = *value
+                    .radii
+                    .first()
+                    .ok_or(HistoryRebuildError::InvalidParameters)?;
+                (
+                    brep::fillet_edges(&body, &selected_edges(&value.edges)?, radius)?,
+                    value.base.transform,
+                )
+            }
+            SolidHistoryOperation::Chamfer(value) => {
+                let faces = body.face_keys().collect::<Vec<_>>();
+                let base_face = usize::try_from(value.base_face)
+                    .ok()
+                    .and_then(|ordinal| faces.get(ordinal).copied())
+                    .ok_or(HistoryRebuildError::InvalidParameters)?;
+                (
+                    brep::chamfer_edges(
+                        &body,
+                        &selected_edges(&value.edges)?,
+                        base_face,
+                        value.base_distance,
+                        value.other_distance,
+                    )?,
+                    value.base.transform,
+                )
+            }
+            _ => return Err(HistoryRebuildError::Unsupported),
+        };
+        body = brep::transform(&rebuilt, &placement(transform)?)
+            .ok_or(HistoryRebuildError::InvalidTransform)?;
+    }
+    Ok(body)
 }

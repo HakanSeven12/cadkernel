@@ -75,13 +75,13 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 .get(coedge.owner)
                 .and_then(|ring| body.faces.get(ring.owner))
                 .ok_or(Unappendable::Inconsistent)?;
-            if matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_))) {
-                match add_pcurve(document, curve, ids.surface(face.surface)) {
-                    Some(id) => {
-                        ids.pcurves.insert(key, id);
-                    }
-                    None => return Err(Unappendable::Curve),
+            let needs_curve = matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_)));
+            match add_pcurve(document, curve, ids.surface(face.surface)) {
+                Some(id) => {
+                    ids.pcurves.insert(key, id);
                 }
+                None if needs_curve => return Err(Unappendable::Curve),
+                None => {}
             }
         }
         ids.coedges.insert(key, add(document, "coedge", Vec::new()));
@@ -438,6 +438,8 @@ fn add_pcurve(
         rational.then_some(weights.as_slice()),
         0.0,
         support_surface,
+        // The spline knots carry the parameter interval. These are UV
+        // translations on the support surface, not edge-domain endpoints.
         (0.0, 0.0),
     ))
 }

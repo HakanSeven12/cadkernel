@@ -30,7 +30,12 @@ pub mod arena;
 pub mod blend;
 pub mod boolean;
 pub mod bounds;
+mod chamfer_circular;
+mod chamfer_prismatic;
+mod chamfer_profile;
 pub mod classify;
+mod fillet_circular;
+mod fillet_prismatic;
 pub mod geometry;
 pub mod imprint;
 pub mod intersect;
@@ -43,6 +48,7 @@ pub(crate) mod nurbs_builder;
 pub mod pcurve;
 pub mod place;
 pub mod presspull;
+pub mod slice;
 pub mod shell;
 pub mod split;
 pub mod sweep;
@@ -50,7 +56,7 @@ pub mod sweep_path;
 pub mod topology;
 
 pub use arena::{Arena, Key};
-pub use blend::{chamfer, fillet, presspull};
+pub use blend::{chamfer, chamfer_edges, fillet, fillet_edges, presspull, ChamferError, FilletError};
 pub use boolean::{combine, Operation};
 pub use bounds::{body_bounds, face_bounds, operation_tolerance, Aabb};
 pub use classify::{contains_point, Containment};
@@ -67,6 +73,7 @@ pub use presspull::{
     planar_region, presspull_face, presspull_region, subtract_planar_regions, union_planar_regions,
     PlanarFaceProfile, PlanarIntersection, PresspullMode,
 };
+pub use slice::{slice_by_plane, slice_by_surface, surface_side, PlaneSlice};
 pub use shell::{shell, ShellError};
 pub use sweep::{
     extrude, extrude_region, extrude_surface, extrude_surface_region, revolve, revolve_region,

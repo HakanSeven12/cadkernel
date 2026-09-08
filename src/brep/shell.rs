@@ -443,3 +443,34 @@ fn recognize_sphere(body: &Body) -> Option<SphereShape> {
         face,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brep::{analytic_mass_properties, make};
+    use std::f64::consts::PI;
+
+    #[test]
+    fn a_sphere_shell_has_the_exact_annular_volume() {
+        let solid = make::sphere([3.0, -2.0, 5.0], 4.0).unwrap();
+        let result = shell(&solid, &[], 1.0).unwrap();
+
+        assert!(result.validate().is_empty());
+        assert_eq!(result.shells.len(), 2);
+        let properties = analytic_mass_properties(&result).unwrap();
+        let expected = 4.0 * PI * (4.0_f64.powi(3) - 3.0_f64.powi(3)) / 3.0;
+        assert!((properties.volume - expected).abs() < 1e-8);
+        assert_eq!(properties.centroid, [3.0, -2.0, 5.0]);
+    }
+
+    #[test]
+    fn removing_a_box_face_opens_a_valid_shell() {
+        let solid = make::cuboid([0.0; 3], [6.0, 5.0, 4.0]).unwrap();
+        let removed = solid.face_keys().next().unwrap();
+        let result = shell(&solid, &[removed], 0.5).unwrap();
+
+        assert!(result.validate().is_empty());
+        assert_eq!(result.roots.len(), 1);
+        assert_eq!(result.lumps.len(), 1);
+    }
+}

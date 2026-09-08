@@ -118,7 +118,7 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
 /// A Boolean initially sews all retained faces into one provisional shell.
 /// Restore connected shells and attach inward-facing cavity shells to the
 /// containing outer lump, rather than turning a void into a separate solid.
-fn regroup_shells(body: &mut Body, tolerance: f64) -> Result<(), Snag> {
+pub(super) fn regroup_shells(body: &mut Body, tolerance: f64) -> Result<(), Snag> {
     let faces = body.face_keys().collect::<Vec<_>>();
     let components = super::sweep::face_components(body, &faces).ok_or(Snag::CutRefused)?;
     if components.len() <= 1 { return Ok(()); }
@@ -182,7 +182,7 @@ fn regroup_shells(body: &mut Body, tolerance: f64) -> Result<(), Snag> {
     if body.validate().is_empty() { Ok(()) } else { Err(Snag::CutRefused) }
 }
 
-fn orient_shell(body: &mut Body) -> Result<(), Snag> {
+pub(super) fn orient_shell(body: &mut Body) -> Result<(), Snag> {
     let mut adjacent: HashMap<FaceKey, Vec<(FaceKey, bool)>> = HashMap::new();
     for (_, edge) in body.edges.iter() {
         let [first, second] = edge.coedges.as_slice() else {
@@ -353,7 +353,7 @@ fn keeps_shared_wall(
 /// vertex of an imprinted face sits on the seam, where the answer is
 /// "boundary" for reasons that have nothing to do with which side the face is
 /// on.
-fn face_side(body: &Body, other: &Body, face: FaceKey, tolerance: f64) -> Containment {
+pub(super) fn face_side(body: &Body, other: &Body, face: FaceKey, tolerance: f64) -> Containment {
     match interior_point(body, face, tolerance) {
         Some(point) => contains_point(other, point, tolerance),
         None => Containment::Unknown,
@@ -367,7 +367,7 @@ fn face_side(body: &Body, other: &Body, face: FaceKey, tolerance: f64) -> Contai
 /// boundary's own points is inside a convex face and can fall outside a
 /// concave one, so it is checked rather than assumed, and the midpoints
 /// between it and each boundary point are tried after it.
-fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Option<[f64; 3]> {
+pub(super) fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Option<[f64; 3]> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
     if let Surface::Sphere(sphere) = surface {
