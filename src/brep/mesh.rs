@@ -46,23 +46,132 @@ impl Mesh {
     /// accuracy follows the tessellation tolerance. Empty or degenerate meshes
     /// return `None`; a local reference keeps survey coordinates well conditioned.
     pub fn mass_properties(&self) -> Option<(f64, [f64; 3])> {
-        let origin = Vec3::from(*self.positions.first()?);
-        let mut volume6 = 0.0;
-        let mut moment = Vec3::from([0.0; 3]);
+        let properties = self.inertial_properties()?;
+        Some((properties.volume, properties.centroid))
+    }
+
+    /// Volume, centroid and inertia of a closed, consistently wound mesh.
+    /// A local reference keeps the integration stable at survey coordinates.
+    pub fn inertial_properties(&self) -> Option<super::MassProperties> {
+        let reference = Vec3::from(*self.positions.first()?);
+        let mut signed_volume = 0.0;
+        let mut centroid_numerator = [0.0; 3];
+        let mut squared_integrals = [0.0; 3];
+        let mut product_integrals = [0.0; 3];
         for triangle in &self.triangles {
-            let a = Vec3::from(*self.positions.get(triangle[0])?) - origin;
-            let b = Vec3::from(*self.positions.get(triangle[1])?) - origin;
-            let c = Vec3::from(*self.positions.get(triangle[2])?) - origin;
-            let weight = a.dot(b.cross(c));
-            volume6 += weight;
-            moment = moment + (a + b + c) * weight;
+            let a = Vec3::from(*self.positions.get(triangle[0])?) - reference;
+            let b = Vec3::from(*self.positions.get(triangle[1])?) - reference;
+            let c = Vec3::from(*self.positions.get(triangle[2])?) - reference;
+            if [a, b, c]
+                .iter()
+                .flat_map(|point| [point.x, point.y, point.z])
+                .any(|value| !value.is_finite())
+            {
+                return None;
+            }
+            let points = [a.to_array(), b.to_array(), c.to_array()];
+            let tetra = a.dot(b.cross(c)) / 6.0;
+            signed_volume += tetra;
+            for axis in 0..3 {
+                let [a, b, c] = points.map(|point| point[axis]);
+                centroid_numerator[axis] += tetra * (a + b + c) / 4.0;
+                squared_integrals[axis] +=
+                    tetra * (a * a + b * b + c * c + a * b + a * c + b * c) / 10.0;
+            }
+            for (index, (first, second)) in [(0usize, 1usize), (1, 2), (2, 0)]
+                .into_iter()
+                .enumerate()
+            {
+                let diagonal = points
+                    .iter()
+                    .map(|point| point[first] * point[second])
+                    .sum::<f64>();
+                let all = points.iter().map(|point| point[first]).sum::<f64>()
+                    * points.iter().map(|point| point[second]).sum::<f64>();
+                product_integrals[index] += tetra * (diagonal + all) / 20.0;
+            }
         }
-        if volume6 == 0.0 || !volume6.is_finite() {
+        if signed_volume == 0.0 || !signed_volume.is_finite() {
             return None;
         }
-        let centroid = (origin + moment / (4.0 * volume6)).to_array();
-        centroid.iter().all(|value| value.is_finite())
-            .then_some((volume6.abs() / 6.0, centroid))
+        let local_centroid = centroid_numerator.map(|value| value / signed_volume);
+        let orientation = signed_volume.signum();
+        let volume = signed_volume.abs();
+        let square = squared_integrals.map(|value| value * orientation);
+        let products = product_integrals.map(|value| -value * orientation);
+        let moment = [
+            square[1] + square[2],
+            square[0] + square[2],
+            square[0] + square[1],
+        ];
+        let central = [
+            [
+                moment[0]
+                    - volume
+                        * (local_centroid[1].powi(2) + local_centroid[2].powi(2)),
+                products[0] + volume * local_centroid[0] * local_centroid[1],
+                products[2] + volume * local_centroid[0] * local_centroid[2],
+            ],
+            [
+                products[0] + volume * local_centroid[0] * local_centroid[1],
+                moment[1]
+                    - volume
+                        * (local_centroid[0].powi(2) + local_centroid[2].powi(2)),
+                products[1] + volume * local_centroid[1] * local_centroid[2],
+            ],
+            [
+                products[2] + volume * local_centroid[0] * local_centroid[2],
+                products[1] + volume * local_centroid[1] * local_centroid[2],
+                moment[2]
+                    - volume
+                        * (local_centroid[0].powi(2) + local_centroid[1].powi(2)),
+            ],
+        ];
+        let (principal_moments, principal_directions) = principal_axes(central);
+        let centroid = (reference + Vec3::from(local_centroid)).to_array();
+        let c = Vec3::from(centroid);
+        let c2 = c.dot(c);
+        let mut origin = central;
+        for row in 0..3 {
+            for column in 0..3 {
+                origin[row][column] += volume
+                    * (if row == column { c2 } else { 0.0 }
+                        - centroid[row] * centroid[column]);
+            }
+        }
+        let moment_of_inertia = [origin[0][0], origin[1][1], origin[2][2]];
+        let product_of_inertia = [origin[0][1], origin[1][2], origin[2][0]];
+        let radii_of_gyration =
+            moment_of_inertia.map(|value| (value.max(0.0) / volume).sqrt());
+        centroid
+            .iter()
+            .chain(moment_of_inertia.iter())
+            .chain(principal_moments.iter())
+            .chain(product_of_inertia.iter())
+            .chain(radii_of_gyration.iter())
+            .all(|value| value.is_finite())
+            .then_some(super::MassProperties {
+                volume,
+                centroid,
+                moment_of_inertia,
+                principal_directions,
+                principal_moments,
+                product_of_inertia,
+                radii_of_gyration,
+            })
+    }
+
+    /// Area of all triangles in the mesh.
+    pub fn surface_area(&self) -> Option<f64> {
+        self.triangles
+            .iter()
+            .try_fold(0.0, |area, triangle| {
+                let a = Vec3::from(*self.positions.get(triangle[0])?);
+                let b = Vec3::from(*self.positions.get(triangle[1])?);
+                let c = Vec3::from(*self.positions.get(triangle[2])?);
+                let triangle_area = (b - a).cross(c - a).length() * 0.5;
+                triangle_area.is_finite().then_some(area + triangle_area)
+            })
     }
 
     /// How many triangles it holds.
@@ -87,6 +196,57 @@ impl Mesh {
                 .map(|t| [t[0] + offset, t[1] + offset, t[2] + offset]),
         );
     }
+}
+
+fn principal_axes(mut matrix: [[f64; 3]; 3]) -> ([f64; 3], [f64; 9]) {
+    let mut vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..24 {
+        let (p, q) = [(0usize, 1usize), (0, 2), (1, 2)]
+            .into_iter()
+            .max_by(|&(ap, aq), &(bp, bq)| {
+                matrix[ap][aq].abs().total_cmp(&matrix[bp][bq].abs())
+            })
+            .unwrap();
+        if matrix[p][q].abs() <= 1e-12 {
+            break;
+        }
+        let angle = 0.5 * (2.0 * matrix[p][q]).atan2(matrix[q][q] - matrix[p][p]);
+        let (sine, cosine) = angle.sin_cos();
+        for row in 0..3 {
+            let (mp, mq) = (matrix[row][p], matrix[row][q]);
+            matrix[row][p] = cosine * mp - sine * mq;
+            matrix[row][q] = sine * mp + cosine * mq;
+        }
+        for column in 0..3 {
+            let (mp, mq) = (matrix[p][column], matrix[q][column]);
+            matrix[p][column] = cosine * mp - sine * mq;
+            matrix[q][column] = sine * mp + cosine * mq;
+        }
+        for row in 0..3 {
+            let (vp, vq) = (vectors[row][p], vectors[row][q]);
+            vectors[row][p] = cosine * vp - sine * vq;
+            vectors[row][q] = sine * vp + cosine * vq;
+        }
+    }
+    let mut axes = (0..3)
+        .map(|axis| {
+            (
+                matrix[axis][axis].max(0.0),
+                [vectors[0][axis], vectors[1][axis], vectors[2][axis]],
+            )
+        })
+        .collect::<Vec<_>>();
+    axes.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let moments = [axes[0].0, axes[1].0, axes[2].0];
+    let directions = if (moments[2] - moments[0]).abs() <= moments[2].abs().max(1.0) * 1e-10 {
+        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    } else {
+        [
+            axes[0].1[0], axes[0].1[1], axes[0].1[2], axes[1].1[0], axes[1].1[1],
+            axes[1].1[2], axes[2].1[0], axes[2].1[1], axes[2].1[2],
+        ]
+    };
+    (moments, directions)
 }
 
 /// One tolerance policy for a body's faces and edges.
@@ -4493,11 +4653,19 @@ mod tests {
             let solid = cuboid(origin, [2.0, 3.0, 4.0]).unwrap();
             let mut mesh = self::body(&solid, default_angle(), TOL);
             for _ in 0..2 {
-                let (volume, centroid) = mesh.mass_properties().unwrap();
-                assert!((volume - 24.0).abs() < 1e-9);
+                let properties = mesh.inertial_properties().unwrap();
+                assert!((properties.volume - 24.0).abs() < 1e-9);
                 for axis in 0..3 {
-                    assert!((centroid[axis] - origin[axis] - [1.0, 1.5, 2.0][axis]).abs() < 1e-6);
+                    assert!(
+                        (properties.centroid[axis]
+                            - origin[axis]
+                            - [1.0, 1.5, 2.0][axis])
+                            .abs()
+                            < 1e-6
+                    );
+                    assert!((properties.principal_moments[axis] - [26.0, 40.0, 50.0][axis]).abs() < 1e-8);
                 }
+                assert!((mesh.surface_area().unwrap() - 52.0).abs() < 1e-9);
                 for triangle in &mut mesh.triangles {
                     triangle.swap(1, 2);
                 }

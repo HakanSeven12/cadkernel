@@ -15,6 +15,31 @@ pub struct MassProperties {
     pub radii_of_gyration: [f64; 3],
 }
 
+impl MassProperties {
+    /// Return the same body translated in world space.
+    pub fn translated(mut self, delta: [f64; 3]) -> Self {
+        let old = self.centroid;
+        let new = [old[0] + delta[0], old[1] + delta[1], old[2] + delta[2]];
+        self.moment_of_inertia[0] += self.volume
+            * (new[1] * new[1] + new[2] * new[2] - old[1] * old[1] - old[2] * old[2]);
+        self.moment_of_inertia[1] += self.volume
+            * (new[0] * new[0] + new[2] * new[2] - old[0] * old[0] - old[2] * old[2]);
+        self.moment_of_inertia[2] += self.volume
+            * (new[0] * new[0] + new[1] * new[1] - old[0] * old[0] - old[1] * old[1]);
+        self.product_of_inertia[0] -=
+            self.volume * (new[0] * new[1] - old[0] * old[1]);
+        self.product_of_inertia[1] -=
+            self.volume * (new[1] * new[2] - old[1] * old[2]);
+        self.product_of_inertia[2] -=
+            self.volume * (new[2] * new[0] - old[2] * old[0]);
+        self.radii_of_gyration = self
+            .moment_of_inertia
+            .map(|moment| (moment.max(0.0) / self.volume).sqrt());
+        self.centroid = new;
+        self
+    }
+}
+
 /// Exact properties for complete analytic spheres and circular cylinders,
 /// including the concentric closed shells produced by [`super::shell`].
 pub fn analytic_mass_properties(body: &Body) -> Option<MassProperties> {
