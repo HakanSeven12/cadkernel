@@ -76,7 +76,7 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 .and_then(|ring| body.faces.get(ring.owner))
                 .ok_or(Unappendable::Inconsistent)?;
             let needs_curve = matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_)));
-            match add_pcurve(document, curve) {
+            match add_pcurve(document, curve, ids.surface(face.surface)) {
                 Some(id) => {
                     ids.pcurves.insert(key, id);
                 }
@@ -405,7 +405,11 @@ fn add_curve(document: &mut SatDocument, curve: &Curve3) -> Option<i32> {
     ))
 }
 
-fn add_pcurve(document: &mut SatDocument, curve: &Curve2) -> Option<i32> {
+fn add_pcurve(
+    document: &mut SatDocument,
+    curve: &Curve2,
+    support_surface: i32,
+) -> Option<i32> {
     let (degree, knots, controls, weights, rational, closed, range) = match curve {
         Curve2::Line(line) => (
             1,
@@ -435,6 +439,7 @@ fn add_pcurve(document: &mut SatDocument, curve: &Curve2) -> Option<i32> {
         &controls,
         rational.then_some(weights.as_slice()),
         0.0,
+        support_surface,
         range,
     ))
 }
