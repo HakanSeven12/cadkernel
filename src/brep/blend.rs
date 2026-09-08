@@ -4,7 +4,7 @@ use super::geometry::{Circle3, Curve3, Cylinder, Line3, Surface};
 use super::topology::{Body, Coedge, Edge, EdgeKey, Face, FaceKey, Loop, Lump, Shell, Vertex};
 use super::Provenance;
 use crate::space::{Plane, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::{PI, TAU};
 
 #[derive(Clone, Copy)]
@@ -18,6 +18,7 @@ struct Halfspace {
 struct EdgeFrame {
     point: Vec3,
     axis: Vec3,
+    faces: [FaceKey; 2],
     first_normal: Vec3,
     second_normal: Vec3,
     first_inward: Vec3,
@@ -32,16 +33,401 @@ struct ExistingFillet {
     forward: bool,
 }
 
+/// Why one or more selected edges could not be chamfered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChamferError {
+    EmptySelection,
+    InvalidDistance,
+    UnknownEdge,
+    UnknownBaseFace,
+    EdgeOutsideBaseFace(EdgeKey),
+    InvalidBodyTopology,
+    UnsupportedBodyTopology,
+    UnsupportedEdgeCurve(EdgeKey),
+    NonManifoldEdge(EdgeKey),
+    UnsupportedAdjacentSurface(EdgeKey),
+    DegenerateGeometry(EdgeKey),
+    UnsupportedBodySurface,
+    NonConvexBody,
+    UnsupportedExistingFillet,
+    DistanceTooLargeOrInteracting,
+    InvalidResult,
+}
+
+impl std::fmt::Display for ChamferError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptySelection => formatter.write_str("no edges were selected"),
+            Self::InvalidDistance => {
+                formatter.write_str("chamfer distances must be finite and positive")
+            }
+            Self::UnknownEdge => formatter.write_str("a selected edge does not belong to the body"),
+            Self::UnknownBaseFace => formatter.write_str("the base face does not belong to the body"),
+            Self::EdgeOutsideBaseFace(edge) => write!(
+                formatter,
+                "selected edge {edge:?} does not belong to the common base face"
+            ),
+            Self::InvalidBodyTopology => formatter.write_str("the input body has invalid topology"),
+            Self::UnsupportedBodyTopology => formatter.write_str(
+                "chamfering currently requires one lump, one shell and faces without holes",
+            ),
+            Self::UnsupportedEdgeCurve(edge) => {
+                write!(formatter, "selected edge {edge:?} is not straight")
+            }
+            Self::NonManifoldEdge(edge) => write!(
+                formatter,
+                "selected edge {edge:?} is not shared by exactly two faces"
+            ),
+            Self::UnsupportedAdjacentSurface(edge) => write!(
+                formatter,
+                "selected edge {edge:?} is not bounded by two planar faces"
+            ),
+            Self::DegenerateGeometry(edge) => {
+                write!(formatter, "selected edge {edge:?} has degenerate geometry")
+            }
+            Self::UnsupportedBodySurface => formatter.write_str(
+                "the body contains a surface this convex planar chamfer cannot preserve",
+            ),
+            Self::NonConvexBody => {
+                formatter.write_str("the body is not a convex intersection of planar halfspaces")
+            }
+            Self::UnsupportedExistingFillet => formatter.write_str(
+                "an existing cylindrical face is not a supported constant edge fillet",
+            ),
+            Self::DistanceTooLargeOrInteracting => formatter.write_str(
+                "a distance removes the body or makes selected chamfer regions interact",
+            ),
+            Self::InvalidResult => formatter.write_str("the chamfered body did not validate"),
+        }
+    }
+}
+
+impl std::error::Error for ChamferError {}
+
 /// Cuts a symmetric chamfer at one straight edge.
 pub fn chamfer(body: &Body, edge: EdgeKey, distance: f64) -> Option<Body> {
-    if !distance.is_finite() || distance <= 0.0 {
+    let frame = edge_frame(body, edge)?;
+    chamfer_edges(body, &[edge], frame.faces[0], distance, distance).ok()
+}
+
+/// Bevels several edges on one base face in one atomic operation.
+pub fn chamfer_edges(
+    body: &Body,
+    selected: &[EdgeKey],
+    base_face: FaceKey,
+    base_distance: f64,
+    other_distance: f64,
+) -> Result<Body, ChamferError> {
+    if !base_distance.is_finite()
+        || !other_distance.is_finite()
+        || base_distance <= 0.0
+        || other_distance <= 0.0
+    {
+        return Err(ChamferError::InvalidDistance);
+    }
+    if selected.is_empty() {
+        return Err(ChamferError::EmptySelection);
+    }
+    if !body.validate().is_empty() {
+        return Err(ChamferError::InvalidBodyTopology);
+    }
+    if !body.faces.contains(base_face) {
+        return Err(ChamferError::UnknownBaseFace);
+    }
+    if selected.iter().any(|edge| !body.edges.contains(*edge)) {
+        return Err(ChamferError::UnknownEdge);
+    }
+
+    let mut selected = selected.to_vec();
+    selected.sort_by_key(EdgeKey::slot);
+    selected.dedup();
+    if let Some(result) = super::chamfer_circular::chamfer_circular(
+        body,
+        &selected,
+        base_face,
+        base_distance,
+        other_distance,
+    ) {
+        return result;
+    }
+    if let Some(result) = super::chamfer_prismatic::chamfer_prismatic(
+        body,
+        &selected,
+        base_face,
+        base_distance,
+        other_distance,
+    ) {
+        return result;
+    }
+    let operation_tolerance = tolerance_body(body);
+    if is_open_sheet(body) {
+        return chamfer_sheet(
+            body,
+            &selected,
+            base_face,
+            base_distance,
+            other_distance,
+            operation_tolerance,
+        );
+    }
+    validate_chamfer_body(body)?;
+    let existing = existing_fillets(body).ok_or(ChamferError::UnsupportedExistingFillet)?;
+    let mut frames = Vec::with_capacity(selected.len());
+    for edge in selected {
+        validate_chamfer_edge(body, edge)?;
+        let frame = edge_frame(body, edge).ok_or(ChamferError::DegenerateGeometry(edge))?;
+        if !frame.faces.contains(&base_face) {
+            return Err(ChamferError::EdgeOutsideBaseFace(edge));
+        }
+        frames.push((edge, frame));
+    }
+    let mut halfspaces = frames[0].1.halfspaces.clone();
+    for (edge, frame) in &frames {
+        let distances = if frame.faces[0] == base_face {
+            (base_distance, other_distance)
+        } else {
+            (other_distance, base_distance)
+        };
+        let cut = cut_halfspace_distances(frame, distances.0, distances.1)
+            .ok_or(ChamferError::DegenerateGeometry(*edge))?;
+        halfspaces.push(cut);
+    }
+    let (mut result, _) =
+        convex_body(&halfspaces).ok_or(ChamferError::DistanceTooLargeOrInteracting)?;
+    restore_fillets(&mut result, &existing).ok_or(ChamferError::UnsupportedExistingFillet)?;
+    if !result.validate().is_empty() || result.worst_vertex_gap() > operation_tolerance {
+        return Err(ChamferError::InvalidResult);
+    }
+    Ok(result)
+}
+
+fn is_open_sheet(body: &Body) -> bool {
+    body.edges.iter().any(|(_, edge)| edge.coedges.len() == 1)
+        && body
+            .edges
+            .iter()
+            .all(|(_, edge)| !edge.coedges.is_empty() && edge.coedges.len() <= 2)
+}
+
+fn chamfer_sheet(
+    body: &Body,
+    selected: &[EdgeKey],
+    base_face: FaceKey,
+    base_distance: f64,
+    other_distance: f64,
+    operation_tolerance: f64,
+) -> Result<Body, ChamferError> {
+    if body.roots.len() != 1
+        || body
+            .lumps
+            .get(body.roots[0])
+            .is_none_or(|lump| lump.shells.len() != 1)
+        || body.faces.iter().any(|(_, face)| face.loops.len() != 1)
+        || body.faces.iter().any(|(_, face)| {
+            !matches!(body.surfaces.get(face.surface), Some(Surface::Plane(_)))
+        })
+    {
+        return Err(ChamferError::UnsupportedBodyTopology);
+    }
+    let (supports, boundaries) = sheet_halfspaces(body, operation_tolerance)
+        .ok_or(ChamferError::UnsupportedBodySurface)?;
+    let mut halfspaces = supports
+        .iter()
+        .map(|(_, halfspace)| *halfspace)
+        .chain(boundaries)
+        .collect::<Vec<_>>();
+    let mut cuts = Vec::with_capacity(selected.len());
+    for edge in selected {
+        validate_chamfer_edge(body, *edge)?;
+        let frame = sheet_edge_frame(body, *edge, &supports, halfspaces.clone())
+            .ok_or(ChamferError::DegenerateGeometry(*edge))?;
+        if !frame.faces.contains(&base_face) {
+            return Err(ChamferError::EdgeOutsideBaseFace(*edge));
+        }
+        let distances = if frame.faces[0] == base_face {
+            (base_distance, other_distance)
+        } else {
+            (other_distance, base_distance)
+        };
+        let cut = cut_halfspace_distances(&frame, distances.0, distances.1)
+            .ok_or(ChamferError::DegenerateGeometry(*edge))?;
+        halfspaces.push(cut);
+        cuts.push(cut);
+    }
+    let (closed, _) =
+        convex_body(&halfspaces).ok_or(ChamferError::DistanceTooLargeOrInteracting)?;
+    let kept = supports
+        .iter()
+        .map(|(_, halfspace)| *halfspace)
+        .chain(cuts)
+        .filter_map(|halfspace| face_on(&closed, halfspace))
+        .collect::<HashSet<_>>();
+    if kept.len() < supports.len() + selected.len() {
+        return Err(ChamferError::DistanceTooLargeOrInteracting);
+    }
+
+    let mut result = Body::new();
+    let lump = result.lumps.insert(Lump {
+        shells: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let shell = result.shells.insert(Shell {
+        faces: Vec::new(),
+        owner: lump,
+        provenance: Provenance::Synthesized,
+    });
+    let mut kept = kept.into_iter().collect::<Vec<_>>();
+    kept.sort_by_key(FaceKey::slot);
+    for face in kept {
+        super::boolean::copy_face(&mut result, &closed, face, shell, false)
+            .map_err(|_| ChamferError::InvalidResult)?;
+    }
+    result
+        .lumps
+        .get_mut(lump)
+        .ok_or(ChamferError::InvalidResult)?
+        .shells = vec![shell];
+    result.roots = vec![lump];
+    if !result.validate().is_empty() || result.worst_vertex_gap() > operation_tolerance {
+        return Err(ChamferError::InvalidResult);
+    }
+    Ok(result)
+}
+
+fn sheet_halfspaces(
+    body: &Body,
+    operation_tolerance: f64,
+) -> Option<(Vec<(FaceKey, Halfspace)>, Vec<Halfspace>)> {
+    let points = body
+        .vertices
+        .iter()
+        .map(|(_, vertex)| Vec3::from(vertex.point))
+        .collect::<Vec<_>>();
+    let centre = points.iter().copied().fold(Vec3::ZERO, |sum, point| sum + point)
+        / points.len() as f64;
+    let mut supports = Vec::new();
+    for (face_key, face) in body.faces.iter() {
+        let Surface::Plane(plane) = body.surfaces.get(face.surface)? else {
+            return None;
+        };
+        let mut normal = Vec3::from(plane.normal()?);
+        let mut offset = normal.dot(Vec3::from(plane.origin));
+        if normal.dot(centre) > offset {
+            normal = -normal;
+            offset = -offset;
+        }
+        supports.push((
+            face_key,
+            Halfspace {
+                origin: Vec3::from(plane.origin),
+                normal,
+                offset,
+                added: false,
+            },
+        ));
+    }
+
+    let mut boundaries = Vec::new();
+    for (_, edge) in body.edges.iter().filter(|(_, edge)| edge.coedges.len() == 1) {
+        let coedge = body.coedges.get(edge.coedges[0])?;
+        let face = body.loops.get(coedge.owner)?.owner;
+        let face_normal = supports
+            .iter()
+            .find(|(key, _)| *key == face)?
+            .1
+            .normal;
+        let start = Vec3::from(body.vertices.get(edge.start)?.point);
+        let end = Vec3::from(body.vertices.get(edge.end)?.point);
+        let axis = (end - start).normalize()?;
+        let face_points = body
+            .face_coedges(face)
+            .into_iter()
+            .filter_map(|key| body.coedges.get(key))
+            .filter_map(|coedge| body.edges.get(coedge.edge))
+            .flat_map(|edge| [edge.start, edge.end])
+            .filter_map(|vertex| body.vertices.get(vertex))
+            .map(|vertex| Vec3::from(vertex.point))
+            .collect::<Vec<_>>();
+        let face_centre = face_points
+            .iter()
+            .copied()
+            .fold(Vec3::ZERO, |sum, point| sum + point)
+            / face_points.len() as f64;
+        let mut normal = face_normal.cross(axis).normalize()?;
+        let mut offset = normal.dot(start);
+        if normal.dot(face_centre) > offset + operation_tolerance {
+            normal = -normal;
+            offset = -offset;
+        }
+        if supports.iter().any(|(_, candidate)| {
+            same_halfspace(*candidate, normal, offset, operation_tolerance)
+        }) || boundaries.iter().any(|candidate| {
+            same_halfspace(*candidate, normal, offset, operation_tolerance)
+        }) {
+            continue;
+        }
+        boundaries.push(Halfspace {
+            origin: start,
+            normal,
+            offset,
+            added: false,
+        });
+    }
+    Some((supports, boundaries))
+}
+
+fn same_halfspace(
+    candidate: Halfspace,
+    normal: Vec3,
+    offset: f64,
+    operation_tolerance: f64,
+) -> bool {
+    candidate.normal.dot(normal) > 1.0 - 1.0e-8
+        && (candidate.offset - offset).abs() <= operation_tolerance
+}
+
+fn sheet_edge_frame(
+    body: &Body,
+    edge_key: EdgeKey,
+    supports: &[(FaceKey, Halfspace)],
+    halfspaces: Vec<Halfspace>,
+) -> Option<EdgeFrame> {
+    let edge = body.edges.get(edge_key)?;
+    if !matches!(body.curves.get(edge.curve)?, Curve3::Line(_)) || edge.coedges.len() != 2 {
         return None;
     }
-    let existing = existing_fillets(body)?;
-    let frame = edge_frame(body, edge)?;
-    let (_, mut result, _) = cut(&frame, distance)?;
-    restore_fillets(&mut result, &existing)?;
-    Some(result)
+    let start = Vec3::from(body.vertices.get(edge.start)?.point);
+    let end = Vec3::from(body.vertices.get(edge.end)?.point);
+    let axis = (end - start).normalize()?;
+    let face_of = |coedge| {
+        let loop_key = body.coedges.get(coedge)?.owner;
+        Some(body.loops.get(loop_key)?.owner)
+    };
+    let faces = [face_of(edge.coedges[0])?, face_of(edge.coedges[1])?];
+    let normal_of = |face| {
+        supports
+            .iter()
+            .find(|(key, _)| *key == face)
+            .map(|(_, value)| value.normal)
+    };
+    let first_normal = normal_of(faces[0])?;
+    let second_normal = normal_of(faces[1])?;
+    let dot = first_normal.dot(second_normal);
+    if dot.abs() > 1.0 - 1.0e-9 {
+        return None;
+    }
+    let first_inward = -(second_normal - first_normal * dot).normalize()?;
+    let second_inward = -(first_normal - second_normal * dot).normalize()?;
+    Some(EdgeFrame {
+        point: start,
+        axis,
+        faces,
+        first_normal,
+        second_normal,
+        first_inward,
+        second_inward,
+        halfspaces,
+    })
 }
 
 /// Rounds one straight edge with a constant-radius cylindrical face.
@@ -99,26 +485,42 @@ fn circle_parameters(plane: &Plane, start: Vec3, end: Vec3) -> Option<(f64, f64)
 }
 
 fn cut(frame: &EdgeFrame, setback: f64) -> Option<(Halfspace, Body, FaceKey)> {
-    if !setback.is_finite() || setback <= 0.0 {
-        return None;
-    }
-    let first = frame.point + frame.first_inward * setback;
-    let second = frame.point + frame.second_inward * setback;
-    let normal = (frame.first_normal + frame.second_normal).normalize()?;
-    let offset = 0.5 * (normal.dot(first) + normal.dot(second));
-    let added = Halfspace {
-        origin: first,
-        normal,
-        offset,
-        added: true,
-    };
-    if normal.dot(frame.point) <= offset + tolerance(&[frame.point, first, second]) {
-        return None;
-    }
+    let added = cut_halfspace_distances(frame, setback, setback)?;
     let mut halfspaces = frame.halfspaces.clone();
     halfspaces.push(added);
     let (result, face) = convex_body(&halfspaces)?;
     Some((added, result, face))
+}
+
+fn cut_halfspace_distances(
+    frame: &EdgeFrame,
+    first_setback: f64,
+    second_setback: f64,
+) -> Option<Halfspace> {
+    if !first_setback.is_finite()
+        || !second_setback.is_finite()
+        || first_setback <= 0.0
+        || second_setback <= 0.0
+    {
+        return None;
+    }
+    let first = frame.point + frame.first_inward * first_setback;
+    let second = frame.point + frame.second_inward * second_setback;
+    let chord = second - first;
+    let mut normal = frame.axis.cross(chord).normalize()?;
+    if normal.dot(frame.first_normal + frame.second_normal) < 0.0 {
+        normal = -normal;
+    }
+    let offset = 0.5 * (normal.dot(first) + normal.dot(second));
+    if normal.dot(frame.point) <= offset + tolerance(&[frame.point, first, second]) {
+        return None;
+    }
+    Some(Halfspace {
+        origin: first,
+        normal,
+        offset,
+        added: true,
+    })
 }
 
 fn edge_frame(body: &Body, edge_key: EdgeKey) -> Option<EdgeFrame> {
@@ -173,12 +575,77 @@ fn edge_frame(body: &Body, edge_key: EdgeKey) -> Option<EdgeFrame> {
     Some(EdgeFrame {
         point: start,
         axis,
+        faces,
         first_normal,
         second_normal,
         first_inward,
         second_inward,
         halfspaces,
     })
+}
+
+fn validate_chamfer_edge(body: &Body, edge_key: EdgeKey) -> Result<(), ChamferError> {
+    let edge = body.edges.get(edge_key).ok_or(ChamferError::UnknownEdge)?;
+    if !matches!(body.curves.get(edge.curve), Some(Curve3::Line(_))) {
+        return Err(ChamferError::UnsupportedEdgeCurve(edge_key));
+    }
+    if edge.coedges.len() != 2 {
+        return Err(ChamferError::NonManifoldEdge(edge_key));
+    }
+    let start = body
+        .vertices
+        .get(edge.start)
+        .ok_or(ChamferError::InvalidBodyTopology)?;
+    let end = body
+        .vertices
+        .get(edge.end)
+        .ok_or(ChamferError::InvalidBodyTopology)?;
+    if (Vec3::from(end.point) - Vec3::from(start.point))
+        .normalize()
+        .is_none()
+    {
+        return Err(ChamferError::DegenerateGeometry(edge_key));
+    }
+    for coedge in &edge.coedges {
+        let coedge = body
+            .coedges
+            .get(*coedge)
+            .ok_or(ChamferError::InvalidBodyTopology)?;
+        let ring = body
+            .loops
+            .get(coedge.owner)
+            .ok_or(ChamferError::InvalidBodyTopology)?;
+        let face = body
+            .faces
+            .get(ring.owner)
+            .ok_or(ChamferError::InvalidBodyTopology)?;
+        let Some(Surface::Plane(plane)) = body.surfaces.get(face.surface) else {
+            return Err(ChamferError::UnsupportedAdjacentSurface(edge_key));
+        };
+        if plane.normal().is_none() {
+            return Err(ChamferError::DegenerateGeometry(edge_key));
+        }
+    }
+    Ok(())
+}
+
+fn validate_chamfer_body(body: &Body) -> Result<(), ChamferError> {
+    if body.roots.len() != 1
+        || body.lumps.len() != 1
+        || body.shells.len() != 1
+        || body.faces.iter().any(|(_, face)| face.loops.len() != 1)
+    {
+        return Err(ChamferError::UnsupportedBodyTopology);
+    }
+    if body.faces.iter().any(|(_, face)| {
+        !matches!(
+            body.surfaces.get(face.surface),
+            Some(Surface::Plane(_) | Surface::Cylinder(_))
+        )
+    }) {
+        return Err(ChamferError::UnsupportedBodySurface);
+    }
+    Ok(())
 }
 
 fn existing_fillets(body: &Body) -> Option<Vec<ExistingFillet>> {
