@@ -1441,6 +1441,13 @@ pub fn rebuild_body(
             let document = value
                 .acis_data
                 .parse()
+                .or_else(|| {
+                    (value.acis_data.is_binary && !value.acis_data.sab_data.is_empty())
+                        .then(|| {
+                            cadcodec::entities::acis::SabReader::read(&value.acis_data.sab_data).ok()
+                        })
+                        .flatten()
+                })
                 .ok_or(HistoryRebuildError::InvalidBrep)?;
             let (bodies, _) = super::lift(&document);
             finish(bodies.into_iter().next(), value.base.transform)
