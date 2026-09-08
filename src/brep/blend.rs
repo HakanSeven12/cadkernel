@@ -20,6 +20,7 @@ struct Halfspace {
 struct EdgeFrame {
     point: Vec3,
     axis: Vec3,
+    faces: [FaceKey; 2],
     first_normal: Vec3,
     second_normal: Vec3,
     first_inward: Vec3,
@@ -122,18 +123,155 @@ impl fmt::Display for FilletError {
 
 impl std::error::Error for FilletError {}
 
+/// Why one or more selected edges could not be chamfered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChamferError {
+    EmptySelection,
+    InvalidDistance,
+    UnknownEdge,
+    UnknownBaseFace,
+    EdgeOutsideBaseFace(EdgeKey),
+    InvalidBodyTopology,
+    UnsupportedBodyTopology,
+    UnsupportedEdgeCurve(EdgeKey),
+    NonManifoldEdge(EdgeKey),
+    UnsupportedAdjacentSurface(EdgeKey),
+    DegenerateGeometry(EdgeKey),
+    UnsupportedBodySurface,
+    NonConvexBody,
+    UnsupportedExistingFillet,
+    DistanceTooLargeOrInteracting,
+    InvalidResult,
+}
+
+impl fmt::Display for ChamferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySelection => formatter.write_str("no edges were selected"),
+            Self::InvalidDistance => {
+                formatter.write_str("chamfer distances must be finite and positive")
+            }
+            Self::UnknownEdge => formatter.write_str("a selected edge does not belong to the body"),
+            Self::UnknownBaseFace => formatter.write_str("the base face does not belong to the body"),
+            Self::EdgeOutsideBaseFace(edge) => write!(
+                formatter,
+                "selected edge {edge:?} does not belong to the common base face"
+            ),
+            Self::InvalidBodyTopology => formatter.write_str("the input body has invalid topology"),
+            Self::UnsupportedBodyTopology => formatter.write_str(
+                "chamfering currently requires one lump, one shell and faces without holes",
+            ),
+            Self::UnsupportedEdgeCurve(edge) => {
+                write!(formatter, "selected edge {edge:?} is not straight")
+            }
+            Self::NonManifoldEdge(edge) => write!(
+                formatter,
+                "selected edge {edge:?} is not shared by exactly two faces"
+            ),
+            Self::UnsupportedAdjacentSurface(edge) => write!(
+                formatter,
+                "selected edge {edge:?} is not bounded by two planar faces"
+            ),
+            Self::DegenerateGeometry(edge) => {
+                write!(formatter, "selected edge {edge:?} has degenerate geometry")
+            }
+            Self::UnsupportedBodySurface => formatter.write_str(
+                "the body contains a surface this convex planar chamfer cannot preserve",
+            ),
+            Self::NonConvexBody => {
+                formatter.write_str("the body is not a convex intersection of planar halfspaces")
+            }
+            Self::UnsupportedExistingFillet => formatter.write_str(
+                "an existing cylindrical face is not a supported constant edge fillet",
+            ),
+            Self::DistanceTooLargeOrInteracting => formatter.write_str(
+                "a distance removes the body or makes selected chamfer regions interact",
+            ),
+            Self::InvalidResult => formatter.write_str("the chamfered body did not validate"),
+        }
+    }
+}
+
+impl std::error::Error for ChamferError {}
+
 /// Cuts a symmetric chamfer at one straight edge.
 pub fn chamfer(body: &Body, edge: EdgeKey, distance: f64) -> Option<Body> {
-    if !distance.is_finite() || distance <= 0.0 {
-        return None;
-    }
-    let existing = existing_fillets(body)?;
-    let corners = existing_corners(body)?;
     let frame = edge_frame(body, edge)?;
+    chamfer_edges(body, &[edge], frame.faces[0], distance, distance).ok()
+}
+
+/// Bevels several straight edges on one base face in one atomic operation.
+///
+/// `base_distance` is measured on `base_face`; `other_distance` is measured
+/// on the other face adjacent to each selected edge. Selection order and
+/// duplicate keys do not affect the result.
+pub fn chamfer_edges(
+    body: &Body,
+    selected: &[EdgeKey],
+    base_face: FaceKey,
+    base_distance: f64,
+    other_distance: f64,
+) -> Result<Body, ChamferError> {
+    if !base_distance.is_finite()
+        || !other_distance.is_finite()
+        || base_distance <= 0.0
+        || other_distance <= 0.0
+    {
+        return Err(ChamferError::InvalidDistance);
+    }
+    if selected.is_empty() {
+        return Err(ChamferError::EmptySelection);
+    }
+    if !body.validate().is_empty() {
+        return Err(ChamferError::InvalidBodyTopology);
+    }
+    if !body.faces.contains(base_face) {
+        return Err(ChamferError::UnknownBaseFace);
+    }
+    if selected.iter().any(|edge| !body.edges.contains(*edge)) {
+        return Err(ChamferError::UnknownEdge);
+    }
+
+    let mut selected = selected.to_vec();
+    selected.sort_by_key(EdgeKey::slot);
+    selected.dedup();
     let tolerance = operation_tolerance(&[body]);
-    let (_, mut result, _) = cut(&frame, distance, tolerance)?;
-    restore_fillets(&mut result, &existing, &corners, tolerance)?;
-    Some(result)
+    let existing = existing_fillets(body).ok_or(ChamferError::UnsupportedExistingFillet)?;
+    let corners = existing_corners(body).ok_or(ChamferError::UnsupportedExistingFillet)?;
+    validate_chamfer_body(body, &existing, tolerance)?;
+
+    let mut frames = Vec::with_capacity(selected.len());
+    for edge in selected {
+        validate_chamfer_edge(body, edge)?;
+        let frame = edge_frame(body, edge).ok_or(ChamferError::DegenerateGeometry(edge))?;
+        if !frame.faces.contains(&base_face) {
+            return Err(ChamferError::EdgeOutsideBaseFace(edge));
+        }
+        frames.push((edge, frame));
+    }
+
+    let mut halfspaces = frames[0].1.halfspaces.clone();
+    for (edge, frame) in &frames {
+        let distances = if frame.faces[0] == base_face {
+            (base_distance, other_distance)
+        } else {
+            (other_distance, base_distance)
+        };
+        let cut = cut_halfspace_distances(frame, distances.0, distances.1, tolerance)
+            .ok_or(ChamferError::DegenerateGeometry(*edge))?;
+        halfspaces.push(cut);
+    }
+    let (mut result, _) = convex_body(&halfspaces, tolerance)
+        .ok_or(ChamferError::DistanceTooLargeOrInteracting)?;
+    restore_fillets(&mut result, &existing, &corners, tolerance)
+        .ok_or(ChamferError::UnsupportedExistingFillet)?;
+    if !result.validate().is_empty()
+        || result.worst_vertex_gap() > tolerance
+        || !blend_boundaries_fit(&result, tolerance)
+    {
+        return Err(ChamferError::InvalidResult);
+    }
+    Ok(result)
 }
 
 /// Rounds one straight edge with a constant-radius cylindrical face.
@@ -271,25 +409,30 @@ fn circle_parameters(plane: &Plane, start: Vec3, end: Vec3) -> Option<(f64, f64)
     (span > 1e-12).then_some((start, start + span))
 }
 
-fn cut(
-    frame: &EdgeFrame,
-    setback: f64,
-    tolerance: f64,
-) -> Option<(Halfspace, Body, FaceKey)> {
-    let added = cut_halfspace(frame, setback, tolerance)?;
-    let mut halfspaces = frame.halfspaces.clone();
-    halfspaces.push(added);
-    let (result, face) = convex_body(&halfspaces, tolerance)?;
-    Some((added, result, face))
+fn cut_halfspace(frame: &EdgeFrame, setback: f64, tolerance: f64) -> Option<Halfspace> {
+    cut_halfspace_distances(frame, setback, setback, tolerance)
 }
 
-fn cut_halfspace(frame: &EdgeFrame, setback: f64, tolerance: f64) -> Option<Halfspace> {
-    if !setback.is_finite() || setback <= 0.0 {
+fn cut_halfspace_distances(
+    frame: &EdgeFrame,
+    first_setback: f64,
+    second_setback: f64,
+    tolerance: f64,
+) -> Option<Halfspace> {
+    if !first_setback.is_finite()
+        || !second_setback.is_finite()
+        || first_setback <= 0.0
+        || second_setback <= 0.0
+    {
         return None;
     }
-    let first = frame.point + frame.first_inward * setback;
-    let second = frame.point + frame.second_inward * setback;
-    let normal = (frame.first_normal + frame.second_normal).normalize()?;
+    let first = frame.point + frame.first_inward * first_setback;
+    let second = frame.point + frame.second_inward * second_setback;
+    let chord = second - first;
+    let mut normal = frame.axis.cross(chord).normalize()?;
+    if normal.dot(frame.first_normal + frame.second_normal) < 0.0 {
+        normal = -normal;
+    }
     let offset = 0.5 * (normal.dot(first) + normal.dot(second));
     let added = Halfspace {
         origin: first,
@@ -382,6 +525,7 @@ fn edge_frame(body: &Body, edge_key: EdgeKey) -> Option<EdgeFrame> {
     Some(EdgeFrame {
         point: start,
         axis,
+        faces,
         first_normal,
         second_normal,
         first_inward,
@@ -710,6 +854,66 @@ fn face_on(body: &Body, halfspace: Halfspace, tolerance: f64) -> Option<FaceKey>
         (normal.dot(halfspace.normal) > 1.0 - 1e-8
             && (normal.dot(Vec3::from(plane.origin)) - halfspace.offset).abs() <= tolerance)
             .then_some(key)
+    })
+}
+
+fn validate_chamfer_edge(body: &Body, edge_key: EdgeKey) -> Result<(), ChamferError> {
+    let edge = body.edges.get(edge_key).ok_or(ChamferError::UnknownEdge)?;
+    if !matches!(body.curves.get(edge.curve), Some(Curve3::Line(_))) {
+        return Err(ChamferError::UnsupportedEdgeCurve(edge_key));
+    }
+    if edge.coedges.len() != 2 {
+        return Err(ChamferError::NonManifoldEdge(edge_key));
+    }
+    let start = body
+        .vertices
+        .get(edge.start)
+        .ok_or(ChamferError::InvalidBodyTopology)?;
+    let end = body
+        .vertices
+        .get(edge.end)
+        .ok_or(ChamferError::InvalidBodyTopology)?;
+    if (Vec3::from(end.point) - Vec3::from(start.point))
+        .normalize()
+        .is_none()
+    {
+        return Err(ChamferError::DegenerateGeometry(edge_key));
+    }
+    for coedge in &edge.coedges {
+        let coedge = body
+            .coedges
+            .get(*coedge)
+            .ok_or(ChamferError::InvalidBodyTopology)?;
+        let ring = body
+            .loops
+            .get(coedge.owner)
+            .ok_or(ChamferError::InvalidBodyTopology)?;
+        let face = body
+            .faces
+            .get(ring.owner)
+            .ok_or(ChamferError::InvalidBodyTopology)?;
+        let Some(Surface::Plane(plane)) = body.surfaces.get(face.surface) else {
+            return Err(ChamferError::UnsupportedAdjacentSurface(edge_key));
+        };
+        if plane.normal().is_none() {
+            return Err(ChamferError::DegenerateGeometry(edge_key));
+        }
+    }
+    Ok(())
+}
+
+fn validate_chamfer_body(
+    body: &Body,
+    existing: &[ExistingFillet],
+    tolerance: f64,
+) -> Result<(), ChamferError> {
+    validate_supported_body(body, existing, tolerance).map_err(|error| match error {
+        FilletError::InvalidBodyTopology => ChamferError::InvalidBodyTopology,
+        FilletError::UnsupportedBodyTopology => ChamferError::UnsupportedBodyTopology,
+        FilletError::UnsupportedBodySurface => ChamferError::UnsupportedBodySurface,
+        FilletError::NonConvexBody => ChamferError::NonConvexBody,
+        FilletError::UnsupportedExistingFillet => ChamferError::UnsupportedExistingFillet,
+        _ => ChamferError::InvalidBodyTopology,
     })
 }
 
