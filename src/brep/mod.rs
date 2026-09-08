@@ -31,6 +31,8 @@ pub mod blend;
 pub mod boolean;
 pub mod bounds;
 pub mod classify;
+mod fillet_circular;
+mod fillet_prismatic;
 pub mod geometry;
 pub mod imprint;
 pub mod intersect;
