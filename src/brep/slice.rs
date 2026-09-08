@@ -5,7 +5,7 @@
 //! entity, so a failed cut never makes the source disappear.
 
 use super::topology::{Body, FaceKey, Lump, Shell};
-use super::{body_bounds, combine, imprint, operation_tolerance, Operation, Placement, Provenance, Snag};
+use super::{body_bounds, combine, imprint, operation_tolerance, Containment, Operation, Placement, Provenance, Snag};
 use crate::space::{Plane, Vec3};
 
 /// The two non-empty bodies produced by a plane crossing a body.
@@ -47,6 +47,142 @@ pub fn slice_by_plane(body: &Body, plane: Plane) -> Result<Option<PlaneSlice>, S
     } else {
         split_sheet(body, plane, frame, tolerance)
     }
+}
+
+/// Splits a body with the oriented analytic face carried by an open sheet.
+///
+/// The cutter must contain one face.  Plane, cylinder, cone, sphere and torus
+/// sheets have exact signed-distance fields; spline sheets are refused until
+/// the kernel can classify their two sides without approximation.
+pub fn slice_by_surface(body: &Body, cutter: &Body) -> Result<Option<PlaneSlice>, Snag> {
+    let cutter_face = single_face(cutter).ok_or(Snag::CutRefused)?;
+    let cutter_node = cutter.faces.get(cutter_face).ok_or(Snag::CutRefused)?;
+    if matches!(
+        cutter.surfaces.get(cutter_node.surface),
+        None | Some(super::Surface::Nurbs(_))
+    ) {
+        return Err(Snag::NoClosedForm);
+    }
+    let tolerance = operation_tolerance(&[body, cutter]);
+    let mut divided = body.clone();
+    let mut divided_cutter = cutter.clone();
+    let report = imprint(&mut divided, &mut divided_cutter, tolerance)?;
+    if report.cuts == 0 {
+        return Ok(None);
+    }
+
+    let mut negative_faces = Vec::new();
+    let mut positive_faces = Vec::new();
+    for face in divided.face_keys() {
+        let point = super::boolean::interior_point(&divided, face, tolerance)
+            .ok_or(Snag::CutRefused)?;
+        let distance = surface_distance(cutter, point).ok_or(Snag::CutRefused)?;
+        if distance < -tolerance {
+            negative_faces.push(face);
+        } else if distance > tolerance {
+            positive_faces.push(face);
+        } else {
+            return Err(Snag::CutRefused);
+        }
+    }
+    if negative_faces.is_empty() || positive_faces.is_empty() {
+        return Ok(None);
+    }
+
+    let closed = body
+        .edges
+        .iter()
+        .filter(|(_, edge)| !edge.coedges.is_empty())
+        .all(|(_, edge)| edge.coedges.len() == 2);
+    if !closed {
+        return Ok(Some(PlaneSlice {
+            negative: copy_faces(&divided, &negative_faces)?,
+            positive: copy_faces(&divided, &positive_faces)?,
+        }));
+    }
+
+    let caps = divided_cutter
+        .face_keys()
+        .filter(|face| {
+            super::boolean::face_side(&divided_cutter, body, *face, tolerance)
+                == Containment::Inside
+        })
+        .collect::<Vec<_>>();
+    if caps.is_empty() {
+        return Err(Snag::CutRefused);
+    }
+    Ok(Some(PlaneSlice {
+        negative: copy_closed_side(
+            &divided,
+            &negative_faces,
+            &divided_cutter,
+            &caps,
+            false,
+        )?,
+        positive: copy_closed_side(
+            &divided,
+            &positive_faces,
+            &divided_cutter,
+            &caps,
+            true,
+        )?,
+    }))
+}
+
+/// Signed side of the analytic sheet used by [`slice_by_surface`].
+pub fn surface_side(cutter: &Body, point: [f64; 3]) -> Option<f64> {
+    let face = single_face(cutter)?;
+    let node = cutter.faces.get(face)?;
+    let surface = cutter.surfaces.get(node.surface)?;
+    (!matches!(surface, super::Surface::Nurbs(_)))
+        .then(|| surface.distance_to(point) * if node.forward { 1.0 } else { -1.0 })
+}
+
+fn single_face(body: &Body) -> Option<FaceKey> {
+    let mut faces = body.face_keys();
+    let face = faces.next()?;
+    faces.next().is_none().then_some(face)
+}
+
+fn surface_distance(cutter: &Body, point: [f64; 3]) -> Option<f64> {
+    surface_side(cutter, point)
+}
+
+fn copy_closed_side(
+    source: &Body,
+    faces: &[FaceKey],
+    cutter: &Body,
+    caps: &[FaceKey],
+    flip_caps: bool,
+) -> Result<Body, Snag> {
+    let mut result = Body::new();
+    let lump = result.lumps.insert(Lump {
+        shells: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let shell = result.shells.insert(Shell {
+        faces: Vec::new(),
+        owner: lump,
+        provenance: Provenance::Synthesized,
+    });
+    result.lumps.get_mut(lump).ok_or(Snag::CutRefused)?.shells.push(shell);
+    result.roots.push(lump);
+    for face in faces {
+        super::boolean::copy_face(&mut result, source, *face, shell, false)?;
+    }
+    for face in caps {
+        super::boolean::copy_face(&mut result, cutter, *face, shell, flip_caps)?;
+    }
+    super::boolean::orient_shell(&mut result)?;
+    if result
+        .edges
+        .iter()
+        .any(|(_, edge)| edge.coedges.len() != 2)
+        || !result.validate().is_empty()
+    {
+        return Err(Snag::CutRefused);
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Copy)]
