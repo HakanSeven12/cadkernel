@@ -98,6 +98,25 @@ pub fn shell(
     Ok(result)
 }
 
+/// Resolve a surface pick to a face supported by [`shell`].
+pub fn shell_face_at_point(body: &Body, point: [f64; 3]) -> Option<FaceKey> {
+    if point.iter().any(|value| !value.is_finite())
+        || (recognize_box(body).is_none()
+            && recognize_cylinder(body).is_none()
+            && recognize_sphere(body).is_none())
+    {
+        return None;
+    }
+    body.face_keys()
+        .filter_map(|key| {
+            let face = body.faces.get(key)?;
+            let surface = body.surfaces.get(face.surface)?;
+            Some((key, surface.distance_to(point).abs()))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(key, _)| key)
+}
+
 fn shell_box(
     body: &Body,
     shape: &BoxShape,
@@ -466,7 +485,7 @@ mod tests {
     #[test]
     fn removing_a_box_face_opens_a_valid_shell() {
         let solid = make::cuboid([0.0; 3], [6.0, 5.0, 4.0]).unwrap();
-        let removed = solid.face_keys().next().unwrap();
+        let removed = shell_face_at_point(&solid, [3.0, 2.5, 4.0]).unwrap();
         let result = shell(&solid, &[removed], 0.5).unwrap();
 
         assert!(result.validate().is_empty());

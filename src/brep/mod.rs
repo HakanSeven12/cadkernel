@@ -74,7 +74,7 @@ pub use presspull::{
     PlanarFaceProfile, PlanarIntersection, PresspullMode,
 };
 pub use slice::{slice_by_plane, slice_by_surface, surface_side, PlaneSlice};
-pub use shell::{shell, ShellError};
+pub use shell::{shell, shell_face_at_point, ShellError};
 pub use sweep::{
     extrude, extrude_region, extrude_surface, extrude_surface_region, revolve, revolve_region,
     revolve_surface, revolve_surface_region, sweep_along, sweep_along_deformed,
