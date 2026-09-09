@@ -68,14 +68,18 @@ pub fn thicken(body: &Body, distance: f64) -> Result<Body, ThickenError> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Patch {
-    u_start: f64,
-    u_sweep: f64,
-    v_start: f64,
-    v_sweep: f64,
+pub(crate) struct Patch {
+    pub(crate) u_start: f64,
+    pub(crate) u_sweep: f64,
+    pub(crate) v_start: f64,
+    pub(crate) v_sweep: f64,
 }
 
-fn rectangular_patch(body: &Body, face_key: FaceKey, surface: &Surface) -> Option<Patch> {
+pub(crate) fn rectangular_patch(
+    body: &Body,
+    face_key: FaceKey,
+    surface: &Surface,
+) -> Option<Patch> {
     let face = body.faces.get(face_key)?;
     if face.loops.len() != 1 {
         return None;

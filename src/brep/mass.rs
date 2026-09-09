@@ -43,7 +43,90 @@ impl MassProperties {
 /// Exact properties for complete analytic spheres and circular cylinders,
 /// including the concentric closed shells produced by [`super::shell`].
 pub fn analytic_mass_properties(body: &Body) -> Option<MassProperties> {
-    sphere_properties(body).or_else(|| cylinder_properties(body))
+    sphere_properties(body)
+        .or_else(|| cylindrical_sector_properties(body))
+        .or_else(|| cylinder_properties(body))
+}
+
+fn cylindrical_sector_properties(body: &Body) -> Option<MassProperties> {
+    let mut cylinders = Vec::new();
+    for face_key in body.face_keys() {
+        let face = body.faces.get(face_key)?;
+        match body.surfaces.get(face.surface)? {
+            Surface::Cylinder(cylinder) => cylinders.push((face_key, *cylinder)),
+            Surface::Plane(_) => {}
+            _ => return None,
+        }
+    }
+    if cylinders.len() != 2 {
+        return None;
+    }
+    cylinders.sort_by(|left, right| right.1.radius.total_cmp(&left.1.radius));
+    let (outer_face, outer) = cylinders[0];
+    let inner = cylinders[1].1;
+    let axis = Vec3::from(outer.base.normal()?).normalize()?;
+    let inner_axis = Vec3::from(inner.base.normal()?).normalize()?;
+    let scale = outer.radius.abs().max(1.0);
+    let outer_origin = Vec3::from(outer.base.origin);
+    let inner_origin = Vec3::from(inner.base.origin);
+    let inner_lateral = inner_origin - axis * (inner_origin - outer_origin).dot(axis);
+    if !outer.radius.is_finite()
+        || !inner.radius.is_finite()
+        || inner.radius <= 0.0
+        || inner.radius >= outer.radius
+        || inner_axis.dot(axis).abs() < 1.0 - 1e-8
+        || inner_lateral.distance(outer_origin) > scale * 1e-8
+    {
+        return None;
+    }
+    let patch = super::thicken::rectangular_patch(
+        body,
+        outer_face,
+        &Surface::Cylinder(outer),
+    )?;
+    let angle = patch.u_sweep;
+    let height = patch.v_sweep;
+    if !angle.is_finite()
+        || !height.is_finite()
+        || angle <= 0.0
+        || angle > 2.0 * PI + 1e-8
+        || height <= 0.0
+    {
+        return None;
+    }
+
+    let radial_square = outer.radius.powi(2) - inner.radius.powi(2);
+    let radial_cube = outer.radius.powi(3) - inner.radius.powi(3);
+    let radial_fourth = outer.radius.powi(4) - inner.radius.powi(4);
+    let area = 0.5 * radial_square * angle;
+    let half = angle * 0.5;
+    let centroid_radius = if (angle - 2.0 * PI).abs() <= 1e-8 {
+        0.0
+    } else {
+        4.0 * half.sin() * radial_cube / (3.0 * angle * radial_square)
+    };
+    let volume = area * height;
+    let middle = patch.u_start + half;
+    let radial = Vec3::from(outer.base.vector_at([middle.cos(), middle.sin()])).normalize()?;
+    let tangent = axis.cross(radial).normalize()?;
+    let centre_on_axis = outer_origin + axis * (patch.v_start + height * 0.5);
+    let centroid = (centre_on_axis + radial * centroid_radius).to_array();
+
+    let factor = radial_fourth * 0.25;
+    let radial_second = factor * (angle * 0.5 + angle.sin() * 0.5);
+    let tangent_second = factor * (angle * 0.5 - angle.sin() * 0.5);
+    let height_second = area * height.powi(3) / 12.0;
+    let radial_moment = height * tangent_second + height_second;
+    let tangent_moment =
+        height * (radial_second - area * centroid_radius.powi(2)) + height_second;
+    let axial_moment = height
+        * (radial_second + tangent_second - area * centroid_radius.powi(2));
+    assemble(
+        volume,
+        centroid,
+        [radial_moment, tangent_moment, axial_moment],
+        [radial.to_array(), tangent.to_array(), axis.to_array()],
+    )
 }
 
 fn sphere_properties(body: &Body) -> Option<MassProperties> {
