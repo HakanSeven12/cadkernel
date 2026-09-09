@@ -53,6 +53,7 @@ pub mod shell;
 pub mod split;
 pub mod sweep;
 pub mod sweep_path;
+pub mod thicken;
 pub mod topology;
 
 pub use arena::{Arena, Key};
@@ -89,6 +90,7 @@ pub use sweep_path::{
     sweep_path, sweep_path_start, sweep_profile_base, sweep_profile_group_base,
     sweep_profile_placement, SweepOptions, SweepPath,
 };
+pub use thicken::{thicken, ThickenError};
 pub use topology::{
     Body, Coedge, CoedgeKey, CurveKey, Edge, EdgeKey, Face, FaceKey, Flaw, Loop, LoopKey, Lump,
     LumpKey, Shell, ShellKey, SurfaceKey, Vertex, VertexKey,
