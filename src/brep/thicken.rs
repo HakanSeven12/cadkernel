@@ -46,7 +46,7 @@ pub fn thicken(body: &Body, distance: f64) -> Result<Body, ThickenError> {
     }
 
     let tolerance = super::operation_tolerance(&[body]);
-    let face_solids = faces
+    let mut solids = faces
         .into_iter()
         .map(|face| {
             single_face(body, face).and_then(|sheet| {
@@ -61,21 +61,37 @@ pub fn thicken(body: &Body, distance: f64) -> Result<Body, ThickenError> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut solids = Vec::new();
     for (_, edge) in body.edges.iter() {
         if let Some(connector) = straight_edge_connector(body, edge, distance)? {
             solids.push(connector);
         }
     }
-    solids.extend(face_solids);
+
+    loop {
+        let mut joined = None;
+        'pairs: for first in 0..solids.len() {
+            for second in first + 1..solids.len() {
+                if let Some(body) =
+                    join_on_full_planar_face(&solids[first], &solids[second], tolerance)?
+                {
+                    joined = Some((first, second, body));
+                    break 'pairs;
+                }
+            }
+        }
+        let Some((first, second, body)) = joined else {
+            break;
+        };
+        solids.swap_remove(second);
+        solids.swap_remove(first);
+        solids.push(body);
+    }
+
     let mut solids = solids.into_iter();
     let mut result = solids.next().ok_or(ThickenError::UnsupportedSurface)?;
     for solid in solids {
-        result = match join_on_full_planar_face(&result, &solid, tolerance)? {
-            Some(joined) => joined,
-            None => super::boolean::combine(result, solid, super::Operation::Union, tolerance)
-                .map_err(|_| ThickenError::SelfIntersection)?,
-        };
+        result = super::boolean::combine(result, solid, super::Operation::Union, tolerance)
+            .map_err(|_| ThickenError::SelfIntersection)?;
     }
     (!result.roots.is_empty()
         && result.validate().is_empty()
@@ -1384,9 +1400,13 @@ mod tests {
                 start: [2.0, 0.0],
                 end: [3.0, 2.0],
             }),
+            Curve::Line(Line {
+                start: [3.0, 2.0],
+                end: [4.0, 1.0],
+            }),
         ];
         let sheet = extrude_surface(Plane::XY, &profile, [0.0, 0.0, 3.0]).unwrap();
-        assert_eq!(sheet.faces.len(), 2);
+        assert_eq!(sheet.faces.len(), 3);
         let solid = thicken(&sheet, 0.25).unwrap();
         assert!(solid.validate().is_empty());
         assert!(solid.edges.iter().all(|(_, edge)| edge.coedges.len() == 2));
