@@ -25,9 +25,7 @@ impl MassProperties {
         self.moment_of_inertia[1] += self.volume * (square_change(0) + square_change(2));
         self.moment_of_inertia[2] += self.volume * (square_change(0) + square_change(1));
         let product_change = |first, second| {
-            old[first] * delta[second]
-                + old[second] * delta[first]
-                + delta[first] * delta[second]
+            old[first] * delta[second] + old[second] * delta[first] + delta[first] * delta[second]
         };
         self.product_of_inertia[0] -= self.volume * product_change(0, 1);
         self.product_of_inertia[1] -= self.volume * product_change(1, 2);
@@ -43,7 +41,112 @@ impl MassProperties {
 /// Exact properties for complete analytic spheres and circular cylinders,
 /// including the concentric closed shells produced by [`super::shell`].
 pub fn analytic_mass_properties(body: &Body) -> Option<MassProperties> {
-    sphere_properties(body).or_else(|| cylinder_properties(body))
+    sphere_properties(body)
+        .or_else(|| cylindrical_sector_properties(body))
+        .or_else(|| cylinder_properties(body))
+}
+
+fn cylindrical_sector_properties(body: &Body) -> Option<MassProperties> {
+    let mut cylinders = Vec::new();
+    for face_key in body.face_keys() {
+        let face = body.faces.get(face_key)?;
+        match body.surfaces.get(face.surface)? {
+            Surface::Cylinder(cylinder) => cylinders.push((face_key, *cylinder)),
+            Surface::Plane(_) => {}
+            _ => return None,
+        }
+    }
+    if cylinders.len() != 2 {
+        return None;
+    }
+    cylinders.sort_by(|left, right| right.1.radius.total_cmp(&left.1.radius));
+    let (outer_face, outer) = cylinders[0];
+    let (inner_face, inner) = cylinders[1];
+    let axis = Vec3::from(outer.base.normal()?).normalize()?;
+    let inner_axis = Vec3::from(inner.base.normal()?).normalize()?;
+    let scale = outer.radius.abs().max(1.0);
+    let outer_origin = Vec3::from(outer.base.origin);
+    let inner_origin = Vec3::from(inner.base.origin);
+    let inner_lateral = inner_origin - axis * (inner_origin - outer_origin).dot(axis);
+    if !outer.radius.is_finite()
+        || !inner.radius.is_finite()
+        || inner.radius <= 0.0
+        || inner.radius >= outer.radius
+        || inner_axis.dot(axis).abs() < 1.0 - 1e-8
+        || inner_lateral.distance(outer_origin) > scale * 1e-8
+    {
+        return None;
+    }
+    let patch = super::thicken::rectangular_patch(body, outer_face, &Surface::Cylinder(outer))?;
+    let inner_patch =
+        super::thicken::rectangular_patch(body, inner_face, &Surface::Cylinder(inner))?;
+    let inner_bottom = inner_origin + inner_axis * inner_patch.v_start;
+    let inner_top = inner_bottom + inner_axis * inner_patch.v_sweep;
+    let outer_bottom = patch.v_start;
+    let outer_top = patch.v_start + patch.v_sweep;
+    let z0 = (inner_bottom - outer_origin).dot(axis);
+    let z1 = (inner_top - outer_origin).dot(axis);
+    if (z0.min(z1) - outer_bottom).abs() > scale * 1e-8
+        || (z0.max(z1) - outer_top).abs() > scale * 1e-8
+        || (inner_patch.u_sweep - patch.u_sweep).abs() > 1e-8
+        || body.edges.iter().any(|(_, edge)| edge.coedges.len() != 2)
+    {
+        return None;
+    }
+    let outer_mid = Vec3::from(outer.base.vector_at([
+        (patch.u_start + patch.u_sweep * 0.5).cos(),
+        (patch.u_start + patch.u_sweep * 0.5).sin(),
+    ]))
+    .normalize()?;
+    let inner_mid = Vec3::from(inner.base.vector_at([
+        (inner_patch.u_start + inner_patch.u_sweep * 0.5).cos(),
+        (inner_patch.u_start + inner_patch.u_sweep * 0.5).sin(),
+    ]))
+    .normalize()?;
+    if patch.u_sweep < 2.0 * PI - 1e-8 && outer_mid.distance(inner_mid) > 1e-8 {
+        return None;
+    }
+    let angle = patch.u_sweep;
+    let height = patch.v_sweep;
+    if !angle.is_finite()
+        || !height.is_finite()
+        || angle <= 0.0
+        || angle > 2.0 * PI + 1e-8
+        || height <= 0.0
+    {
+        return None;
+    }
+
+    let radial_square = outer.radius.powi(2) - inner.radius.powi(2);
+    let radial_cube = outer.radius.powi(3) - inner.radius.powi(3);
+    let radial_fourth = outer.radius.powi(4) - inner.radius.powi(4);
+    let area = 0.5 * radial_square * angle;
+    let half = angle * 0.5;
+    let centroid_radius = if (angle - 2.0 * PI).abs() <= 1e-8 {
+        0.0
+    } else {
+        4.0 * half.sin() * radial_cube / (3.0 * angle * radial_square)
+    };
+    let volume = area * height;
+    let middle = patch.u_start + half;
+    let radial = Vec3::from(outer.base.vector_at([middle.cos(), middle.sin()])).normalize()?;
+    let tangent = axis.cross(radial).normalize()?;
+    let centre_on_axis = outer_origin + axis * (patch.v_start + height * 0.5);
+    let centroid = (centre_on_axis + radial * centroid_radius).to_array();
+
+    let factor = radial_fourth * 0.25;
+    let radial_second = factor * (angle * 0.5 + angle.sin() * 0.5);
+    let tangent_second = factor * (angle * 0.5 - angle.sin() * 0.5);
+    let height_second = area * height.powi(3) / 12.0;
+    let radial_moment = height * tangent_second + height_second;
+    let tangent_moment = height * (radial_second - area * centroid_radius.powi(2)) + height_second;
+    let axial_moment = height * (radial_second + tangent_second - area * centroid_radius.powi(2));
+    assemble(
+        volume,
+        centroid,
+        [radial_moment, tangent_moment, axial_moment],
+        [radial.to_array(), tangent.to_array(), axis.to_array()],
+    )
 }
 
 fn sphere_properties(body: &Body) -> Option<MassProperties> {
@@ -181,16 +284,10 @@ fn cylinder_properties(body: &Body) -> Option<MassProperties> {
     }
     let center_at = (outer_volume * outer_center - inner_volume * inner_center) / volume;
     let centroid = (reference + axis * center_at).to_array();
-    let axial = 0.5
-        * (outer_volume * outer.radius.powi(2)
-            - inner_volume * inner_radius.powi(2));
-    let transverse = outer_volume
-        * (3.0 * outer.radius.powi(2) + outer_height.powi(2))
-        / 12.0
+    let axial = 0.5 * (outer_volume * outer.radius.powi(2) - inner_volume * inner_radius.powi(2));
+    let transverse = outer_volume * (3.0 * outer.radius.powi(2) + outer_height.powi(2)) / 12.0
         + outer_volume * (outer_center - center_at).powi(2)
-        - inner_volume
-            * (3.0 * inner_radius.powi(2) + inner_height.powi(2))
-            / 12.0
+        - inner_volume * (3.0 * inner_radius.powi(2) + inner_height.powi(2)) / 12.0
         - inner_volume * (inner_center - center_at).powi(2);
     assemble(
         volume,
@@ -208,7 +305,10 @@ fn assemble(
 ) -> Option<MassProperties> {
     if !volume.is_finite()
         || volume <= 0.0
-        || centroid.iter().chain(principal_moments.iter()).any(|value| !value.is_finite())
+        || centroid
+            .iter()
+            .chain(principal_moments.iter())
+            .any(|value| !value.is_finite())
     {
         return None;
     }
@@ -226,8 +326,8 @@ fn assemble(
     let mut origin = central;
     for row in 0..3 {
         for column in 0..3 {
-            origin[row][column] += volume
-                * (if row == column { c2 } else { 0.0 } - centroid[row] * centroid[column]);
+            origin[row][column] +=
+                volume * (if row == column { c2 } else { 0.0 } - centroid[row] * centroid[column]);
         }
     }
     let moment_of_inertia = [origin[0][0], origin[1][1], origin[2][2]];
@@ -238,8 +338,8 @@ fn assemble(
         centroid,
         moment_of_inertia,
         principal_directions: [
-            axes[0][0], axes[0][1], axes[0][2], axes[1][0], axes[1][1], axes[1][2],
-            axes[2][0], axes[2][1], axes[2][2],
+            axes[0][0], axes[0][1], axes[0][2], axes[1][0], axes[1][1], axes[1][2], axes[2][0],
+            axes[2][1], axes[2][2],
         ],
         principal_moments,
         product_of_inertia,
@@ -284,8 +384,8 @@ mod tests {
         let properties = analytic_mass_properties(&make::sphere([2.0, -3.0, 5.0], 2.0).unwrap())
             .unwrap()
             .translated([7.0, 11.0, -13.0]);
-        let expected = analytic_mass_properties(&make::sphere([9.0, 8.0, -8.0], 2.0).unwrap())
-            .unwrap();
+        let expected =
+            analytic_mass_properties(&make::sphere([9.0, 8.0, -8.0], 2.0).unwrap()).unwrap();
 
         assert_eq!(properties.centroid, expected.centroid);
         for (actual, expected) in properties
