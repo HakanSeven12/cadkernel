@@ -4727,6 +4727,38 @@ mod tests {
     }
 
     #[test]
+    fn planar_isolines_are_opt_in_and_counted_per_axis() {
+        let solid = cuboid([0.0; 3], [2.0, 3.0, 4.0]).unwrap();
+        let tolerance = TessellationTolerance::new(default_angle(), TOL);
+
+        assert!(tessellate_wireframe(&solid, tolerance.with_isolines(2))
+            .isolines
+            .is_empty());
+        assert_eq!(
+            tessellate_wireframe(
+                &solid,
+                tolerance
+                    .with_uv_isolines(1, 0)
+                    .with_planar_isolines(true),
+            )
+            .isolines
+            .len(),
+            6,
+        );
+        assert_eq!(
+            tessellate_wireframe(
+                &solid,
+                tolerance
+                    .with_uv_isolines(0, 2)
+                    .with_planar_isolines(true),
+            )
+            .isolines
+            .len(),
+            12,
+        );
+    }
+
+    #[test]
     fn the_triangles_cover_the_boxs_own_area() {
         let solid = cuboid([0.0; 3], [2.0, 3.0, 4.0]).unwrap();
         let mesh = self::body(&solid, default_angle(), TOL);
