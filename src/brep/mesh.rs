@@ -268,7 +268,7 @@ pub struct TessellationTolerance {
     pub angle: f64,
     pub linear: f64,
     chordal: Option<f64>,
-    isolines: usize,
+    isolines: [usize; 2],
     planar_isolines: bool,
 }
 
@@ -278,7 +278,7 @@ impl TessellationTolerance {
             angle: crate::tessellation::angle(angle),
             linear: finite_positive(linear, 1e-9),
             chordal: None,
-            isolines: 0,
+            isolines: [0; 2],
             planar_isolines: false,
         }
     }
@@ -289,7 +289,14 @@ impl TessellationTolerance {
     }
 
     pub fn with_isolines(mut self, count: usize) -> Self {
-        self.isolines = count;
+        self.isolines = [count; 2];
+        self
+    }
+
+    /// Use independent construction-line counts for the two surface
+    /// parameter axes. The first count fixes U while the second fixes V.
+    pub fn with_uv_isolines(mut self, u_count: usize, v_count: usize) -> Self {
+        self.isolines = [u_count, v_count];
         self
     }
 
@@ -918,7 +925,7 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
                 out.triangle_faces
                     .extend(std::iter::repeat(face_key).take(mesh.triangles.len()));
                 out.mesh.absorb(mesh);
-                if tolerance.isolines > 0 {
+                if tolerance.isolines.iter().any(|count| *count > 0) {
                     match face_isolines(
                         body,
                         face_key,
@@ -952,7 +959,7 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
 pub fn tessellate_wireframe(body: &Body, tolerance: TessellationTolerance) -> BodyWireframe {
     let schedules = body_edge_schedules(body, tolerance);
     let mut out = BodyWireframe::default();
-    if tolerance.isolines > 0 {
+    if tolerance.isolines.iter().any(|count| *count > 0) {
         for face_key in body.face_keys() {
             let max_angle = face_chordal_angle(body, face_key, tolerance.angle, tolerance.chordal);
             match face_isolines(
@@ -1073,7 +1080,7 @@ fn face_isolines(
     face: FaceKey,
     max_angle: f64,
     tolerance: f64,
-    count: usize,
+    counts: [usize; 2],
     planar_isolines: bool,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
 ) -> Option<Vec<FacePolyline>> {
@@ -1099,6 +1106,10 @@ fn face_isolines(
     };
     let mut out = Vec::new();
     for fixed_axis in 0..2 {
+        let count = counts[fixed_axis];
+        if count == 0 {
+            continue;
+        }
         let varying_axis = 1 - fixed_axis;
         let fixed_span = bounds[fixed_axis][1] - bounds[fixed_axis][0];
         if fixed_span <= 0.0 {
