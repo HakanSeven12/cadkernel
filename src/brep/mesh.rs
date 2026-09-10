@@ -269,6 +269,7 @@ pub struct TessellationTolerance {
     pub linear: f64,
     chordal: Option<f64>,
     isolines: usize,
+    planar_isolines: bool,
 }
 
 impl TessellationTolerance {
@@ -278,6 +279,7 @@ impl TessellationTolerance {
             linear: finite_positive(linear, 1e-9),
             chordal: None,
             isolines: 0,
+            planar_isolines: false,
         }
     }
 
@@ -288,6 +290,16 @@ impl TessellationTolerance {
 
     pub fn with_isolines(mut self, count: usize) -> Self {
         self.isolines = count;
+        self
+    }
+
+    /// Include parameter-space construction lines on planar faces.
+    ///
+    /// Planar isolines stay opt-in because solid-body display normally needs
+    /// only the boundary edges, while editable sheet surfaces use the interior
+    /// grid to expose their construction parameters.
+    pub fn with_planar_isolines(mut self, enabled: bool) -> Self {
+        self.planar_isolines = enabled;
         self
     }
 
@@ -913,6 +925,7 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
                         max_angle,
                         tolerance.linear,
                         tolerance.isolines,
+                        tolerance.planar_isolines,
                         &schedules,
                     ) {
                         Some(lines) => out.isolines.extend(lines),
@@ -948,6 +961,7 @@ pub fn tessellate_wireframe(body: &Body, tolerance: TessellationTolerance) -> Bo
                 max_angle,
                 tolerance.linear,
                 tolerance.isolines,
+                tolerance.planar_isolines,
                 &schedules,
             ) {
                 Some(lines) => out.isolines.extend(lines),
@@ -1060,6 +1074,7 @@ fn face_isolines(
     max_angle: f64,
     tolerance: f64,
     count: usize,
+    planar_isolines: bool,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
 ) -> Option<Vec<FacePolyline>> {
     let Some(node) = body.faces.get(face) else {
@@ -1068,7 +1083,7 @@ fn face_isolines(
     let Some(surface) = body.surfaces.get(node.surface) else {
         return None;
     };
-    if matches!(surface, super::geometry::Surface::Plane(_)) {
+    if matches!(surface, super::geometry::Surface::Plane(_)) && !planar_isolines {
         return Some(Vec::new());
     }
     let parameters = if let Some(domain) = whole_surface_domain(body, face, surface) {
