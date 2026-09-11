@@ -30,3 +30,6 @@ pub use vec::Vec3;
 
 #[cfg(feature = "geom2d")]
 pub use planar::PlanarCurve;
+
+mod polyline_approximation;
+pub use polyline_approximation::SplinePolyline;
