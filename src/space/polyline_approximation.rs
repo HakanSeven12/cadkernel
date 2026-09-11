@@ -21,6 +21,8 @@ impl NurbsCurve3 {
     pub fn to_polyline_precision(&self, precision: u8) -> Option<SplinePolyline> {
         if precision > 99 || self.control_points().len() > MAX_POINTS { return None; }
         let degree = self.degree();
+        if self.knots().len() > 2 * MAX_POINTS || degree >= self.control_points().len() { return None; }
+        let mut budget = 16_000_000usize;
         let (start, end) = self.domain();
         if degree == 0 || !self.knots()[..=degree].iter().all(|k| *k == start)
             || !self.knots()[self.knots().len()-degree-1..].iter().all(|k| *k == end) { return None; }
@@ -44,6 +46,7 @@ impl NurbsCurve3 {
             if multiplicity > degree { return None; }
             while multiplicity < degree {
                 if controls.len() >= MAX_POINTS { return None; }
+                budget = budget.checked_sub(controls.len().checked_add(degree)?)?;
                 let span = super::spline::span_of(degree, &knots, controls.len()-1, knot);
                 let mut next = Vec::with_capacity(controls.len()+1);
                 next.extend_from_slice(&controls[..=span-degree]);
@@ -59,7 +62,7 @@ impl NurbsCurve3 {
         }
         let mut points = vec![cartesian(controls[0])?];
         for piece in controls.windows(degree+1).step_by(degree) {
-            subdivide(piece, tolerance, 0, &mut points)?;
+            subdivide(piece, tolerance, 0, &mut budget, &mut points)?;
         }
         Some(SplinePolyline { points, tolerance })
     }
@@ -71,7 +74,8 @@ fn cartesian(p: [f64;4]) -> Option<[f64;3]> {
     result.iter().all(|x| x.is_finite()).then_some(result)
 }
 
-fn subdivide(net: &[[f64;4]], tolerance: f64, depth: usize, out: &mut Vec<[f64;3]>) -> Option<()> {
+fn subdivide(net: &[[f64;4]], tolerance: f64, depth: usize, budget: &mut usize, out: &mut Vec<[f64;3]>) -> Option<()> {
+    *budget = budget.checked_sub(net.len().checked_mul(net.len())?)?;
     let start = Vec3::from(cartesian(net[0])?);
     let end_array = cartesian(*net.last()?)?;
     let end = Vec3::from(end_array);
@@ -94,6 +98,6 @@ fn subdivide(net: &[[f64;4]], tolerance: f64, depth: usize, out: &mut Vec<[f64;3
         left.push(work[0]); right.push(work[remaining-1]);
     }
     right.reverse();
-    subdivide(&left,tolerance,depth+1,out)?;
-    subdivide(&right,tolerance,depth+1,out)
+    subdivide(&left,tolerance,depth+1,budget,out)?;
+    subdivide(&right,tolerance,depth+1,budget,out)
 }
