@@ -56,18 +56,30 @@ impl NurbsCurve3 {
     /// produce a periodic curve with an exact clamped representation of one
     /// period; repeating the first point on an open curve is not equivalent.
     pub fn from_control_polygon(degree: usize, points: &[[f64; 3]], closed: bool) -> Option<Self> {
+        Self::from_weighted_control_polygon(degree, points, &vec![1.0; points.len()], closed)
+    }
+
+    /// The control-polygon constructor with rational weights retained through
+    /// periodic seam insertion in homogeneous coordinates.
+    pub fn from_weighted_control_polygon(degree: usize, points: &[[f64; 3]], weights: &[f64], closed: bool) -> Option<Self> {
         let count = points.len();
-        if degree == 0 || count <= degree || points.iter().flatten().any(|v| !v.is_finite()) {
+        if degree == 0 || count <= degree || weights.len() != count
+            || weights.iter().any(|weight| !weight.is_finite() || *weight <= 0.0)
+            || points.iter().flatten().any(|v| !v.is_finite()) {
             return None;
         }
         if !closed {
-            return Self::new_strict(degree, points.to_vec(), clamped_uniform_knots(degree, count), vec![1.0; count]);
+            return Self::new_strict(degree, points.to_vec(), clamped_uniform_knots(degree, count), weights.to_vec());
         }
         // Include a period on either side so both cuts are interior knots.
         // The seam follows the final degree control vertices, then wraps to
         // the first vertex of the supplied polygon.
-        let mut controls: Vec<[f64; 3]> = (0..3 * count + degree)
-            .map(|index| points[(index + count - degree) % count]).collect();
+        let mut controls: Vec<[f64; 4]> = (0..3 * count + degree)
+            .map(|index| {
+                let index = (index + count - degree) % count;
+                let point = points[index]; let weight = weights[index];
+                [point[0] * weight, point[1] * weight, point[2] * weight, weight]
+            }).collect();
         let mut knots: Vec<f64> = (0..controls.len() + degree + 1).map(|index| index as f64).collect();
         let from = (count + degree) as f64;
         let to = from + count as f64;
@@ -94,7 +106,8 @@ impl NurbsCurve3 {
         let controls = controls[first..=last].to_vec();
         let knots = std::iter::once(from).chain(knots[first + 1..=last_knot].iter().copied())
             .chain(std::iter::once(to)).map(|knot| knot - from).collect();
-        let weights = vec![1.0; controls.len()];
+        let weights = controls.iter().map(|point| point[3]).collect();
+        let controls = controls.iter().map(|point| [point[0] / point[3], point[1] / point[3], point[2] / point[3]]).collect();
         Self::new_strict(degree, controls, knots, weights).map(|curve| curve.with_periodicity(true))
     }
 
