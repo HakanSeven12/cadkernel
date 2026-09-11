@@ -11,16 +11,19 @@ pub fn line_as_nurbs(points: [[f64; 3]; 2], degree: usize) -> Option<NurbsCurve3
     NurbsCurve3::new_strict(degree,controls,[vec![0.0;degree+1],vec![1.0;degree+1]].concat(),vec![1.0;degree+1])
 }
 
-/// Join touching clamped NURBS of equal degree without fitting or sampling.
+/// Join touching clamped NURBS without fitting or sampling.
 /// The source direction is retained; the other curve can be reversed or prepended.
 /// Rational weights are rescaled at the seam, which has C0 continuity.
+/// A lower-degree input is elevated exactly to match the other curve.
 /// Coincident endpoints preserve both curve shapes exactly. Within tolerance,
 /// only the candidate endpoint is snapped to the source endpoint; the source
 /// control points and weights remain unchanged when appending or prepending.
 pub fn join_nurbs_curves(source: &NurbsCurve3, other: &NurbsCurve3, tolerance: f64) -> Option<NurbsCurve3> {
-    if !tolerance.is_finite() || tolerance < 0.0 || source.degree()!=other.degree() || source.is_closed() || other.is_closed() { return None; }
-    let degree=source.degree();
-    for curve in [source,other] {
+    if !tolerance.is_finite() || tolerance < 0.0 || source.is_closed() || other.is_closed() { return None; }
+    let degree = source.degree().max(other.degree());
+    let source = if source.degree() < degree { source.elevated(degree - source.degree())? } else { source.clone() };
+    let other = if other.degree() < degree { other.elevated(degree - other.degree())? } else { other.clone() };
+    for curve in [&source,&other] {
         let (a,b)=curve.domain(); let knots=curve.knots();
         if !a.is_finite() || !b.is_finite() || a>=b || !knots[..=degree].iter().all(|v|*v==a)
             || !knots[knots.len()-degree-1..].iter().all(|v|*v==b) { return None; }
@@ -32,9 +35,9 @@ pub fn join_nurbs_curves(source: &NurbsCurve3, other: &NurbsCurve3, tolerance: f
     }
     let close=|a:[f64;3],b:[f64;3]|Vec3::from(a).distance(Vec3::from(b))<=tolerance;
     let (first,second,prepend)=if close(source.point_at(1.0),other.point_at(0.0)) {(source.clone(),other.clone(),false)}
-        else if close(source.point_at(1.0),other.point_at(1.0)) {(source.clone(),reverse(other)?,false)}
+        else if close(source.point_at(1.0),other.point_at(1.0)) {(source.clone(),reverse(&other)?,false)}
         else if close(source.point_at(0.0),other.point_at(1.0)) {(other.clone(),source.clone(),true)}
-        else if close(source.point_at(0.0),other.point_at(0.0)) {(reverse(other)?,source.clone(),true)}
+        else if close(source.point_at(0.0),other.point_at(0.0)) {(reverse(&other)?,source.clone(),true)}
         else {return None;};
     let (_,end)=first.domain();let(start,_)=second.domain();
     let mut controls=first.control_points().to_vec();
@@ -113,5 +116,18 @@ mod tests {
         assert_eq!(join_collinear_lines([[2.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
             [[5.0, 0.0, 0.0], [4.0, 0.0, 0.0]], 1e-9),
             Some([[5.0, 0.0, 0.0], [0.0, 0.0, 0.0]]));
+    }
+
+    #[test]
+    fn spline_join_elevates_the_lower_degree_without_moving_either_half() {
+        let source = line_as_nurbs([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], 1).unwrap();
+        let other = line_as_nurbs([[1.0, 0.0, 0.0], [2.0, 1.0, 0.0]], 3).unwrap();
+        let joined = join_nurbs_curves(&source, &other, 1e-9).unwrap();
+        assert_eq!(joined.degree(), 3);
+        assert!(Vec3::from(joined.point_at(0.0)).distance(Vec3::new(0.0, 0.0, 0.0)) < 1e-12);
+        assert!(Vec3::from(joined.point_at(0.25)).distance(Vec3::new(0.5, 0.0, 0.0)) < 1e-12);
+        assert!(Vec3::from(joined.point_at(0.5)).distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-12);
+        assert!(Vec3::from(joined.point_at(0.75)).distance(Vec3::new(1.5, 0.5, 0.0)) < 1e-12);
+        assert!(Vec3::from(joined.point_at(1.0)).distance(Vec3::new(2.0, 1.0, 0.0)) < 1e-12);
     }
 }
