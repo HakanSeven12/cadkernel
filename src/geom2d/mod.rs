@@ -180,3 +180,6 @@ mod tests {
         Tolerance::new(0.0);
     }
 }
+
+mod bounds;
+pub use bounds::analytic_curve_bounds;
