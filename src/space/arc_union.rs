@@ -20,6 +20,28 @@ pub struct ArcUnion {
     pub full_circle: bool,
     pub kind: ArcUnionKind,
 }
+
+/// Whether a finite arc lies on exactly the supplied supporting circle.
+pub fn circle_contains_arc(
+    center: [f64; 3],
+    normal: [f64; 3],
+    radius: f64,
+    arc: CircularArc,
+) -> bool {
+    use std::f64::consts::TAU;
+    center == arc.center
+        && normal == arc.normal
+        && radius == arc.radius
+        && center
+            .iter()
+            .chain(normal.iter())
+            .chain([radius, arc.start, arc.end].iter())
+            .all(|value| value.is_finite())
+        && radius > 0.0
+        && super::Vec3::from(normal).normalize().is_some()
+        && (arc.end - arc.start).rem_euclid(TAU) > 0.0
+}
+
 /// Unite coincident, overlapping or touching arcs without bridging a real gap.
 /// Supporting centers, radii and normals must match exactly. Tolerance applies
 /// to endpoint distance along the circle, not to different supporting circles.
@@ -63,5 +85,24 @@ mod tests {
             arc(std::f64::consts::PI, std::f64::consts::TAU), 1e-9).unwrap();
         assert_eq!(union.kind, ArcUnionKind::EndToEnd);
         assert!(union.full_circle);
+    }
+
+    #[test]
+    fn circle_containment_requires_the_exact_support_and_a_finite_span() {
+        let arc = CircularArc {
+            center: [1.0, 2.0, 3.0],
+            normal: [0.0, 0.0, 1.0],
+            radius: 2.0,
+            start: 0.0,
+            end: std::f64::consts::PI,
+        };
+        assert!(circle_contains_arc(arc.center, arc.normal, arc.radius, arc));
+        assert!(!circle_contains_arc([1.0, 2.0, 3.1], arc.normal, arc.radius, arc));
+        assert!(!circle_contains_arc(
+            arc.center,
+            arc.normal,
+            arc.radius,
+            CircularArc { end: 0.0, ..arc },
+        ));
     }
 }

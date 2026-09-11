@@ -228,4 +228,23 @@ mod tests {
         assert!(Vec3::from(original.point_at(0.0)).distance(Vec3::from(reversed.point_at(1.0))) < 1e-9);
         assert!(Vec3::from(original.point_at(1.0)).distance(Vec3::from(reversed.point_at(0.0))) < 1e-9);
     }
+
+    #[test]
+    fn a_zero_turn_zero_height_helix_is_one_exact_point() {
+        let helix = HelixCurve {
+            base_center: [1.0, 2.0, 3.0],
+            axis_direction: [0.0, 0.0, 1.0],
+            start_direction: [1.0, 0.0, 0.0],
+            base_radius: 2.0,
+            top_radius: 4.0,
+            height: 0.0,
+            turns: 0.0,
+            direction: HelixDirection::CounterClockwise,
+        };
+        let curve = helix.nurbs().unwrap();
+        assert_eq!(helix.length(), Some(0.0));
+        assert_eq!(curve.point_at(0.0), [3.0, 2.0, 3.0]);
+        assert_eq!(curve.point_at(1.0), [3.0, 2.0, 3.0]);
+        assert_eq!(helix.reversed(), Some(helix));
+    }
 }
