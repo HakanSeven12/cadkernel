@@ -24,7 +24,7 @@ pub mod vec;
 pub mod planar;
 
 pub use helix::{HelixCurve, HelixDirection};
-pub use line_union::{line_union, LineUnion, LineUnionKind};
+pub use line_union::{line_union, simplify_linear_chain, LineUnion, LineUnionKind};
 pub use nurbs::{NurbsCurve3, NurbsSurface3};
 pub use plane::{are_coplanar, coplanarity_tolerance, Plane};
 pub use spline::{clamped_uniform_knots, de_boor, Parameterization};

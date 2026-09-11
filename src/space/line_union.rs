@@ -53,3 +53,28 @@ pub fn line_union(
         kind,
     })
 }
+
+/// Retained indices after removing consecutive duplicate points and redundant
+/// collinear interior vertices. Corners and changes of direction are retained.
+pub fn simplify_linear_chain(points: &[[f64; 3]], tolerance: f64) -> Vec<usize> {
+    if !tolerance.is_finite() || tolerance < 0.0
+        || !points.iter().flatten().all(|v| v.is_finite()) {
+        return (0..points.len()).collect();
+    }
+    let mut kept: Vec<usize> = Vec::new();
+    for (index, &point) in points.iter().enumerate() {
+        if kept.last().is_some_and(|&last| {
+            (Vec3::from(point) - Vec3::from(points[last])).length() <= tolerance
+        }) { continue; }
+        while kept.len() >= 2 {
+            let a = kept[kept.len() - 2];
+            let b = kept[kept.len() - 1];
+            let Some(joined) = line_union([points[a], points[b]], [points[b], point], tolerance)
+            else { break; };
+            if joined.kind != LineUnionKind::EndToEnd { break; }
+            kept.pop();
+        }
+        kept.push(index);
+    }
+    kept
+}
