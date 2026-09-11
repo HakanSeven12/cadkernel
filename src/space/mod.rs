@@ -17,6 +17,7 @@ pub mod nurbs;
 pub mod plane;
 pub mod polygon;
 pub mod spline;
+pub mod source_join;
 pub mod vec;
 
 #[cfg(feature = "geom2d")]
