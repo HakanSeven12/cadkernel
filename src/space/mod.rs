@@ -13,6 +13,7 @@
 
 pub mod curve;
 pub mod helix;
+pub mod lengthen;
 pub mod nurbs;
 pub mod plane;
 pub mod polygon;
