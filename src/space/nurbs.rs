@@ -133,6 +133,36 @@ impl NurbsCurve3 {
         Self::new_strict(degree, controls, knots, weights)
     }
 
+    /// Open cubic interpolation in full spatial coordinates.
+    pub fn interpolate_fit(points: &[[f64; 3]], start_tangent: Option<[f64; 3]>,
+        end_tangent: Option<[f64; 3]>, parameterization: Parameterization) -> Option<Self> {
+        let (controls, knots) = super::spline::interpolate_open(points, start_tangent, end_tangent, parameterization)?;
+        let weights = vec![1.0; controls.len()];
+        Self::new_strict(3, controls, knots, weights)
+    }
+
+    /// Analytic rational derivative with respect to the knot parameter.
+    pub fn derivative_at_knot(&self, parameter: f64) -> [f64; 3] {
+        let (start, end) = self.domain();
+        let parameter = wrap_parameter(parameter, start, end, self.closed);
+        let scale = self.weights.iter().copied().fold(0.0_f64, f64::max);
+        let homogeneous = |index: usize| {
+            let weight = self.weights[index] / scale;
+            let point = self.control_points[index];
+            [point[0] * weight, point[1] * weight, point[2] * weight, weight]
+        };
+        let value = de_boor_by(self.degree, &self.knots, self.control_points.len(), parameter, homogeneous);
+        let derivative = de_boor_by(self.degree - 1, &self.knots[1..self.knots.len() - 1],
+            self.control_points.len() - 1, parameter, |index| {
+                let width = self.knots[index + self.degree + 1] - self.knots[index + 1];
+                if width == 0.0 { return [0.0; 4]; }
+                let a = homogeneous(index); let b = homogeneous(index + 1);
+                std::array::from_fn(|axis| (b[axis] - a[axis]) * self.degree as f64 / width)
+        });
+        if value[3] <= 0.0 { return [f64::NAN; 3]; }
+        std::array::from_fn(|axis| (derivative[axis] - value[axis] / value[3] * derivative[3]) / value[3])
+    }
+
     /// Builds a curve, filling in what the caller left out.
     ///
     /// A knot vector of the wrong length is replaced with a clamped uniform
@@ -1002,6 +1032,19 @@ mod tests {
         let reduced = curve.without_control_vertex(1).unwrap();
         assert_eq!((reduced.degree(), reduced.control_points().len()), (2, 3));
         assert_eq!(reduced.knots(), &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn rational_derivative_matches_a_finite_difference() {
+        let curve = NurbsCurve3::new_strict(2, vec![[0.0, 0.0, 0.0], [1.0, 2.0, 1.0],
+            [3.0, 0.0, 2.0]], vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![1.0, 3.0, 2.0]).unwrap();
+        let parameter = 0.37;
+        let step = 1e-6;
+        let before = Vec3::from(curve.point_at_knot(parameter - step));
+        let after = Vec3::from(curve.point_at_knot(parameter + step));
+        let numeric = (after - before) / (2.0 * step);
+        let analytic = Vec3::from(curve.derivative_at_knot(parameter));
+        assert!(analytic.distance(numeric) < 1e-6, "{analytic:?} vs {numeric:?}");
     }
 
     #[test]

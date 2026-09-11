@@ -12,6 +12,7 @@
 //! planar B-rep face.
 
 pub mod alignment;
+pub mod arclength;
 pub mod curve;
 pub mod arc_union;
 pub mod helix;
@@ -28,6 +29,7 @@ pub mod vec;
 pub mod planar;
 
 pub use alignment::align_point_pairs;
+pub use arclength::ArcLengthCurve3;
 pub use helix::{HelixCurve, HelixDirection};
 pub use line_union::{line_union, simplify_linear_chain, LineUnion, LineUnionKind};
 pub use nurbs::{NurbsCurve3, NurbsSurface3};
