@@ -183,3 +183,5 @@ mod tests {
 
 mod arc_fit;
 pub use arc_fit::{fit_arc_chain, ArcFitVertex};
+mod bounds;
+pub use bounds::analytic_curve_bounds;
