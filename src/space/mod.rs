@@ -29,4 +29,4 @@ pub use spline::{clamped_uniform_knots, de_boor, Parameterization};
 pub use vec::Vec3;
 
 #[cfg(feature = "geom2d")]
-pub use planar::PlanarCurve;
+pub use planar::{common_curve_plane, PlanarCurve};
