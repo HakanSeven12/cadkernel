@@ -8,6 +8,10 @@ repository = "https://github.com/HakanSeven12/cadkernel"
 keywords = ["cad", "geometry", "brep", "nurbs", "kernel"]
 categories = ["mathematics", "graphics"]
 
+[workspace]
+members = ["crates/cadkernel-constraints"]
+resolver = "2"
+
 [features]
 default = ["geom2d"]
 
