@@ -412,3 +412,35 @@ pub fn common_curve_plane(curves: &[PlanarCurve], tolerance: f64) -> Option<Plan
     if offsets.iter().any(|offset| offset.dot(normal).abs() > tolerance + roundoff) { return None; }
     Plane::orthonormal(origin.to_array(), x.to_array(), normal.to_array())
 }
+
+#[cfg(test)]
+mod common_plane_tests {
+    use super::*;
+    use crate::geom2d::Line;
+
+    #[test]
+    fn disconnected_lines_in_one_plane_share_that_plane() {
+        let curves = [
+            PlanarCurve::flat(Curve::Line(Line { start: [0.0, 0.0], end: [2.0, 0.0] })),
+            PlanarCurve::flat(Curve::Line(Line { start: [0.0, 1.0], end: [0.0, 3.0] })),
+        ];
+        let plane = common_curve_plane(&curves, 1e-9).unwrap();
+        assert!(curves.iter().flat_map(|curve| [curve.point_at(0.0), curve.point_at(1.0)])
+            .all(|point| plane.contains(point, 1e-9)));
+    }
+
+    #[test]
+    fn noncoplanar_curve_support_is_rejected() {
+        let raised = Plane::from_axes(
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        );
+        let curves = [
+            PlanarCurve::flat(Curve::Line(Line { start: [0.0, 0.0], end: [2.0, 0.0] })),
+            PlanarCurve::flat(Curve::Line(Line { start: [0.0, 0.0], end: [0.0, 2.0] })),
+            PlanarCurve::new(raised, Curve::Line(Line { start: [0.0, 0.0], end: [1.0, 1.0] })),
+        ];
+        assert!(common_curve_plane(&curves, 1e-9).is_none());
+    }
+}

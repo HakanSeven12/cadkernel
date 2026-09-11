@@ -109,3 +109,44 @@ pub fn fit_arc_chain(points: &[[f64; 2]], closed: bool, directions: &[Option<[f6
     if !closed { result.push(ArcFitVertex { point: points[n - 1].to_array(), bulge: 0.0, source: n - 1, fraction: 0.0, inserted: false }); }
     Some(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_points_remain_one_straight_span() {
+        let fitted = fit_arc_chain(&[[0.0, 0.0], [3.0, 4.0]], false, &[None, None]).unwrap();
+        assert_eq!(fitted.len(), 2);
+        assert_eq!(fitted[0].point, [0.0, 0.0]);
+        assert_eq!(fitted[0].bulge, 0.0);
+        assert_eq!(fitted[1].point, [3.0, 4.0]);
+    }
+
+    #[test]
+    fn curved_chain_keeps_endpoints_and_returns_finite_arcs() {
+        let fitted = fit_arc_chain(
+            &[[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]],
+            false,
+            &[None, None, None],
+        )
+        .unwrap();
+        assert_eq!(fitted.first().unwrap().point, [0.0, 0.0]);
+        assert_eq!(fitted.last().unwrap().point, [2.0, 0.0]);
+        assert!(fitted.iter().all(|vertex| {
+            vertex.point.iter().all(|value| value.is_finite())
+                && vertex.bulge.is_finite()
+                && vertex.fraction.is_finite()
+        }));
+    }
+
+    #[test]
+    fn invalid_direction_rejects_the_entire_fit() {
+        assert!(fit_arc_chain(
+            &[[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]],
+            false,
+            &[Some([f64::MAX, f64::MAX]), None, None],
+        )
+        .is_none());
+    }
+}

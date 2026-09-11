@@ -57,3 +57,52 @@ fn remove_once(curve: &NurbsCurve3, knot: f64, tolerance: f64) -> Option<NurbsCu
     let weights = controls.iter().map(|point| point[3]).collect();
     NurbsCurve3::new_strict(degree, points, knots, weights).map(|result| result.with_periodicity(curve.periodicity()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redundant_inserted_knot_is_removed_without_changing_shape() {
+        let curve = NurbsCurve3::new_strict(
+            2,
+            vec![
+                [0.0, 0.0, 0.0],
+                [0.5, 0.5, 0.0],
+                [1.0, 0.5, 0.0],
+                [1.5, 0.5, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
+            vec![1.0; 5],
+        )
+        .unwrap();
+        let compact = curve.compact_knots(1e-12).unwrap();
+
+        assert_eq!(compact.control_points().len(), 4);
+        assert_eq!(compact.knots().iter().filter(|knot| **knot == 0.5).count(), 1);
+        for step in 0..=20 {
+            let parameter = step as f64 / 20.0;
+            assert!(Vec3::from(curve.point_at(parameter))
+                .distance(Vec3::from(compact.point_at(parameter))) < 1e-12);
+        }
+    }
+
+    #[test]
+    fn unequal_rational_weights_are_left_untouched() {
+        let curve = NurbsCurve3::new_strict(
+            2,
+            vec![
+                [0.0, 0.0, 0.0],
+                [0.5, 0.5, 0.0],
+                [1.0, 0.5, 0.0],
+                [1.5, 0.5, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
+            vec![1.0, 2.0, 1.0, 2.0, 1.0],
+        )
+        .unwrap();
+        assert_eq!(curve.compact_knots(1e-12).unwrap(), curve);
+    }
+}
