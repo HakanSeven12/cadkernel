@@ -14,6 +14,9 @@ pub fn line_as_nurbs(points: [[f64; 3]; 2], degree: usize) -> Option<NurbsCurve3
 /// Join touching clamped NURBS of equal degree without fitting or sampling.
 /// The source direction is retained; the other curve can be reversed or prepended.
 /// Rational weights are rescaled at the seam, which has C0 continuity.
+/// Coincident endpoints preserve both curve shapes exactly. Within tolerance,
+/// only the candidate endpoint is snapped to the source endpoint; the source
+/// control points and weights remain unchanged when appending or prepending.
 pub fn join_nurbs_curves(source: &NurbsCurve3, other: &NurbsCurve3, tolerance: f64) -> Option<NurbsCurve3> {
     if !tolerance.is_finite() || tolerance < 0.0 || source.degree()!=other.degree() || source.is_closed() || other.is_closed() { return None; }
     let degree=source.degree();
@@ -28,15 +31,26 @@ pub fn join_nurbs_curves(source: &NurbsCurve3, other: &NurbsCurve3, tolerance: f
             curve.knots().iter().rev().map(|v|a+b-v).collect(),curve.weights().iter().copied().rev().collect())
     }
     let close=|a:[f64;3],b:[f64;3]|Vec3::from(a).distance(Vec3::from(b))<=tolerance;
-    let (first,second)=if close(source.point_at(1.0),other.point_at(0.0)) {(source.clone(),other.clone())}
-        else if close(source.point_at(1.0),other.point_at(1.0)) {(source.clone(),reverse(other)?)}
-        else if close(source.point_at(0.0),other.point_at(1.0)) {(other.clone(),source.clone())}
-        else if close(source.point_at(0.0),other.point_at(0.0)) {(reverse(other)?,source.clone())}
+    let (first,second,prepend)=if close(source.point_at(1.0),other.point_at(0.0)) {(source.clone(),other.clone(),false)}
+        else if close(source.point_at(1.0),other.point_at(1.0)) {(source.clone(),reverse(other)?,false)}
+        else if close(source.point_at(0.0),other.point_at(1.0)) {(other.clone(),source.clone(),true)}
+        else if close(source.point_at(0.0),other.point_at(0.0)) {(reverse(other)?,source.clone(),true)}
         else {return None;};
     let (_,end)=first.domain();let(start,_)=second.domain();
-    let mut controls=first.control_points().to_vec(); controls.extend_from_slice(&second.control_points()[1..]);
-    let ratio=first.weights().last()? / second.weights().first()?;
-    let mut weights=first.weights().to_vec(); weights.extend(second.weights()[1..].iter().map(|w|w*ratio));
+    let mut controls=first.control_points().to_vec();
+    if prepend { *controls.last_mut()? = *second.control_points().first()?; }
+    controls.extend_from_slice(&second.control_points()[1..]);
+    let mut weights = if prepend {
+        let ratio=second.weights().first()? / first.weights().last()?;
+        first.weights().iter().map(|weight| weight * ratio).collect::<Vec<_>>()
+    } else { first.weights().to_vec() };
+    if prepend {
+        *weights.last_mut()? = *second.weights().first()?;
+        weights.extend_from_slice(&second.weights()[1..]);
+    } else {
+        let ratio=first.weights().last()? / second.weights().first()?;
+        weights.extend(second.weights()[1..].iter().map(|weight| weight * ratio));
+    }
     let mut knots=first.knots()[..first.knots().len()-1].to_vec();
     knots.extend(second.knots()[degree+1..].iter().map(|v|v-start+end));
     NurbsCurve3::new_strict(degree,controls,knots,weights)
