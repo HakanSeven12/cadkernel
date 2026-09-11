@@ -713,6 +713,84 @@ impl NurbsSurface3 {
         )
     }
 
+    /// The knot parameters of the nearest point on the surface.
+    ///
+    /// NURBS surfaces have no closed-form inverse. A coarse search finds a
+    /// stable basin, then a damped Gauss-Newton iteration follows the surface
+    /// tangents to the nearest point.
+    pub fn parameters_at(&self, point: [f64; 3]) -> Option<(f64, f64)> {
+        const GRID: usize = 16;
+        const ITERATIONS: usize = 32;
+        let ((u0, u1), (v0, v1)) = self.domain();
+        if ![u0, u1, v0, v1].into_iter().all(f64::is_finite)
+            || u1 <= u0
+            || v1 <= v0
+        {
+            return None;
+        }
+        let target = Vec3::from(point);
+        let mut best = (f64::INFINITY, u0, v0);
+        for u_index in 0..=GRID {
+            let u = u0 + (u1 - u0) * u_index as f64 / GRID as f64;
+            for v_index in 0..=GRID {
+                let v = v0 + (v1 - v0) * v_index as f64 / GRID as f64;
+                let distance =
+                    (Vec3::from(self.point_at_knot(u, v)) - target).length_squared();
+                if distance.is_finite() && distance < best.0 {
+                    best = (distance, u, v);
+                }
+            }
+        }
+        if !best.0.is_finite() {
+            return None;
+        }
+        let (mut u, mut v) = (best.1, best.2);
+        for _ in 0..ITERATIONS {
+            let position = Vec3::from(self.point_at_knot(u, v));
+            let residual = position - target;
+            let Some((along_u, along_v)) = self.tangents_at_knot(u, v) else {
+                break;
+            };
+            let (along_u, along_v) = (Vec3::from(along_u), Vec3::from(along_v));
+            let uu = along_u.dot(along_u);
+            let uv = along_u.dot(along_v);
+            let vv = along_v.dot(along_v);
+            let determinant = uu * vv - uv * uv;
+            if !determinant.is_finite()
+                || determinant.abs() <= f64::EPSILON * uu.abs().max(vv.abs()).max(1.0)
+            {
+                break;
+            }
+            let ru = along_u.dot(residual);
+            let rv = along_v.dot(residual);
+            let step = [
+                (-ru * vv + uv * rv) / determinant,
+                (uv * ru - uu * rv) / determinant,
+            ];
+            let current = residual.length_squared();
+            let mut accepted = false;
+            for divisor in [1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {
+                let candidate_u =
+                    wrap_parameter(u + step[0] / divisor, u0, u1, self.u_closed);
+                let candidate_v =
+                    wrap_parameter(v + step[1] / divisor, v0, v1, self.v_closed);
+                let candidate =
+                    (Vec3::from(self.point_at_knot(candidate_u, candidate_v)) - target)
+                        .length_squared();
+                if candidate.is_finite() && candidate < current {
+                    u = candidate_u;
+                    v = candidate_v;
+                    accepted = true;
+                    break;
+                }
+            }
+            if !accepted || step[0].hypot(step[1]) <= f64::EPSILON * 64.0 {
+                break;
+            }
+        }
+        Some((u, v))
+    }
+
     pub fn degrees(&self) -> (usize, usize) {
         (self.u_degree, self.v_degree)
     }
@@ -1220,6 +1298,20 @@ mod tests {
         assert!(middle[2] > 0.5, "{middle:?}");
         assert!(middle[2] < 4.0, "{middle:?}");
         assert!((middle[0] - 5.0).abs() < 1e-9 && (middle[1] - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn surface_parameters_recover_points_on_a_curved_surface() {
+        let surface = hill();
+        for expected in [(0.13, 0.27), (0.5, 0.5), (0.82, 0.71)] {
+            let point = surface.point_at(expected.0, expected.1);
+            let actual = surface.parameters_at(point).unwrap();
+            let recovered = surface.point_at_knot(actual.0, actual.1);
+            assert!(
+                Vec3::from(recovered).distance(Vec3::from(point)) < 1e-8,
+                "expected={expected:?} actual={actual:?} recovered={recovered:?}"
+            );
+        }
     }
 
     #[test]

@@ -100,26 +100,21 @@ impl Surface {
         match self {
             Self::Plane(plane) => plane.point_at([u, v]),
             Self::Cylinder(cylinder) => {
-                let around = cylinder.base.point_at([
-                    cylinder.radius * u.cos(),
-                    cylinder.radius * u.sin(),
-                ]);
+                let around = cylinder
+                    .base
+                    .point_at([cylinder.radius * u.cos(), cylinder.radius * u.sin()]);
                 offset_along_normal(&cylinder.base, around, v)
             }
             Self::Cone(cone) => {
                 // The radius shrinks along the axis at the tangent of the
                 // half-angle, from the *base* circle.
                 let radius = cone.radius - v * cone.half_angle.tan();
-                let around = cone
-                    .base
-                    .point_at([radius * u.cos(), radius * u.sin()]);
+                let around = cone.base.point_at([radius * u.cos(), radius * u.sin()]);
                 offset_along_normal(&cone.base, around, v)
             }
             Self::Sphere(sphere) => {
                 let ring = sphere.radius * v.cos();
-                let around = sphere
-                    .frame
-                    .point_at([ring * u.cos(), ring * u.sin()]);
+                let around = sphere.frame.point_at([ring * u.cos(), ring * u.sin()]);
                 offset_along_normal(&sphere.frame, around, sphere.radius * v.sin())
             }
             Self::Torus(torus) => {
@@ -136,20 +131,18 @@ impl Surface {
         match self {
             Self::Plane(plane) => Some((plane.x_axis, plane.y_axis)),
             Self::Cylinder(cylinder) => Some((
-                cylinder.base.vector_at([
-                    -cylinder.radius * u.sin(),
-                    cylinder.radius * u.cos(),
-                ]),
+                cylinder
+                    .base
+                    .vector_at([-cylinder.radius * u.sin(), cylinder.radius * u.cos()]),
                 cylinder.base.normal()?,
             )),
             Self::Cone(cone) => {
                 let radius = cone.radius - v * cone.half_angle.tan();
                 let radial = cone.base.vector_at([u.cos(), u.sin()]);
-                let along = Vec3::from(cone.base.normal()?)
-                    - Vec3::from(radial) * cone.half_angle.tan();
+                let along =
+                    Vec3::from(cone.base.normal()?) - Vec3::from(radial) * cone.half_angle.tan();
                 Some((
-                    cone.base
-                        .vector_at([-radius * u.sin(), radius * u.cos()]),
+                    cone.base.vector_at([-radius * u.sin(), radius * u.cos()]),
                     along.to_array(),
                 ))
             }
@@ -161,7 +154,7 @@ impl Surface {
                     (Vec3::from(around) * (sphere.radius * v.cos())).to_array(),
                     (Vec3::from(radial) * (-sphere.radius * v.sin())
                         + normal * (sphere.radius * v.cos()))
-                        .to_array(),
+                    .to_array(),
                 ))
             }
             Self::Torus(torus) => {
@@ -173,7 +166,7 @@ impl Surface {
                     (Vec3::from(around) * ring).to_array(),
                     (Vec3::from(radial) * (-torus.minor_radius * v.sin())
                         + normal * (torus.minor_radius * v.cos()))
-                        .to_array(),
+                    .to_array(),
                 ))
             }
             Self::Nurbs(surface) => surface.tangents_at_knot(u, v),
@@ -184,11 +177,9 @@ impl Surface {
     pub fn normal_at(&self, u: f64, v: f64) -> Option<[f64; 3]> {
         match self {
             Self::Plane(plane) => plane.normal(),
-            Self::Cylinder(cylinder) => Vec3::from(
-                cylinder.base.vector_at([u.cos(), u.sin()]),
-            )
-            .normalize()
-            .map(Vec3::to_array),
+            Self::Cylinder(cylinder) => Vec3::from(cylinder.base.vector_at([u.cos(), u.sin()]))
+                .normalize()
+                .map(Vec3::to_array),
             Self::Sphere(sphere) => (Vec3::from(self.point_at(u, v))
                 - Vec3::from(sphere.frame.origin))
             .normalize()
@@ -266,11 +257,18 @@ impl Surface {
                 Some((local[1].atan2(local[0]), height.atan2(ring)))
             }
             Self::Torus(torus) => {
+                if torus.minor_radius.abs() <= f64::EPSILON {
+                    return None;
+                }
                 let local = torus.frame.project(point)?;
                 let height = height_above(&torus.frame, point)?;
                 let ring = local[0].hypot(local[1]);
                 let around = local[1].atan2(local[0]);
-                let outer = (around, height.atan2(ring - torus.major_radius));
+                let minor_sign = torus.minor_radius.signum();
+                let outer = (
+                    around,
+                    (height * minor_sign).atan2((ring - torus.major_radius) * minor_sign),
+                );
                 // A horn or spindle torus has a second sheet whose signed
                 // ring is negative. In space that reverses the longitude by
                 // half a turn; `hypot` alone folds it onto the other sheet.
@@ -278,7 +276,7 @@ impl Surface {
                 // back nearest to the supplied point.
                 let inner = (
                     around + std::f64::consts::PI,
-                    height.atan2(-ring - torus.major_radius),
+                    (height * minor_sign).atan2((-ring - torus.major_radius) * minor_sign),
                 );
                 let error = |parameters: (f64, f64)| {
                     Vec3::from(self.point_at(parameters.0, parameters.1))
@@ -290,7 +288,7 @@ impl Surface {
                     Some(outer)
                 }
             }
-            Self::Nurbs(_) => None,
+            Self::Nurbs(surface) => surface.parameters_at(point),
         }
     }
 
@@ -372,9 +370,7 @@ impl Surface {
     pub fn distance_to(&self, point: [f64; 3]) -> f64 {
         match self {
             Self::Plane(plane) => plane.distance_to(point).unwrap_or(f64::INFINITY),
-            Self::Cylinder(cylinder) => {
-                axial_distance(&cylinder.base, point).1 - cylinder.radius
-            }
+            Self::Cylinder(cylinder) => axial_distance(&cylinder.base, point).1 - cylinder.radius,
             Self::Cone(cone) => {
                 let (along, across) = axial_distance(&cone.base, point);
                 // In the (across, along) half plane the cone's profile is not
@@ -398,7 +394,11 @@ impl Surface {
                 // For a self-intersecting torus neither signed half-plane
                 // circle contains the other parametrised sheet. The nearest
                 // sheet is the one with the smaller absolute residual.
-                if inner.abs() < outer.abs() { inner } else { outer }
+                if inner.abs() < outer.abs() {
+                    inner
+                } else {
+                    outer
+                }
             }
             Self::Nurbs(_) => f64::INFINITY,
         }
@@ -580,8 +580,9 @@ impl Curve3 {
                 // Squashed onto the unit circle, where the parameter reads
                 // straight off. Taking the angle of the raw point instead
                 // would be wrong by up to the eccentricity.
-                Some(local) => (local[1] / ellipse.minor_radius)
-                    .atan2(local[0] / ellipse.major_radius),
+                Some(local) => {
+                    (local[1] / ellipse.minor_radius).atan2(local[0] / ellipse.major_radius)
+                }
                 None => 0.0,
             },
             Self::PlanarSpline { plane, curve } => match plane.project(point) {
@@ -667,7 +668,13 @@ mod tests {
             half_angle: FRAC_PI_4,
         });
         // The apex is ten up; twice that is ten out again on the far nappe.
-        for (height, radius) in [(0.0, 10.0), (6.0, 4.0), (10.0, 0.0), (16.0, 6.0), (20.0, 10.0)] {
+        for (height, radius) in [
+            (0.0, 10.0),
+            (6.0, 4.0),
+            (10.0, 0.0),
+            (16.0, 6.0),
+            (20.0, 10.0),
+        ] {
             let on = [radius, 0.0, height];
             assert!(surface.distance_to(on).abs() < 1e-12, "{on:?}");
         }
@@ -706,7 +713,10 @@ mod tests {
         });
         for u in [0.0, 1.0, PI, 5.0] {
             for v in [0.0, 1.0, PI, 5.0] {
-                assert!(surface.contains(surface.point_at(u, v), 1e-9), "u={u} v={v}");
+                assert!(
+                    surface.contains(surface.point_at(u, v), 1e-9),
+                    "u={u} v={v}"
+                );
             }
         }
         // The outermost point of the ring, and the innermost.
@@ -714,6 +724,26 @@ mod tests {
         assert!((surface.point_at(0.0, PI)[0] - 8.0).abs() < 1e-12);
         // The centre of the hole is a major radius from the tube.
         assert!((surface.distance_to([0.0, 0.0, 0.0]) - 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn negative_minor_radius_torus_parameters_round_trip() {
+        let surface = Surface::Torus(Torus {
+            frame: xy(),
+            major_radius: 12.65,
+            minor_radius: -2.0,
+        });
+        for u in [0.0, 0.7, PI, 5.2] {
+            for v in [0.0, 0.8, PI, 5.4] {
+                let point = surface.point_at(u, v);
+                let parameters = surface.parameters_at(point).unwrap();
+                let recovered = surface.point_at(parameters.0, parameters.1);
+                assert!(
+                    Vec3::from(recovered).distance(Vec3::from(point)) < 1e-9,
+                    "u={u} v={v} parameters={parameters:?} recovered={recovered:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -761,9 +791,7 @@ mod tests {
         for i in 0..8 {
             let point = curve.point_at(TAU * i as f64 / 8.0);
             assert!(plane.contains(point, 1e-9), "{point:?}");
-            assert!(
-                (Vec3::from(point).distance(Vec3::from(plane.origin)) - 2.0).abs() < 1e-9
-            );
+            assert!((Vec3::from(point).distance(Vec3::from(plane.origin)) - 2.0).abs() < 1e-9);
         }
     }
 
