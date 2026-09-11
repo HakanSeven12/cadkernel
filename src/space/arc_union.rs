@@ -50,3 +50,13 @@ pub fn circular_arc_union(a: CircularArc, b: CircularArc, tolerance: f64) -> Opt
     Some(ArcUnion{start:(a.start+low).rem_euclid(TAU),end:(a.start+high).rem_euclid(TAU),full_circle:high-low>=TAU-epsilon,
         kind:if overlap>epsilon {ArcUnionKind::Overlap}else{ArcUnionKind::EndToEnd}})
 }
+
+/// Whether a complete circle contains this finite arc on the same support.
+/// Exact support matching follows cleanup semantics; no circle is displaced.
+pub fn circle_contains_arc(center: [f64; 3], normal: [f64; 3], radius: f64, arc: CircularArc) -> bool {
+    center == arc.center && normal == arc.normal && radius == arc.radius
+        && center.iter().chain(normal.iter()).all(|v| v.is_finite())
+        && radius.is_finite() && radius > 0.0 && super::Vec3::from(normal).normalize().is_some()
+        && arc.start.is_finite() && arc.end.is_finite()
+        && { let span = (arc.end - arc.start).rem_euclid(std::f64::consts::TAU); span.is_finite() && span > 0.0 }
+}
