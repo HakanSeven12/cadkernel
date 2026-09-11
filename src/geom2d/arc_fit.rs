@@ -1,5 +1,5 @@
 //! Tangent-continuous circular fitting of planar vertex chains.
-use super::{arc_from_start_tangent, Vec2};
+use super::{arc_from_start_tangent, Curve, Vec2};
 
 /// One fitted vertex, with its original span and distance fraction for attributes.
 #[derive(Clone, Debug)]
@@ -58,15 +58,38 @@ pub fn fit_arc_chain(points: &[[f64; 2]], closed: bool, directions: &[Option<[f6
             result.push(ArcFitVertex { point: p0.to_array(), bulge: 0.0, source: i, fraction: 0.0, inserted: false });
             continue;
         }
-        let a = 2.0 * (1.0 - t0.dot(t1).clamp(-1.0, 1.0));
-        let b = d.dot(t0 + t1);
-        let k = if a > 1e-12 {
-            let root = (b * b + a * d.length_squared()).sqrt();
-            if b >= 0.0 { d.length_squared() / (root + b) } else { (root - b) / a }
-        } else if b.abs() > 1e-12 { d.length_squared() / (2.0 * b) }
-        else { d.length() * 0.5 };
-        if !k.is_finite() || k <= 0.0 { return None; }
-        let knee = (p0 + t0 * k + p1 - t1 * k) * 0.5;
+        let s0 = chords[i].cross(t0);
+        let s1 = chords[i].cross(t1);
+        if s0.abs() <= 1e-12 || s1.abs() <= 1e-12 {
+            result.push(ArcFitVertex { point: p0.to_array(), bulge: 0.0, source: i, fraction: 0.0, inserted: false });
+            continue;
+        }
+        // Match the two circle-center projections on the chord, then solve
+        // their tangency. Signed radii support inflection as well as convex arcs.
+        let a = -2.0 * (1.0 - t0.dot(t1).clamp(-1.0, 1.0)) / (s0 * s1);
+        let discriminant = 16.0 - 4.0 * a;
+        let knee = if discriminant >= -1e-12 {
+            let reach = d.length() * 2.0 / (4.0 + discriminant.max(0.0).sqrt());
+            let r0 = -reach / s0;
+            let r1 = reach / s1;
+            let c0 = p0 + t0.perpendicular() * r0;
+            let c1 = p1 + t1.perpendicular() * r1;
+            if (r0 - r1).abs() <= 1e-12 * r0.abs().max(r1.abs()).max(1.0) {
+                let arc = arc_from_start_tangent(p0.to_array(), t0.to_array(), p1.to_array(), false)?;
+                Vec2::from(Curve::Arc(arc).point_at(0.5))
+            } else { (c1 * r0 - c0 * r1) / (r0 - r1) }
+        } else {
+            // A convex pair can lack symmetric-center roots. Join its circles
+            // with a common tangent parallel to the chord instead.
+            let normal = chords[i].perpendicular();
+            let from = t0.perpendicular() - normal;
+            let to = normal - t1.perpendicular();
+            let determinant = from.cross(to);
+            if determinant.abs() <= 1e-12 { return None; }
+            let radius = d.cross(to) / determinant;
+            p0 + from * radius
+        };
+        if knee.to_array().iter().any(|v| !v.is_finite()) { return None; }
         let (first_bulge, first_length) = arc_piece(p0, t0, knee)?;
         let (reverse_bulge, second_length) = arc_piece(p1, -t1, knee)?;
         let fraction = first_length / (first_length + second_length);
