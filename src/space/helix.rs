@@ -23,6 +23,43 @@ pub struct HelixCurve {
 }
 
 impl HelixCurve {
+    /// Recover the axial frame and base radius from stored generating points.
+    /// At a zero-radius base the projected curve tangent defines radial phase.
+    pub fn frame_from_points(base: [f64; 3], axis: [f64; 3], start: [f64; 3], tangent: [f64; 3]) -> Option<([f64; 3], [f64; 3], f64)> {
+        if base.iter().chain(axis.iter()).chain(start.iter()).chain(tangent.iter()).any(|v| !v.is_finite()) { return None; }
+        let axis = Vec3::from(axis).normalize()?;
+        let delta = Vec3::from(start) - Vec3::from(base);
+        let radial = delta - axis * delta.dot(axis);
+        let radius = radial.length();
+        if !radius.is_finite() { return None; }
+        let direction = if radius > 1e-12 { radial.normalize()? } else {
+            let tangent = Vec3::from(tangent);
+            (tangent - axis * tangent.dot(axis)).normalize()?
+        };
+        Some((axis.to_array(), direction.to_array(), radius))
+    }
+
+    /// Reverse traversal while preserving the complete helical locus.
+    /// Axis and endpoint radii exchange roles; handedness and turn count stay fixed.
+    pub fn reversed(&self) -> Option<Self> {
+        if !self.is_valid() { return None; }
+        if self.turns == 0.0 { return Some(*self); }
+        let (center, x, y, axis) = self.frame()?;
+        let angle = self.total_angle()?;
+        let winding = match self.direction { HelixDirection::Clockwise => -1.0, HelixDirection::CounterClockwise => 1.0 };
+        let reversed = Self {
+            base_center: (center + axis * self.height).to_array(),
+            axis_direction: (-axis).to_array(),
+            start_direction: (x * angle.cos() + y * (winding * angle.sin())).to_array(),
+            base_radius: self.top_radius,
+            top_radius: self.base_radius,
+            height: self.height,
+            turns: self.turns,
+            direction: self.direction,
+        };
+        (reversed.is_valid() && reversed.frame().is_some()).then_some(reversed)
+    }
+
     const SEGMENTS_PER_TURN: f64 = 6.0;
     const MAX_SEGMENTS: usize = 100_000;
 
@@ -43,9 +80,11 @@ impl HelixCurve {
             && self.top_radius.is_finite()
             && self.height.is_finite()
             && self.turns.is_finite()
-            && self.base_radius > 0.0
+            && self.base_radius >= 0.0
             && self.top_radius >= 0.0
-            && self.turns > 0.0
+            && (self.base_radius > 0.0 || self.top_radius > 0.0)
+            && self.turns >= 0.0
+            && (self.turns > 0.0 || self.height == 0.0)
     }
 
     fn total_angle(&self) -> Option<f64> {
@@ -92,6 +131,10 @@ impl HelixCurve {
             return None;
         }
         let frame = self.frame()?;
+        if self.turns == 0.0 {
+            let point = (frame.0 + frame.1 * self.base_radius).to_array();
+            return NurbsCurve3::new_strict(1, vec![point, point], vec![0.0, 0.0, 1.0, 1.0], vec![1.0, 1.0]);
+        }
         let total_angle = self.total_angle()?;
         let segments = self.segment_count()?;
         let angle_step = total_angle / segments as f64;
@@ -127,6 +170,7 @@ impl HelixCurve {
         if !self.is_valid() || self.frame().is_none() {
             return None;
         }
+        if self.turns == 0.0 { return Some(0.0); }
         let total_angle = self.total_angle()?;
         let radius_delta = self.top_radius - self.base_radius;
         let radial_rate = radius_delta / total_angle;
@@ -167,5 +211,40 @@ impl HelixCurve {
     pub fn turn_slope(&self) -> Option<f64> {
         (self.is_valid() && self.frame().is_some())
             .then(|| (self.top_radius - self.base_radius).atan2(self.height.abs()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_base_radius_reverses_between_the_same_endpoints() {
+        let helix = HelixCurve { base_center: [1.0, 2.0, 3.0], axis_direction: [0.0, 0.0, 1.0],
+            start_direction: [1.0, 0.0, 0.0], base_radius: 0.0, top_radius: 2.0, height: 5.0,
+            turns: 1.25, direction: HelixDirection::CounterClockwise };
+        let original = helix.nurbs().unwrap();
+        let reversed = helix.reversed().unwrap().nurbs().unwrap();
+        assert!(Vec3::from(original.point_at(0.0)).distance(Vec3::from(reversed.point_at(1.0))) < 1e-9);
+        assert!(Vec3::from(original.point_at(1.0)).distance(Vec3::from(reversed.point_at(0.0))) < 1e-9);
+    }
+
+    #[test]
+    fn a_zero_turn_zero_height_helix_is_one_exact_point() {
+        let helix = HelixCurve {
+            base_center: [1.0, 2.0, 3.0],
+            axis_direction: [0.0, 0.0, 1.0],
+            start_direction: [1.0, 0.0, 0.0],
+            base_radius: 2.0,
+            top_radius: 4.0,
+            height: 0.0,
+            turns: 0.0,
+            direction: HelixDirection::CounterClockwise,
+        };
+        let curve = helix.nurbs().unwrap();
+        assert_eq!(helix.length(), Some(0.0));
+        assert_eq!(curve.point_at(0.0), [3.0, 2.0, 3.0]);
+        assert_eq!(curve.point_at(1.0), [3.0, 2.0, 3.0]);
+        assert_eq!(helix.reversed(), Some(helix));
     }
 }

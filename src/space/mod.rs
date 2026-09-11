@@ -11,9 +11,17 @@
 //! circles, ellipses and polylines are stored exactly this way, and so is a
 //! planar B-rep face.
 
+pub mod alignment;
+pub mod arclength;
+pub mod arc_union;
 pub mod curve;
+pub mod endpoint_join;
 pub mod helix;
+pub mod line_union;
+pub mod lengthen;
 pub mod nurbs;
+mod knot_compaction;
+mod polyline_approximation;
 pub mod plane;
 pub mod polygon;
 pub mod spline;
@@ -23,11 +31,15 @@ pub mod vec;
 #[cfg(feature = "geom2d")]
 pub mod planar;
 
+pub use alignment::align_point_pairs;
+pub use arclength::ArcLengthCurve3;
 pub use helix::{HelixCurve, HelixDirection};
+pub use line_union::{line_union, simplify_linear_chain, LineUnion, LineUnionKind};
 pub use nurbs::{NurbsCurve3, NurbsSurface3};
 pub use plane::{are_coplanar, coplanarity_tolerance, Plane};
+pub use polyline_approximation::SplinePolyline;
 pub use spline::{clamped_uniform_knots, de_boor, Parameterization};
 pub use vec::Vec3;
 
 #[cfg(feature = "geom2d")]
-pub use planar::PlanarCurve;
+pub use planar::{common_curve_plane, PlanarCurve};

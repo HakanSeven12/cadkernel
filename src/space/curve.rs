@@ -246,4 +246,78 @@ mod tests {
             curvature.length()
         );
     }
+
+    #[test]
+    fn spatial_angle_bisector_handles_regular_and_nearly_opposite_rays() {
+        let diagonal = Vec3::from(
+            angle_bisector([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0])
+                .unwrap(),
+        );
+        let expected = std::f64::consts::FRAC_1_SQRT_2;
+        assert!((diagonal.x - expected).abs() < 1e-12);
+        assert!((diagonal.y - expected).abs() < 1e-12);
+
+        let near_opposite = Vec3::from(
+            angle_bisector(
+                [1.0, 1e-9, 0.0],
+                [-1.0, 1e-9, 0.0],
+                [0.0, 0.0, 1.0],
+            )
+            .unwrap(),
+        );
+        assert!(near_opposite.x.abs() < 1e-12, "{near_opposite:?}");
+        assert!((near_opposite.y - 1.0).abs() < 1e-12, "{near_opposite:?}");
+    }
+
+    #[test]
+    fn antiparallel_bisector_uses_the_oriented_plane_normal() {
+        assert_eq!(
+            angle_bisector([1.0, 0.0, 0.0], [-2.0, 0.0, 0.0], [0.0, 0.0, 4.0]),
+            Some([0.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            angle_bisector([-2.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 4.0]),
+            Some([0.0, -1.0, 0.0])
+        );
+        assert_eq!(
+            angle_bisector([1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [2.0, 0.0, 0.0]),
+            None
+        );
+    }
+
+    #[test]
+    fn spatial_angle_bisector_rejects_invalid_rays_without_overflowing() {
+        assert_eq!(angle_bisector([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]), None);
+        assert_eq!(
+            angle_bisector([f64::INFINITY, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            None
+        );
+        let huge = Vec3::from(
+            angle_bisector(
+                [f64::MAX, f64::MAX, 0.0],
+                [f64::MAX, f64::MAX, 0.0],
+                [0.0, 0.0, 1.0],
+            )
+            .unwrap(),
+        );
+        assert!(huge.is_finite());
+        assert!((huge.length() - 1.0).abs() < 1e-12);
+    }
+}
+
+/// Unit bisector of two spatial rays. Opposite rays use the oriented normal
+/// to select the perpendicular direction (normal cross first ray).
+/// A zero ray, nonfinite input or an indeterminate antiparallel plane fails.
+/// Nearly opposite but distinct rays retain their actual bisector.
+pub fn angle_bisector(first: [f64; 3], second: [f64; 3], normal: [f64; 3]) -> Option<[f64; 3]> {
+    if first.iter().chain(second.iter()).chain(normal.iter()).any(|v| !v.is_finite()) { return None; }
+    fn unit(value: Vec3) -> Option<Vec3> {
+        let scale = value.x.abs().max(value.y.abs()).max(value.z.abs());
+        if scale == 0.0 || !scale.is_finite() { return None; }
+        (value / scale).normalize()
+    }
+    let a = unit(Vec3::from(first))?;
+    let b = unit(Vec3::from(second))?;
+    let direction = unit(a + b).or_else(|| unit(unit(Vec3::from(normal))?.cross(a)))?;
+    Some(direction.to_array())
 }

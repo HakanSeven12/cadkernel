@@ -24,6 +24,48 @@ use super::curve::{Curve, Extent};
 use super::vec::Vec2;
 use super::Tolerance;
 
+/// Parameter spans remaining after removing a picked interval from a bounded curve.
+/// Open curves keep both outside spans, independent of pick order. A single
+/// interior parameter splits an open curve without removing any geometry.
+/// Closed curves keep the directed complement, which may end beyond parameter 1.
+pub fn break_spans(curve: &Curve, first: f64, second: f64, tolerance: Tolerance) -> Option<Vec<[f64; 2]>> {
+    if curve.extent() != Extent::Bounded || !first.is_finite() || !second.is_finite() {
+        return None;
+    }
+    let a = first.clamp(0.0, 1.0);
+    let b = second.clamp(0.0, 1.0);
+    let speed = Vec2::from(curve.tangent_at(a)).length()
+        .max(Vec2::from(curve.tangent_at(b)).length());
+    if !speed.is_finite() || speed <= 0.0 {
+        return None;
+    }
+    let epsilon = (tolerance.linear() / speed).min(1.0);
+    if curve.is_closed() {
+        // A closed polyline can split at a single point into two open chains
+        // retaining its original seam; a closed conic cannot represent this.
+        if matches!(curve, Curve::Polyline(_)) && (a - b).abs() <= epsilon {
+            let mut spans = Vec::with_capacity(2);
+            if a > epsilon { spans.push([0.0, a]); }
+            if 1.0 - a > epsilon { spans.push([a, 1.0]); }
+            return Some(spans);
+        }
+        let removed = (b - a).rem_euclid(1.0);
+        if removed <= epsilon || 1.0 - removed <= epsilon {
+            return None;
+        }
+        return Some(vec![[b, b + 1.0 - removed]]);
+    }
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut spans = Vec::with_capacity(2);
+    if lo > epsilon {
+        spans.push([0.0, lo]);
+    }
+    if 1.0 - hi > epsilon {
+        spans.push([hi, 1.0]);
+    }
+    Some(spans)
+}
+
 /// Curve spans left after removing the cut interval containing `picked`.
 pub fn trim_spans(
     curve: &Curve,
@@ -177,7 +219,7 @@ pub fn inside_pieces(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom2d::{Arc, Circle, Line, XLine};
+    use crate::geom2d::{Arc, Circle, Line, Polyline, PolylineVertex, XLine};
     use std::f64::consts::TAU;
 
     fn tol() -> Tolerance {
@@ -327,6 +369,49 @@ mod tests {
     #[test]
     fn an_empty_boundary_encloses_nothing() {
         assert!(inside_spans(&[], &crossing_line(5.0), tol()).is_empty());
+    }
+
+    #[test]
+    fn breaking_an_open_curve_keeps_both_outside_spans() {
+        let curve = line([0.0, 0.0], [10.0, 0.0]);
+        assert_eq!(
+            break_spans(&curve, 0.8, 0.2, tol()),
+            Some(vec![[0.0, 0.2], [0.8, 1.0]])
+        );
+        assert_eq!(
+            break_spans(&curve, 0.4, 0.4, tol()),
+            Some(vec![[0.0, 0.4], [0.4, 1.0]])
+        );
+        assert_eq!(break_spans(&curve, 0.0, 0.0, tol()), Some(vec![[0.0, 1.0]]));
+    }
+
+    #[test]
+    fn breaking_a_closed_curve_keeps_the_directed_complement() {
+        let curve = Curve::Circle(Circle {
+            centre: [0.0, 0.0],
+            radius: 2.0,
+        });
+        assert_eq!(break_spans(&curve, 0.25, 0.75, tol()), Some(vec![[0.75, 1.25]]));
+        assert_eq!(break_spans(&curve, 0.75, 0.25, tol()), Some(vec![[0.25, 0.75]]));
+        assert!(break_spans(&curve, 0.25, 0.25, tol()).is_none());
+        assert!(break_spans(&curve, f64::NAN, 0.5, tol()).is_none());
+        assert!(break_spans(&crossing_line(0.0), 0.25, 0.75, tol()).is_none());
+    }
+
+    #[test]
+    fn one_point_splits_a_closed_polyline_at_its_original_seam_too() {
+        let curve = Curve::Polyline(Polyline {
+            vertices: vec![
+                PolylineVertex::straight([0.0, 0.0]),
+                PolylineVertex::straight([1.0, 0.0]),
+                PolylineVertex::straight([1.0, 1.0]),
+            ],
+            closed: true,
+        });
+        assert_eq!(
+            break_spans(&curve, 0.4, 0.4, tol()),
+            Some(vec![[0.0, 0.4], [0.4, 1.0]])
+        );
     }
 
     #[test]
