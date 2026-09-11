@@ -52,6 +52,32 @@ pub struct NurbsCurve3 {
 }
 
 impl NurbsCurve3 {
+    /// Delete one control vertex from an open clamped curve, intentionally
+    /// changing its shape. Remove the associated interior knot; if fewer
+    /// vertices remain than the current order, lower the degree by one.
+    pub fn without_control_vertex(&self, index: usize) -> Option<Self> {
+        let count = self.control_points.len();
+        let degree = self.degree;
+        if self.closed || count <= 2 || index >= count { return None; }
+        let (start, end) = self.domain();
+        if !self.knots[..=degree].iter().all(|knot| *knot == start)
+            || !self.knots[count..].iter().all(|knot| *knot == end) { return None; }
+        let mut controls = self.control_points.clone();
+        let mut weights = self.weights.clone();
+        let mut knots = self.knots.clone();
+        controls.remove(index);
+        weights.remove(index);
+        let degree = if controls.len() <= degree {
+            knots.pop();
+            knots.remove(0);
+            degree - 1
+        } else {
+            knots.remove((index + (degree + 1) / 2).clamp(degree + 1, count - 1));
+            degree
+        };
+        Self::new_strict(degree, controls, knots, weights)
+    }
+
     /// Builds a curve, filling in what the caller left out.
     ///
     /// A knot vector of the wrong length is replaced with a clamped uniform
