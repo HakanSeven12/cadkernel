@@ -41,6 +41,14 @@ pub fn break_spans(curve: &Curve, first: f64, second: f64, tolerance: Tolerance)
     }
     let epsilon = (tolerance.linear() / speed).min(1.0);
     if curve.is_closed() {
+        // A closed polyline can split at a single point into two open chains
+        // retaining its original seam; a closed conic cannot represent this.
+        if matches!(curve, Curve::Polyline(_)) && (a - b).abs() <= epsilon {
+            let mut spans = Vec::with_capacity(2);
+            if a > epsilon { spans.push([0.0, a]); }
+            if 1.0 - a > epsilon { spans.push([a, 1.0]); }
+            return Some(spans);
+        }
         let removed = (b - a).rem_euclid(1.0);
         if removed <= epsilon || 1.0 - removed <= epsilon {
             return None;
