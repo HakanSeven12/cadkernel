@@ -103,3 +103,15 @@ pub fn join_cocircular_arcs(
         || Vec3::from(source.1).normalize()?.distance(Vec3::from(other.1).normalize()?) > 1e-12 { return None; }
     join_counterclockwise_spans(source.3, other.3)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_join_keeps_the_source_direction() {
+        assert_eq!(join_collinear_lines([[2.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            [[5.0, 0.0, 0.0], [4.0, 0.0, 0.0]], 1e-9),
+            Some([[5.0, 0.0, 0.0], [0.0, 0.0, 0.0]]));
+    }
+}

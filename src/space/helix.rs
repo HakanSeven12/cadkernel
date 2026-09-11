@@ -206,3 +206,19 @@ impl HelixCurve {
             .then(|| (self.top_radius - self.base_radius).atan2(self.height.abs()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_base_radius_reverses_between_the_same_endpoints() {
+        let helix = HelixCurve { base_center: [1.0, 2.0, 3.0], axis_direction: [0.0, 0.0, 1.0],
+            start_direction: [1.0, 0.0, 0.0], base_radius: 0.0, top_radius: 2.0, height: 5.0,
+            turns: 1.25, direction: HelixDirection::CounterClockwise };
+        let original = helix.nurbs().unwrap();
+        let reversed = helix.reversed().unwrap().nurbs().unwrap();
+        assert!(Vec3::from(original.point_at(0.0)).distance(Vec3::from(reversed.point_at(1.0))) < 1e-9);
+        assert!(Vec3::from(original.point_at(1.0)).distance(Vec3::from(reversed.point_at(0.0))) < 1e-9);
+    }
+}

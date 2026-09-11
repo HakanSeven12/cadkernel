@@ -74,3 +74,15 @@ pub fn lengthen_arc(curve: &super::PlanarCurve, pick: [f64; 3], change: LengthCh
     Some(if change_end { (arc.start_angle, arc.start_angle + span) }
         else { (arc.end_angle - span, arc.end_angle) })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dynamic_endpoint_can_cross_the_fixed_endpoint() {
+        assert_eq!(lengthen_line([0.0, 0.0, 0.0], [0.0, 0.0, 4.0], [0.0, 0.0, 4.0],
+            LengthChange::Dynamic([0.0, 2.0, -3.0])),
+            Some([[0.0, 0.0, 0.0], [0.0, 0.0, -3.0]]));
+    }
+}

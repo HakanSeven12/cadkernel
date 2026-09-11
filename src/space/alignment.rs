@@ -77,3 +77,20 @@ pub fn align_point_pairs(
     ];
     matrix.iter().flatten().all(|v| v.is_finite()).then_some(matrix)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn three_pairs_map_a_spatial_frame() {
+        let source = [[1.0, 2.0, 3.0], [3.0, 2.0, 3.0], [1.0, 5.0, 3.0]];
+        let target = [[7.0, 8.0, 9.0], [7.0, 10.0, 9.0], [4.0, 8.0, 9.0]];
+        let matrix = align_point_pairs(&source, &target, true).unwrap();
+        for (from, to) in source.into_iter().zip(target) {
+            let actual = std::array::from_fn(|row| matrix[row][0] * from[0]
+                + matrix[row][1] * from[1] + matrix[row][2] * from[2] + matrix[row][3]);
+            assert!(Vec3::from(actual).distance(Vec3::from(to)) < 1e-12);
+        }
+    }
+}

@@ -127,7 +127,7 @@ impl NurbsCurve3 {
             knots.remove(0);
             degree - 1
         } else {
-            knots.remove((index + (degree + 1) / 2).clamp(degree + 1, count - 1));
+            knots.remove((index + degree.div_ceil(2)).clamp(degree + 1, count - 1));
             degree
         };
         Self::new_strict(degree, controls, knots, weights)
@@ -979,6 +979,29 @@ mod tests {
             [-1.0, -1.0, 3.0],
             [1.0, -1.0, 4.0],
         ]
+    }
+
+    #[test]
+    fn periodic_control_curves_close_and_reverse_without_moving() {
+        let curve = NurbsCurve3::from_control_polygon(2, &[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0],
+            [2.0, 2.0, 1.0], [0.0, 2.0, 0.0]], true).unwrap();
+        assert!(curve.periodicity());
+        assert!(Vec3::from(curve.point_at(0.0)).distance(Vec3::from(curve.point_at(1.0))) < 1e-9);
+        let reversed = curve.reversed().unwrap();
+        for step in 0..=8 {
+            let t = step as f64 / 8.0;
+            assert!(Vec3::from(curve.point_at(t)).distance(Vec3::from(reversed.point_at(1.0 - t))) < 1e-9);
+        }
+    }
+
+    #[test]
+    fn deleting_a_control_vertex_keeps_a_valid_clamped_curve() {
+        let curve = NurbsCurve3::new_strict(3, vec![[0.0; 3], [1.0, 2.0, 0.0],
+            [2.0, 2.0, 0.0], [3.0; 3]], vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            vec![1.0; 4]).unwrap();
+        let reduced = curve.without_control_vertex(1).unwrap();
+        assert_eq!((reduced.degree(), reduced.control_points().len()), (2, 3));
+        assert_eq!(reduced.knots(), &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]

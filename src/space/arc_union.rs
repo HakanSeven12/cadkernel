@@ -50,3 +50,18 @@ pub fn circular_arc_union(a: CircularArc, b: CircularArc, tolerance: f64) -> Opt
     Some(ArcUnion{start:(a.start+low).rem_euclid(TAU),end:(a.start+high).rem_euclid(TAU),full_circle:high-low>=TAU-epsilon,
         kind:if overlap>epsilon {ArcUnionKind::Overlap}else{ArcUnionKind::EndToEnd}})
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touching_half_arcs_form_a_full_circle() {
+        let arc = |start, end| CircularArc { center: [0.0; 3], normal: [0.0, 0.0, 1.0],
+            radius: 2.0, start, end };
+        let union = circular_arc_union(arc(0.0, std::f64::consts::PI),
+            arc(std::f64::consts::PI, std::f64::consts::TAU), 1e-9).unwrap();
+        assert_eq!(union.kind, ArcUnionKind::EndToEnd);
+        assert!(union.full_circle);
+    }
+}

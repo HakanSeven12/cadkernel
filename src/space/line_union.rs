@@ -78,3 +78,18 @@ pub fn simplify_linear_chain(points: &[[f64; 3]], tolerance: f64) -> Vec<usize> 
     }
     kept
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn union_and_simplification_preserve_direction_changes() {
+        let union = line_union([[4.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            [[3.0, 0.0, 0.0], [1.0, 0.0, 0.0]], 1e-9).unwrap();
+        assert_eq!(union.kind, LineUnionKind::Overlap);
+        assert_eq!([union.start, union.end], [[4.0, 0.0, 0.0], [1.0, 0.0, 0.0]]);
+        assert_eq!(simplify_linear_chain(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0], [1.0, 0.0, 0.0]], 1e-9), vec![0, 2, 3]);
+    }
+}
