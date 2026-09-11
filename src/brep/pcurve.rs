@@ -471,34 +471,34 @@ fn trim_to(
             end: final_point,
         }),
         Curve::Circle(circle) => {
-            let angles = swept(&walk, circle.centre, |point, centre| {
+            let (from, to) = swept(&walk, circle.centre, |point, centre| {
                 (point[1] - centre[1]).atan2(point[0] - centre[0])
             });
-            match angles {
-                // The edge really does go the whole way round.
-                None => Curve::Circle(circle),
-                Some((from, to)) => Curve::Arc(Arc {
-                    centre: circle.centre,
-                    radius: circle.radius,
-                    // An arc runs counter-clockwise from its start, so one
-                    // walked the other way is written with its ends swapped.
-                    start_angle: from.min(to),
-                    end_angle: from.max(to),
-                }),
-            }
+            let positive = if (to - from).abs() >= TAU - 1e-9 {
+                Curve::Circle(circle)
+            } else {
+                Curve::Arc(Arc { centre: circle.centre, radius: circle.radius,
+                    start_angle: from.min(to), end_angle: from.max(to) })
+            };
+            // Circle and Arc represent positive traversal only. Retain a
+            // clockwise coedge as an exact reversed rational conic instead.
+            if to < from {
+                Curve::Nurbs(super::nurbs_builder::RationalCurve2::from_curve(&positive)?.reversed().curve()?)
+            } else { positive }
         }
         Curve::Ellipse(whole) => {
-            let angles = swept(&walk, [0.0, 0.0], |point, _| {
+            let (from, to) = swept(&walk, [0.0, 0.0], |point, _| {
                 Curve::Ellipse(whole).parameter_at(*point) * TAU
             });
-            match angles {
-                None => Curve::Ellipse(whole),
-                Some((from, to)) => Curve::Ellipse(EllipseArc {
-                    ellipse: whole.ellipse,
-                    start_parameter: from.min(to),
-                    end_parameter: from.max(to),
-                }),
-            }
+            let positive = if (to - from).abs() >= TAU - 1e-9 {
+                Curve::Ellipse(whole)
+            } else {
+                Curve::Ellipse(EllipseArc { ellipse: whole.ellipse,
+                    start_parameter: from.min(to), end_parameter: from.max(to) })
+            };
+            if to < from {
+                Curve::Nurbs(super::nurbs_builder::RationalCurve2::from_curve(&positive)?.reversed().curve()?)
+            } else { positive }
         }
         // A spline's projection already spans exactly its own edge.
         other => other,
@@ -506,12 +506,12 @@ fn trim_to(
 }
 
 /// Where a walk round a closed curve begins and ends, unwound so the two
-/// bound the part actually covered. `None` when it covers all of it.
+/// bound the part actually covered, retaining direction even for full turns.
 fn swept(
     walk: &[[f64; 2]],
     centre: [f64; 2],
     angle_of: impl Fn(&[f64; 2], [f64; 2]) -> f64,
-) -> Option<(f64, f64)> {
+) -> (f64, f64) {
     let mut angles = Vec::with_capacity(walk.len());
     let mut last: Option<f64> = None;
     for point in walk {
@@ -523,7 +523,7 @@ fn swept(
         angles.push(angle);
     }
     let (from, to) = (angles[0], angles[angles.len() - 1]);
-    ((to - from).abs() < TAU - 1e-9).then_some((from, to))
+    (from, to)
 }
 
 /// `angle` moved by whole turns to sit within half a turn of `previous`.
