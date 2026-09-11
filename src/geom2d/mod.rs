@@ -41,7 +41,7 @@ pub use arrangement::{bounded_faces, segment_crossing, signed_area, SegmentCross
 pub use band::{
     polyline_band_boundary, BandBoundaryEdge, BandStationPiece, PolylineBandBoundary,
 };
-pub use clip::{inside_pieces, inside_spans, trim_spans};
+pub use clip::{break_spans, inside_pieces, inside_spans, trim_spans};
 pub use centerline::{centerline_between, CenterLineGeometry};
 pub use containment::{closest_point, contains, distance_to, nearest_of, Closest};
 pub use construct::{
