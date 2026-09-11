@@ -144,6 +144,7 @@ impl NurbsCurve3 {
     /// Component pairs share the planar homogeneous Bezier rule; no planarity
     /// assumption is made. The resulting control net need not be minimal.
     /// Unclamped, discontinuous and unresolved knot spans are unsupported.
+    #[cfg(feature = "geom2d")]
     pub fn elevated(&self, by: usize) -> Option<Self> {
         let raised = self.degree.checked_add(by)?;
         if by == 0 || raised > 26 { return None; }
@@ -177,6 +178,11 @@ impl NurbsCurve3 {
         let weights = xy.weights().iter().map(|weight| weight * scale).collect();
         Self::new_strict(raised, controls, xy.knots().to_vec(), weights).map(|curve| curve.with_periodicity(self.closed))
     }
+
+    /// Degree elevation is unavailable without the planar homogeneous rules.
+    /// Equal-degree spatial joins remain available without this feature.
+    #[cfg(not(feature = "geom2d"))]
+    pub fn elevated(&self, _by: usize) -> Option<Self> { None }
 
     /// The degree of the curve.
     pub fn degree(&self) -> usize {
