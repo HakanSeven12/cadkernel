@@ -30,7 +30,7 @@ fn arc_piece(start: Vec2, tangent: Vec2, end: Vec2) -> Option<(f64, f64)> {
 /// Invalid/degenerate input returns None without producing a partial chain.
 pub fn fit_arc_chain(points: &[[f64; 2]], closed: bool, directions: &[Option<[f64; 2]>]) -> Option<Vec<ArcFitVertex>> {
     let n = points.len();
-    if n < 3 || directions.len() != n || points.iter().flatten().any(|v| !v.is_finite()) { return None; }
+    if n < 2 || directions.len() != n || points.iter().flatten().any(|v| !v.is_finite()) { return None; }
     let points: Vec<Vec2> = points.iter().copied().map(Vec2::from).collect();
     let spans = if closed { n } else { n - 1 };
     let chords: Vec<Vec2> = (0..spans).map(|i| (points[(i + 1) % n] - points[i]).normalize()).collect::<Option<_>>()?;
@@ -39,7 +39,8 @@ pub fn fit_arc_chain(points: &[[f64; 2]], closed: bool, directions: &[Option<[f6
         if !closed && (i == 0 || i + 1 == n) { continue; }
         tangents[i] = (chords[(i + spans - 1) % spans] + chords[i % spans]).normalize().unwrap_or(chords[i % spans]);
     }
-    if !closed {
+    if !closed && n == 2 { tangents[0] = chords[0]; tangents[1] = chords[0]; }
+    else if !closed {
         tangents[0] = chords[0] * (2.0 * chords[0].dot(tangents[1])) - tangents[1];
         tangents[n - 1] = chords[n - 2] * (2.0 * chords[n - 2].dot(tangents[n - 2])) - tangents[n - 2];
     }
