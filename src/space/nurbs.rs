@@ -21,9 +21,7 @@
 //! already-divided points — gives a curve that looks close and is not, and
 //! the difference is exactly where the weights matter.
 
-use super::spline::{
-    clamped_uniform_knots, de_boor_by, interpolate_periodic, Parameterization,
-};
+use super::spline::{clamped_uniform_knots, de_boor_by, interpolate_periodic, Parameterization};
 use super::Vec3;
 
 fn valid_knots(knots: &[f64]) -> bool {
@@ -59,28 +57,51 @@ impl NurbsCurve3 {
         Self::from_weighted_control_polygon(degree, points, &vec![1.0; points.len()], closed)
     }
 
-    /// The control-polygon constructor with rational weights retained through
-    /// periodic seam insertion in homogeneous coordinates.
-    pub fn from_weighted_control_polygon(degree: usize, points: &[[f64; 3]], weights: &[f64], closed: bool) -> Option<Self> {
+    /// A rational curve defined by its weighted control polygon.
+    pub fn from_weighted_control_polygon(
+        degree: usize,
+        points: &[[f64; 3]],
+        weights: &[f64],
+        closed: bool,
+    ) -> Option<Self> {
         let count = points.len();
-        if degree == 0 || count <= degree || weights.len() != count
-            || weights.iter().any(|weight| !weight.is_finite() || *weight <= 0.0)
-            || points.iter().flatten().any(|v| !v.is_finite()) {
+        if degree == 0
+            || count <= degree
+            || weights.len() != count
+            || points.iter().flatten().any(|value| !value.is_finite())
+            || weights
+                .iter()
+                .any(|weight| !weight.is_finite() || *weight <= 0.0)
+        {
             return None;
         }
         if !closed {
-            return Self::new_strict(degree, points.to_vec(), clamped_uniform_knots(degree, count), weights.to_vec());
+            return Self::new_strict(
+                degree,
+                points.to_vec(),
+                clamped_uniform_knots(degree, count),
+                weights.to_vec(),
+            );
         }
         // Include a period on either side so both cuts are interior knots.
         // The seam follows the final degree control vertices, then wraps to
         // the first vertex of the supplied polygon.
         let mut controls: Vec<[f64; 4]> = (0..3 * count + degree)
             .map(|index| {
-                let index = (index + count - degree) % count;
-                let point = points[index]; let weight = weights[index];
-                [point[0] * weight, point[1] * weight, point[2] * weight, weight]
-            }).collect();
-        let mut knots: Vec<f64> = (0..controls.len() + degree + 1).map(|index| index as f64).collect();
+                let source = (index + count - degree) % count;
+                let point = points[source];
+                let weight = weights[source];
+                [
+                    point[0] * weight,
+                    point[1] * weight,
+                    point[2] * weight,
+                    weight,
+                ]
+            })
+            .collect();
+        let mut knots: Vec<f64> = (0..controls.len() + degree + 1)
+            .map(|index| index as f64)
+            .collect();
         let from = (count + degree) as f64;
         let to = from + count as f64;
         for at in [from, to] {
@@ -90,7 +111,11 @@ impl NurbsCurve3 {
                 next.extend_from_slice(&controls[..=span - degree]);
                 for index in span - degree + 1..=span {
                     let width = knots[index + degree] - knots[index];
-                    let weight = if width > 0.0 { (at - knots[index]) / width } else { 0.0 };
+                    let weight = if width > 0.0 {
+                        (at - knots[index]) / width
+                    } else {
+                        0.0
+                    };
                     next.push(std::array::from_fn(|axis| {
                         controls[index - 1][axis] * (1.0 - weight) + controls[index][axis] * weight
                     }));
@@ -103,12 +128,294 @@ impl NurbsCurve3 {
         let first = knots.iter().rposition(|&knot| knot == from)? - degree;
         let last_knot = knots.iter().rposition(|&knot| knot == to)?;
         let last = last_knot - degree;
-        let controls = controls[first..=last].to_vec();
-        let knots = std::iter::once(from).chain(knots[first + 1..=last_knot].iter().copied())
-            .chain(std::iter::once(to)).map(|knot| knot - from).collect();
+        let controls = &controls[first..=last];
+        let points = controls
+            .iter()
+            .map(|point| {
+                [
+                    point[0] / point[3],
+                    point[1] / point[3],
+                    point[2] / point[3],
+                ]
+            })
+            .collect();
         let weights = controls.iter().map(|point| point[3]).collect();
-        let controls = controls.iter().map(|point| [point[0] / point[3], point[1] / point[3], point[2] / point[3]]).collect();
-        Self::new_strict(degree, controls, knots, weights).map(|curve| curve.with_periodicity(true))
+        let knots = std::iter::once(from)
+            .chain(knots[first + 1..=last_knot].iter().copied())
+            .chain(std::iter::once(to))
+            .map(|knot| knot - from)
+            .collect();
+        Self::new_strict(degree, points, knots, weights).map(|curve| curve.with_periodicity(true))
+    }
+
+    /// Reverse the parameter direction without changing the spatial curve.
+    pub fn reversed(&self) -> Option<Self> {
+        let (start, end) = self.domain();
+        let mut reversed = Self::new_strict(
+            self.degree,
+            self.control_points.iter().copied().rev().collect(),
+            self.knots
+                .iter()
+                .rev()
+                .map(|value| start + end - value)
+                .collect(),
+            self.weights.iter().copied().rev().collect(),
+        )?;
+        reversed.closed = self.closed;
+        Some(reversed)
+    }
+
+    /// The same curve written at a higher degree without changing its shape.
+    pub fn elevated(&self, by: usize) -> Option<Self> {
+        if by == 0 {
+            return None;
+        }
+        let mut curve = self.elevated_once()?;
+        for _ in 1..by {
+            curve = curve.elevated_once()?;
+        }
+        Some(curve)
+    }
+
+    fn elevated_once(&self) -> Option<Self> {
+        let degree = self.degree;
+        let raised = degree + 1;
+        let (segments, breaks) = self.bezier_segments();
+        if segments.is_empty() {
+            return None;
+        }
+
+        let mut control_points = Vec::new();
+        let mut weights = Vec::new();
+        for segment in &segments {
+            let elevated: Vec<[f64; 4]> = (0..=raised)
+                .map(|index| {
+                    let alpha = index as f64 / raised as f64;
+                    let before = index
+                        .checked_sub(1)
+                        .map_or([0.0; 4], |before| segment[before]);
+                    let after = if index <= degree {
+                        segment[index]
+                    } else {
+                        [0.0; 4]
+                    };
+                    std::array::from_fn(|axis| before[axis] * alpha + after[axis] * (1.0 - alpha))
+                })
+                .collect();
+            for point in &elevated[usize::from(!control_points.is_empty())..] {
+                control_points.push([
+                    point[0] / point[3],
+                    point[1] / point[3],
+                    point[2] / point[3],
+                ]);
+                weights.push(point[3]);
+            }
+        }
+
+        let (start, end) = self.domain();
+        let mut knots = vec![start; raised + 1];
+        for at in breaks {
+            knots.extend(std::iter::repeat_n(at, raised));
+        }
+        knots.extend(std::iter::repeat_n(end, raised + 1));
+        Self::new_strict(raised, control_points, knots, weights)
+            .map(|curve| curve.with_periodicity(self.closed))
+    }
+
+    fn bezier_segments(&self) -> (Vec<Vec<[f64; 4]>>, Vec<f64>) {
+        let (start, end) = self.domain();
+        let mut work = self.clone();
+        loop {
+            let mut multiplicities: Vec<(f64, usize)> = Vec::new();
+            for &knot in &work.knots {
+                if knot <= start + 1e-12 || knot >= end - 1e-12 {
+                    continue;
+                }
+                match multiplicities
+                    .iter_mut()
+                    .find(|(at, _)| (*at - knot).abs() < 1e-12)
+                {
+                    Some((_, count)) => *count += 1,
+                    None => multiplicities.push((knot, 1)),
+                }
+            }
+            let missing: Vec<f64> = multiplicities
+                .into_iter()
+                .filter(|(_, count)| *count < work.degree)
+                .map(|(at, _)| at)
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            for at in missing {
+                work.insert_knot(at);
+            }
+        }
+
+        let mut breaks: Vec<f64> = Vec::new();
+        for &knot in &work.knots {
+            if knot > start + 1e-12
+                && knot < end - 1e-12
+                && breaks
+                    .last()
+                    .is_none_or(|last| (*last - knot).abs() > 1e-12)
+            {
+                breaks.push(knot);
+            }
+        }
+        let homogeneous = work.homogeneous();
+        let segments = (0..(homogeneous.len() - 1) / work.degree)
+            .map(|index| {
+                let from = index * work.degree;
+                homogeneous[from..=from + work.degree].to_vec()
+            })
+            .collect();
+        (segments, breaks)
+    }
+
+    fn insert_knot(&mut self, knot: f64) {
+        let (start, end) = self.domain();
+        if knot <= start || knot >= end {
+            return;
+        }
+        let span = super::spline::span_of(
+            self.degree,
+            &self.knots,
+            self.control_points.len() - 1,
+            knot,
+        );
+        let homogeneous = self.homogeneous();
+        let mut updated = Vec::with_capacity(homogeneous.len() + 1);
+        updated.extend_from_slice(&homogeneous[..=span - self.degree]);
+        for index in span - self.degree + 1..=span {
+            let width = self.knots[index + self.degree] - self.knots[index];
+            let alpha = if width.abs() < 1e-15 {
+                0.0
+            } else {
+                (knot - self.knots[index]) / width
+            };
+            updated.push(std::array::from_fn(|axis| {
+                homogeneous[index - 1][axis] * (1.0 - alpha) + homogeneous[index][axis] * alpha
+            }));
+        }
+        updated.extend_from_slice(&homogeneous[span..]);
+
+        self.knots.insert(span + 1, knot);
+        self.control_points = updated
+            .iter()
+            .map(|point| {
+                [
+                    point[0] / point[3],
+                    point[1] / point[3],
+                    point[2] / point[3],
+                ]
+            })
+            .collect();
+        self.weights = updated.iter().map(|point| point[3]).collect();
+    }
+
+    fn homogeneous(&self) -> Vec<[f64; 4]> {
+        self.control_points
+            .iter()
+            .zip(&self.weights)
+            .map(|(point, &weight)| {
+                [
+                    point[0] * weight,
+                    point[1] * weight,
+                    point[2] * weight,
+                    weight,
+                ]
+            })
+            .collect()
+    }
+
+    /// Delete one control vertex from an open clamped curve, intentionally
+    /// changing its shape. Remove the associated interior knot; if fewer
+    /// vertices remain than the current order, lower the degree by one.
+    pub fn without_control_vertex(&self, index: usize) -> Option<Self> {
+        let count = self.control_points.len();
+        let degree = self.degree;
+        if self.closed || count <= 2 || index >= count {
+            return None;
+        }
+        let (start, end) = self.domain();
+        if !self.knots[..=degree].iter().all(|knot| *knot == start)
+            || !self.knots[count..].iter().all(|knot| *knot == end)
+        {
+            return None;
+        }
+        let mut controls = self.control_points.clone();
+        let mut weights = self.weights.clone();
+        let mut knots = self.knots.clone();
+        controls.remove(index);
+        weights.remove(index);
+        let degree = if controls.len() <= degree {
+            knots.pop();
+            knots.remove(0);
+            degree - 1
+        } else {
+            knots.remove((index + degree.div_ceil(2)).clamp(degree + 1, count - 1));
+            degree
+        };
+        Self::new_strict(degree, controls, knots, weights)
+    }
+
+    /// Open cubic interpolation in full spatial coordinates.
+    pub fn interpolate_fit(
+        points: &[[f64; 3]],
+        start_tangent: Option<[f64; 3]>,
+        end_tangent: Option<[f64; 3]>,
+        parameterization: Parameterization,
+    ) -> Option<Self> {
+        let (controls, knots) =
+            super::spline::interpolate_open(points, start_tangent, end_tangent, parameterization)?;
+        let weights = vec![1.0; controls.len()];
+        Self::new_strict(3, controls, knots, weights)
+    }
+
+    /// Analytic rational derivative with respect to the knot parameter.
+    pub fn derivative_at_knot(&self, parameter: f64) -> [f64; 3] {
+        let (start, end) = self.domain();
+        let parameter = wrap_parameter(parameter, start, end, self.closed);
+        let scale = self.weights.iter().copied().fold(0.0_f64, f64::max);
+        let homogeneous = |index: usize| {
+            let weight = self.weights[index] / scale;
+            let point = self.control_points[index];
+            [
+                point[0] * weight,
+                point[1] * weight,
+                point[2] * weight,
+                weight,
+            ]
+        };
+        let value = de_boor_by(
+            self.degree,
+            &self.knots,
+            self.control_points.len(),
+            parameter,
+            homogeneous,
+        );
+        let derivative = de_boor_by(
+            self.degree - 1,
+            &self.knots[1..self.knots.len() - 1],
+            self.control_points.len() - 1,
+            parameter,
+            |index| {
+                let width = self.knots[index + self.degree + 1] - self.knots[index + 1];
+                if width == 0.0 {
+                    return [0.0; 4];
+                }
+                let a = homogeneous(index);
+                let b = homogeneous(index + 1);
+                std::array::from_fn(|axis| (b[axis] - a[axis]) * self.degree as f64 / width)
+            },
+        );
+        if value[3] <= 0.0 {
+            return [f64::NAN; 3];
+        }
+        std::array::from_fn(|axis| {
+            (derivative[axis] - value[axis] / value[3] * derivative[3]) / value[3]
+        })
     }
 
     /// Builds a curve, filling in what the caller left out.
@@ -160,8 +467,13 @@ impl NurbsCurve3 {
             || knots.len() != control_points.len() + degree + 1
             || weights.len() != control_points.len()
             || !valid_knots(&knots)
-            || !control_points.iter().flatten().all(|value| value.is_finite())
-            || !weights.iter().all(|weight| weight.is_finite() && *weight > 0.0)
+            || !control_points
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+            || !weights
+                .iter()
+                .all(|weight| weight.is_finite() && *weight > 0.0)
         {
             return None;
         }
@@ -405,8 +717,7 @@ impl NurbsCurve3 {
         const MAX_DEPTH: u32 = 16;
         let directions = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
             .map(|unit| self.tangent_at_knot(from + (to - from) * unit));
-        let split = depth < 2
-            || crate::tessellation::max_direction_angle(&directions) > max_angle;
+        let split = depth < 2 || crate::tessellation::max_direction_angle(&directions) > max_angle;
         if split && depth < MAX_DEPTH {
             let middle = 0.5 * (from + to);
             self.refine_angle(from, middle, max_angle, depth + 1, out);
@@ -500,7 +811,10 @@ impl NurbsSurface3 {
             control_points[rows - 1].iter().zip(&weights[rows - 1]),
         );
         let v_closed = matching_seam(
-            control_points.iter().map(|row| &row[0]).zip(weights.iter().map(|row| &row[0])),
+            control_points
+                .iter()
+                .map(|row| &row[0])
+                .zip(weights.iter().map(|row| &row[0])),
             control_points
                 .iter()
                 .map(|row| &row[columns - 1])
@@ -612,7 +926,10 @@ impl NurbsSurface3 {
             control_points[rows - 1].iter().zip(&weights[rows - 1]),
         );
         let v_closed = matching_seam(
-            control_points.iter().map(|row| &row[0]).zip(weights.iter().map(|row| &row[0])),
+            control_points
+                .iter()
+                .map(|row| &row[0])
+                .zip(weights.iter().map(|row| &row[0])),
             control_points
                 .iter()
                 .map(|row| &row[columns - 1])
@@ -653,7 +970,10 @@ impl NurbsSurface3 {
     /// The knot ranges the surface is defined over, `u` then `v`.
     pub fn domain(&self) -> ((f64, f64), (f64, f64)) {
         (
-            (self.u_knots[self.u_degree], self.u_knots[self.control_points.len()]),
+            (
+                self.u_knots[self.u_degree],
+                self.u_knots[self.control_points.len()],
+            ),
             (
                 self.v_knots[self.v_degree],
                 self.v_knots[self.control_points[0].len()],
@@ -738,10 +1058,7 @@ impl NurbsSurface3 {
             let sum = knots.get(degree)? + knots.get(points.len())?;
             knots = knots.into_iter().rev().map(|knot| sum - knot).collect();
         }
-        Some(
-            NurbsCurve3::new_strict(degree, points, knots, weights)?
-                .with_periodicity(periodic),
-        )
+        Some(NurbsCurve3::new_strict(degree, points, knots, weights)?.with_periodicity(periodic))
     }
 
     fn homogeneous_control(&self, row: usize, column: usize) -> [f64; 4] {
@@ -783,8 +1100,7 @@ impl NurbsSurface3 {
             self.control_points.len() - 1,
             u,
             |row| {
-                let denominator = self.u_knots[row + self.u_degree + 1]
-                    - self.u_knots[row + 1];
+                let denominator = self.u_knots[row + self.u_degree + 1] - self.u_knots[row + 1];
                 let factor = if denominator.abs() > f64::EPSILON {
                     self.u_degree as f64 / denominator
                 } else {
@@ -821,8 +1137,8 @@ impl NurbsSurface3 {
                     self.control_points[row].len() - 1,
                     v,
                     |column| {
-                        let denominator = self.v_knots[column + self.v_degree + 1]
-                            - self.v_knots[column + 1];
+                        let denominator =
+                            self.v_knots[column + self.v_degree + 1] - self.v_knots[column + 1];
                         let factor = if denominator.abs() > f64::EPSILON {
                             self.v_degree as f64 / denominator
                         } else {
@@ -882,8 +1198,7 @@ impl NurbsSurface3 {
         }
         let point = Vec3::new(raw[0] / raw[3], raw[1] / raw[3], raw[2] / raw[3]);
         let tangent = |derivative: [f64; 4], sign: f64| {
-            ((Vec3::new(derivative[0], derivative[1], derivative[2])
-                - point * derivative[3])
+            ((Vec3::new(derivative[0], derivative[1], derivative[2]) - point * derivative[3])
                 * (sign / raw[3]))
                 .to_array()
         };
@@ -960,12 +1275,139 @@ mod tests {
     }
 
     #[test]
+    fn periodic_control_curves_close_and_reverse_without_moving() {
+        let curve = NurbsCurve3::from_control_polygon(
+            2,
+            &[
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 2.0, 1.0],
+                [0.0, 2.0, 0.0],
+            ],
+            true,
+        )
+        .unwrap();
+        assert!(curve.periodicity());
+        assert!(Vec3::from(curve.point_at(0.0)).distance(Vec3::from(curve.point_at(1.0))) < 1e-9);
+        let reversed = curve.reversed().unwrap();
+        for step in 0..=8 {
+            let t = step as f64 / 8.0;
+            assert!(
+                Vec3::from(curve.point_at(t)).distance(Vec3::from(reversed.point_at(1.0 - t)))
+                    < 1e-9
+            );
+        }
+    }
+
+    #[test]
+    fn rational_degree_elevation_preserves_every_sample() {
+        let curve = NurbsCurve3::new_strict(
+            2,
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 3.0, 2.0],
+                [2.0, -1.0, 4.0],
+                [4.0, 0.0, 5.0],
+            ],
+            vec![0.0, 0.0, 0.0, 0.4, 1.0, 1.0, 1.0],
+            vec![1.0, 3.0, 0.5, 2.0],
+        )
+        .unwrap();
+        let elevated = curve.elevated(2).unwrap();
+        assert_eq!(elevated.degree(), 4);
+        assert!(elevated.is_rational());
+        for step in 0..=64 {
+            let parameter = step as f64 / 64.0;
+            assert!(
+                Vec3::from(curve.point_at(parameter))
+                    .distance(Vec3::from(elevated.point_at(parameter)))
+                    < 1e-9
+            );
+        }
+        assert!(curve.elevated(0).is_none());
+    }
+
+    #[test]
+    fn weighted_periodic_control_curve_closes_and_elevates_exactly() {
+        let points = [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 1.0],
+            [2.0, 2.0, 3.0],
+            [0.0, 2.0, 1.0],
+        ];
+        let curve =
+            NurbsCurve3::from_weighted_control_polygon(2, &points, &[1.0, 3.0, 0.75, 2.0], true)
+                .unwrap();
+        assert!(curve.periodicity());
+        assert!(curve.is_rational());
+        assert!(Vec3::from(curve.point_at(0.0)).distance(Vec3::from(curve.point_at(1.0))) < 1e-9);
+        let elevated = curve.elevated(1).unwrap();
+        assert!(elevated.periodicity());
+        for step in 0..=64 {
+            let parameter = step as f64 / 64.0;
+            assert!(
+                Vec3::from(curve.point_at(parameter))
+                    .distance(Vec3::from(elevated.point_at(parameter)))
+                    < 1e-9
+            );
+        }
+        assert!(NurbsCurve3::from_weighted_control_polygon(
+            2,
+            &points,
+            &[1.0, 0.0, 1.0, 1.0],
+            true
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn deleting_a_control_vertex_keeps_a_valid_clamped_curve() {
+        let curve = NurbsCurve3::new_strict(
+            3,
+            vec![[0.0; 3], [1.0, 2.0, 0.0], [2.0, 2.0, 0.0], [3.0; 3]],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            vec![1.0; 4],
+        )
+        .unwrap();
+        let reduced = curve.without_control_vertex(1).unwrap();
+        assert_eq!((reduced.degree(), reduced.control_points().len()), (2, 3));
+        assert_eq!(reduced.knots(), &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn rational_derivative_matches_a_finite_difference() {
+        let curve = NurbsCurve3::new_strict(
+            2,
+            vec![[0.0, 0.0, 0.0], [1.0, 2.0, 1.0], [3.0, 0.0, 2.0]],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![1.0, 3.0, 2.0],
+        )
+        .unwrap();
+        let parameter = 0.37;
+        let step = 1e-6;
+        let before = Vec3::from(curve.point_at_knot(parameter - step));
+        let after = Vec3::from(curve.point_at_knot(parameter + step));
+        let numeric = (after - before) / (2.0 * step);
+        let analytic = Vec3::from(curve.derivative_at_knot(parameter));
+        assert!(
+            analytic.distance(numeric) < 1e-6,
+            "{analytic:?} vs {numeric:?}"
+        );
+    }
+
+    #[test]
     fn a_clamped_curve_ends_on_its_own_control_points() {
         let curve = NurbsCurve3::new(3, helix_points(), Vec::new(), None).unwrap();
         let start = curve.point_at(0.0);
         let end = curve.point_at(1.0);
-        assert!(Vec3::from(start).distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-9, "{start:?}");
-        assert!(Vec3::from(end).distance(Vec3::new(1.0, -1.0, 4.0)) < 1e-9, "{end:?}");
+        assert!(
+            Vec3::from(start).distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-9,
+            "{start:?}"
+        );
+        assert!(
+            Vec3::from(end).distance(Vec3::new(1.0, -1.0, 4.0)) < 1e-9,
+            "{end:?}"
+        );
     }
 
     #[test]
@@ -973,16 +1415,20 @@ mod tests {
         // The reason this exists rather than the plane one: these points
         // share no plane, and projecting them onto one would lose the climb.
         let curve = NurbsCurve3::new(3, helix_points(), Vec::new(), None).unwrap();
-        let heights: Vec<f64> = (0..=8).map(|step| curve.point_at(step as f64 / 8.0)[2]).collect();
-        assert!(heights.windows(2).all(|pair| pair[1] > pair[0]), "{heights:?}");
+        let heights: Vec<f64> = (0..=8)
+            .map(|step| curve.point_at(step as f64 / 8.0)[2])
+            .collect();
+        assert!(
+            heights.windows(2).all(|pair| pair[1] > pair[0]),
+            "{heights:?}"
+        );
     }
 
     #[test]
     fn a_weighted_curve_is_pulled_towards_the_heavy_point() {
         let points = vec![[0.0, 0.0, 0.0], [1.0, 2.0, 0.0], [2.0, 0.0, 0.0]];
         let plain = NurbsCurve3::new(2, points.clone(), Vec::new(), None).unwrap();
-        let heavy =
-            NurbsCurve3::new(2, points, Vec::new(), Some(vec![1.0, 8.0, 1.0])).unwrap();
+        let heavy = NurbsCurve3::new(2, points, Vec::new(), Some(vec![1.0, 8.0, 1.0])).unwrap();
         assert!(heavy.is_rational());
         assert!(!plain.is_rational());
         assert!(heavy.point_at(0.5)[1] > plain.point_at(0.5)[1]);
@@ -1019,7 +1465,11 @@ mod tests {
         // A sag bound is a distance, not a length, so what it buys in length
         // is a consequence rather than the promise — a tenth of a per cent
         // here on a curve six units long.
-        assert!(length(&fine) > truth * 0.999, "{} vs {truth}", length(&fine));
+        assert!(
+            length(&fine) > truth * 0.999,
+            "{} vs {truth}",
+            length(&fine)
+        );
     }
 
     #[test]
@@ -1077,8 +1527,7 @@ mod tests {
         let (from, to) = curve.domain();
         for end in [from, to] {
             let at_end = Vec3::from(curve.tangent_at_knot(end)).length();
-            let just_inside =
-                Vec3::from(curve.tangent_at_knot(from + (to - from) * 0.02)).length();
+            let just_inside = Vec3::from(curve.tangent_at_knot(from + (to - from) * 0.02)).length();
             assert!(
                 (at_end - just_inside).abs() < 0.35 * just_inside,
                 "{at_end} vs {just_inside}"
