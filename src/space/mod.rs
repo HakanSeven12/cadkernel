@@ -15,6 +15,7 @@ pub mod curve;
 pub mod helix;
 pub mod nurbs;
 pub mod plane;
+pub mod endpoint_join;
 pub mod polygon;
 pub mod spline;
 pub mod vec;
