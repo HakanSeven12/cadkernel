@@ -41,7 +41,7 @@ pub use arrangement::{bounded_faces, segment_crossing, signed_area, SegmentCross
 pub use band::{
     polyline_band_boundary, BandBoundaryEdge, BandStationPiece, PolylineBandBoundary,
 };
-pub use clip::{inside_pieces, inside_spans, trim_spans};
+pub use clip::{break_spans, inside_pieces, inside_spans, trim_spans};
 pub use centerline::{centerline_between, CenterLineGeometry};
 pub use containment::{closest_point, contains, distance_to, nearest_of, Closest};
 pub use construct::{
@@ -59,7 +59,7 @@ pub use intersect::{
 };
 #[cfg(feature = "offset")]
 pub use offset::offset_polyline;
-pub use polyline::{BulgeArc, Polyline, PolylineVertex};
+pub use polyline::{BulgeArc, Polyline, PolylineRange, PolylineRangeSegment, PolylineVertex};
 pub use snap::{
     characteristic_points, nearest_to, perpendicular_from, tangent_from, SnapKind, SnapPoint,
 };
@@ -180,3 +180,8 @@ mod tests {
         Tolerance::new(0.0);
     }
 }
+
+mod arc_fit;
+pub use arc_fit::{fit_arc_chain, ArcFitVertex};
+mod bounds;
+pub use bounds::analytic_curve_bounds;
