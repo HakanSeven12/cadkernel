@@ -180,3 +180,6 @@ mod tests {
         Tolerance::new(0.0);
     }
 }
+
+mod arc_fit;
+pub use arc_fit::{fit_arc_chain, ArcFitVertex};
