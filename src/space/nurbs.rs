@@ -52,6 +52,52 @@ pub struct NurbsCurve3 {
 }
 
 impl NurbsCurve3 {
+    /// A polynomial curve defined by its control polygon. Closed polygons
+    /// produce a periodic curve with an exact clamped representation of one
+    /// period; repeating the first point on an open curve is not equivalent.
+    pub fn from_control_polygon(degree: usize, points: &[[f64; 3]], closed: bool) -> Option<Self> {
+        let count = points.len();
+        if degree == 0 || count <= degree || points.iter().flatten().any(|v| !v.is_finite()) {
+            return None;
+        }
+        if !closed {
+            return Self::new_strict(degree, points.to_vec(), clamped_uniform_knots(degree, count), vec![1.0; count]);
+        }
+        // Include a period on either side so both cuts are interior knots.
+        // The seam follows the final degree control vertices, then wraps to
+        // the first vertex of the supplied polygon.
+        let mut controls: Vec<[f64; 3]> = (0..3 * count + degree)
+            .map(|index| points[(index + count - degree) % count]).collect();
+        let mut knots: Vec<f64> = (0..controls.len() + degree + 1).map(|index| index as f64).collect();
+        let from = (count + degree) as f64;
+        let to = from + count as f64;
+        for at in [from, to] {
+            while knots.iter().filter(|&&knot| knot == at).count() < degree {
+                let span = super::spline::span_of(degree, &knots, controls.len() - 1, at);
+                let mut next = Vec::with_capacity(controls.len() + 1);
+                next.extend_from_slice(&controls[..=span - degree]);
+                for index in span - degree + 1..=span {
+                    let width = knots[index + degree] - knots[index];
+                    let weight = if width > 0.0 { (at - knots[index]) / width } else { 0.0 };
+                    next.push(std::array::from_fn(|axis| {
+                        controls[index - 1][axis] * (1.0 - weight) + controls[index][axis] * weight
+                    }));
+                }
+                next.extend_from_slice(&controls[span..]);
+                controls = next;
+                knots.insert(span + 1, at);
+            }
+        }
+        let first = knots.iter().rposition(|&knot| knot == from)? - degree;
+        let last_knot = knots.iter().rposition(|&knot| knot == to)?;
+        let last = last_knot - degree;
+        let controls = controls[first..=last].to_vec();
+        let knots = std::iter::once(from).chain(knots[first + 1..=last_knot].iter().copied())
+            .chain(std::iter::once(to)).map(|knot| knot - from).collect();
+        let weights = vec![1.0; controls.len()];
+        Self::new_strict(degree, controls, knots, weights).map(|curve| curve.with_periodicity(true))
+    }
+
     /// Builds a curve, filling in what the caller left out.
     ///
     /// A knot vector of the wrong length is replaced with a clamped uniform
