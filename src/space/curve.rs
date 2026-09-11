@@ -247,3 +247,20 @@ mod tests {
         );
     }
 }
+
+/// Unit bisector of two spatial rays. Opposite rays use the oriented normal
+/// to select the perpendicular direction (normal cross first ray).
+/// A zero ray, nonfinite input or an indeterminate antiparallel plane fails.
+/// Nearly opposite but distinct rays retain their actual bisector.
+pub fn angle_bisector(first: [f64; 3], second: [f64; 3], normal: [f64; 3]) -> Option<[f64; 3]> {
+    if first.iter().chain(second.iter()).chain(normal.iter()).any(|v| !v.is_finite()) { return None; }
+    fn unit(value: Vec3) -> Option<Vec3> {
+        let scale = value.x.abs().max(value.y.abs()).max(value.z.abs());
+        if scale == 0.0 || !scale.is_finite() { return None; }
+        (value / scale).normalize()
+    }
+    let a = unit(Vec3::from(first))?;
+    let b = unit(Vec3::from(second))?;
+    let direction = unit(a + b).or_else(|| unit(unit(Vec3::from(normal))?.cross(a)))?;
+    Some(direction.to_array())
+}
