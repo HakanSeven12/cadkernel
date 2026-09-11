@@ -172,6 +172,80 @@ impl Polyline {
     }
 }
 
+/// One retained segment's correspondence to its source segment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PolylineRangeSegment {
+    pub source_index: usize,
+    pub from: f64,
+    pub to: f64,
+}
+
+impl PolylineRangeSegment {
+    /// Restrict a quantity varying linearly along the source segment, such as width.
+    pub fn interpolate(&self, start: f64, end: f64) -> [f64; 2] {
+        [(1.0 - self.from) * start + self.from * end,
+         (1.0 - self.to) * start + self.to * end]
+    }
+}
+
+/// An open portion of a polyline and its outgoing segment correspondences.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolylineRange {
+    pub polyline: Polyline,
+    pub segments: Vec<PolylineRangeSegment>,
+}
+
+impl Polyline {
+    /// Extract an increasing interval of the uniform segment parameter `0..=1`.
+    /// Closed inputs may wrap once, with `to` above one. Circular segments are
+    /// restricted analytically, retaining their signed bulges. No tessellation
+    /// or snapping to nearby vertices is performed. Invalid/empty intervals,
+    /// nonfinite geometry and collapsed curved segments return `None`.
+    pub fn ranged(&self, from: f64, to: f64) -> Option<PolylineRange> {
+        let n = self.vertices.len();
+        if n < 2 || !from.is_finite() || !to.is_finite() || from < 0.0
+            || from > 1.0 || to <= from || to > from + 1.0
+            || (!self.closed && to > 1.0)
+            || self.vertices.iter().any(|v| !v.bulge.is_finite()
+                || v.position.iter().any(|x| !x.is_finite())) { return None; }
+        let count = if self.closed { n } else { n - 1 };
+        let start = from * count as f64;
+        let end = to * count as f64;
+        let first = start.floor() as usize;
+        let last = end.ceil() as usize;
+        let mut vertices = Vec::with_capacity(last - first + 1);
+        let mut segments = Vec::with_capacity(last - first);
+        let mut endpoint = None;
+        for index in first..last {
+            let source_index = index % count;
+            let a = (start - index as f64).max(0.0);
+            let b = (end - index as f64).min(1.0);
+            if b <= a { continue; }
+            let v = self.vertices[source_index];
+            let next = self.vertices[(source_index + 1) % n];
+            let arc = if v.bulge.abs() >= 1e-12 {
+                Some(BulgeArc::from_bulge(v.position, next.position, v.bulge)?)
+            } else { None };
+            let sample = |t: f64| {
+                if t == 0.0 { v.position } else if t == 1.0 { next.position }
+                else if let Some(arc) = arc { arc.sample(t) }
+                else { [(1.0-t)*v.position[0]+t*next.position[0],
+                        (1.0-t)*v.position[1]+t*next.position[1]] }
+            };
+            let bulge = if a == 0.0 && b == 1.0 { v.bulge }
+                else if arc.is_some() { (v.bulge.atan() * (b-a)).tan() }
+                else { 0.0 };
+            let position = sample(a);
+            let finish = sample(b);
+            if !bulge.is_finite() || position.iter().chain(finish.iter()).any(|x| !x.is_finite()) { return None; }
+            vertices.push(PolylineVertex { position, bulge });
+            endpoint = Some(finish);
+            segments.push(PolylineRangeSegment { source_index, from: a, to: b });
+        }
+        vertices.push(PolylineVertex::straight(endpoint?));
+        Some(PolylineRange { polyline: Polyline { vertices, closed: false }, segments })
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
