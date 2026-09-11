@@ -12,6 +12,7 @@
 //! planar B-rep face.
 
 pub mod curve;
+pub mod arc_union;
 pub mod helix;
 pub mod nurbs;
 pub mod plane;
