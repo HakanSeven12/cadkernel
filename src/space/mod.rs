@@ -13,8 +13,9 @@
 
 pub mod alignment;
 pub mod arclength;
-pub mod curve;
 pub mod arc_union;
+pub mod curve;
+pub mod endpoint_join;
 pub mod helix;
 pub mod line_union;
 pub mod lengthen;
