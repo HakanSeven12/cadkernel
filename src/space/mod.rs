@@ -19,6 +19,7 @@ pub mod helix;
 pub mod line_union;
 pub mod lengthen;
 pub mod nurbs;
+mod knot_compaction;
 pub mod plane;
 pub mod polygon;
 pub mod spline;
