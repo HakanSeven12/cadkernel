@@ -52,6 +52,15 @@ pub struct NurbsCurve3 {
 }
 
 impl NurbsCurve3 {
+    /// Reverse the parameter direction without changing the spatial curve.
+    pub fn reversed(&self) -> Option<Self> {
+        let (start,end)=self.domain();
+        let mut reversed=Self::new_strict(self.degree,self.control_points.iter().copied().rev().collect(),
+            self.knots.iter().rev().map(|value|start+end-value).collect(),self.weights.iter().copied().rev().collect())?;
+        reversed.closed=self.closed;
+        Some(reversed)
+    }
+
     /// Builds a curve, filling in what the caller left out.
     ///
     /// A knot vector of the wrong length is replaced with a clamped uniform

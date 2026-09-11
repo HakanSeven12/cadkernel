@@ -23,6 +23,42 @@ pub struct HelixCurve {
 }
 
 impl HelixCurve {
+    /// Recover the axial frame and base radius from stored generating points.
+    /// At a zero-radius base the projected curve tangent defines radial phase.
+    pub fn frame_from_points(base: [f64; 3], axis: [f64; 3], start: [f64; 3], tangent: [f64; 3]) -> Option<([f64; 3], [f64; 3], f64)> {
+        if base.iter().chain(axis.iter()).chain(start.iter()).chain(tangent.iter()).any(|v| !v.is_finite()) { return None; }
+        let axis = Vec3::from(axis).normalize()?;
+        let delta = Vec3::from(start) - Vec3::from(base);
+        let radial = delta - axis * delta.dot(axis);
+        let radius = radial.length();
+        if !radius.is_finite() { return None; }
+        let direction = if radius > 1e-12 { radial.normalize()? } else {
+            let tangent = Vec3::from(tangent);
+            (tangent - axis * tangent.dot(axis)).normalize()?
+        };
+        Some((axis.to_array(), direction.to_array(), radius))
+    }
+
+    /// Reverse traversal while preserving the complete helical locus.
+    /// Axis and endpoint radii exchange roles; handedness and turn count stay fixed.
+    pub fn reversed(&self) -> Option<Self> {
+        if !self.is_valid() { return None; }
+        let (center, x, y, axis) = self.frame()?;
+        let angle = self.total_angle()?;
+        let winding = match self.direction { HelixDirection::Clockwise => -1.0, HelixDirection::CounterClockwise => 1.0 };
+        let reversed = Self {
+            base_center: (center + axis * self.height).to_array(),
+            axis_direction: (-axis).to_array(),
+            start_direction: (x * angle.cos() + y * (winding * angle.sin())).to_array(),
+            base_radius: self.top_radius,
+            top_radius: self.base_radius,
+            height: self.height,
+            turns: self.turns,
+            direction: self.direction,
+        };
+        (reversed.is_valid() && reversed.frame().is_some()).then_some(reversed)
+    }
+
     const SEGMENTS_PER_TURN: f64 = 6.0;
     const MAX_SEGMENTS: usize = 100_000;
 
@@ -43,8 +79,9 @@ impl HelixCurve {
             && self.top_radius.is_finite()
             && self.height.is_finite()
             && self.turns.is_finite()
-            && self.base_radius > 0.0
+            && self.base_radius >= 0.0
             && self.top_radius >= 0.0
+            && (self.base_radius > 0.0 || self.top_radius > 0.0)
             && self.turns > 0.0
     }
 
