@@ -75,6 +75,18 @@ pub fn lengthen_arc(curve: &super::PlanarCurve, pick: [f64; 3], change: LengthCh
         else { (arc.end_angle - span, arc.end_angle) })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dynamic_endpoint_can_cross_the_fixed_endpoint() {
+        assert_eq!(lengthen_line([0.0, 0.0, 0.0], [0.0, 0.0, 4.0], [0.0, 0.0, 4.0],
+            LengthChange::Dynamic([0.0, 2.0, -3.0])),
+            Some([[0.0, 0.0, 0.0], [0.0, 0.0, -3.0]]));
+    }
+}
+
 /// Change an elliptic arc endpoint in its supporting plane, retaining its axes.
 #[cfg(feature = "geom2d")]
 pub fn lengthen_ellipse(curve: &super::PlanarCurve, pick: [f64; 3], change: LengthChange) -> Option<(f64, f64)> {

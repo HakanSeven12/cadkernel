@@ -172,6 +172,80 @@ impl Polyline {
     }
 }
 
+/// One retained segment's correspondence to its source segment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PolylineRangeSegment {
+    pub source_index: usize,
+    pub from: f64,
+    pub to: f64,
+}
+
+impl PolylineRangeSegment {
+    /// Restrict a quantity varying linearly along the source segment, such as width.
+    pub fn interpolate(&self, start: f64, end: f64) -> [f64; 2] {
+        [(1.0 - self.from) * start + self.from * end,
+         (1.0 - self.to) * start + self.to * end]
+    }
+}
+
+/// An open portion of a polyline and its outgoing segment correspondences.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolylineRange {
+    pub polyline: Polyline,
+    pub segments: Vec<PolylineRangeSegment>,
+}
+
+impl Polyline {
+    /// Extract an increasing interval of the uniform segment parameter `0..=1`.
+    /// Closed inputs may wrap once, with `to` above one. Circular segments are
+    /// restricted analytically, retaining their signed bulges. No tessellation
+    /// or snapping to nearby vertices is performed. Invalid/empty intervals,
+    /// nonfinite geometry and collapsed curved segments return `None`.
+    pub fn ranged(&self, from: f64, to: f64) -> Option<PolylineRange> {
+        let n = self.vertices.len();
+        if n < 2 || !from.is_finite() || !to.is_finite() || from < 0.0
+            || from > 1.0 || to <= from || to > from + 1.0
+            || (!self.closed && to > 1.0)
+            || self.vertices.iter().any(|v| !v.bulge.is_finite()
+                || v.position.iter().any(|x| !x.is_finite())) { return None; }
+        let count = if self.closed { n } else { n - 1 };
+        let start = from * count as f64;
+        let end = to * count as f64;
+        let first = start.floor() as usize;
+        let last = end.ceil() as usize;
+        let mut vertices = Vec::with_capacity(last - first + 1);
+        let mut segments = Vec::with_capacity(last - first);
+        let mut endpoint = None;
+        for index in first..last {
+            let source_index = index % count;
+            let a = (start - index as f64).max(0.0);
+            let b = (end - index as f64).min(1.0);
+            if b <= a { continue; }
+            let v = self.vertices[source_index];
+            let next = self.vertices[(source_index + 1) % n];
+            let arc = if v.bulge.abs() >= 1e-12 {
+                Some(BulgeArc::from_bulge(v.position, next.position, v.bulge)?)
+            } else { None };
+            let sample = |t: f64| {
+                if t == 0.0 { v.position } else if t == 1.0 { next.position }
+                else if let Some(arc) = arc { arc.sample(t) }
+                else { [(1.0-t)*v.position[0]+t*next.position[0],
+                        (1.0-t)*v.position[1]+t*next.position[1]] }
+            };
+            let bulge = if a == 0.0 && b == 1.0 { v.bulge }
+                else if arc.is_some() { (v.bulge.atan() * (b-a)).tan() }
+                else { 0.0 };
+            let position = sample(a);
+            let finish = sample(b);
+            if !bulge.is_finite() || position.iter().chain(finish.iter()).any(|x| !x.is_finite()) { return None; }
+            vertices.push(PolylineVertex { position, bulge });
+            endpoint = Some(finish);
+            segments.push(PolylineRangeSegment { source_index, from: a, to: b });
+        }
+        vertices.push(PolylineVertex::straight(endpoint?));
+        Some(PolylineRange { polyline: Polyline { vertices, closed: false }, segments })
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +337,111 @@ mod tests {
         };
         assert!(poly.segment_arc(1).is_none());
         assert!(poly.segment_arc(5).is_none());
+    }
+
+    #[test]
+    fn a_range_keeps_segment_provenance_and_interpolation_parameters() {
+        let polyline = Polyline {
+            vertices: vec![
+                PolylineVertex::straight([0.0, 0.0]),
+                PolylineVertex::straight([1.0, 0.0]),
+                PolylineVertex::straight([1.0, 1.0]),
+            ],
+            closed: false,
+        };
+        let range = polyline.ranged(0.25, 0.75).unwrap();
+        assert_eq!(
+            range.polyline.vertices,
+            vec![
+                PolylineVertex::straight([0.5, 0.0]),
+                PolylineVertex::straight([1.0, 0.0]),
+                PolylineVertex::straight([1.0, 0.5]),
+            ]
+        );
+        assert_eq!(
+            range.segments,
+            vec![
+                PolylineRangeSegment {
+                    source_index: 0,
+                    from: 0.5,
+                    to: 1.0,
+                },
+                PolylineRangeSegment {
+                    source_index: 1,
+                    from: 0.0,
+                    to: 0.5,
+                },
+            ]
+        );
+        assert_eq!(range.segments[0].interpolate(2.0, 6.0), [4.0, 6.0]);
+        assert_eq!(range.segments[1].interpolate(6.0, 10.0), [6.0, 8.0]);
+    }
+
+    #[test]
+    fn a_partial_signed_arc_remains_the_same_exact_arc() {
+        let polyline = Polyline {
+            vertices: vec![
+                PolylineVertex::curved([-1.0, 0.0], -1.0),
+                PolylineVertex::straight([1.0, 0.0]),
+            ],
+            closed: false,
+        };
+        let original = polyline.segment_arc(0).unwrap();
+        let range = polyline.ranged(0.25, 0.75).unwrap();
+        let restricted = range.polyline.segment_arc(0).unwrap();
+        assert!(
+            crate::geom2d::Vec2::from(restricted.sample(0.5))
+                .distance(crate::geom2d::Vec2::from(original.sample(0.5)))
+                < 1e-12
+        );
+        assert!((range.polyline.vertices[0].bulge - (-std::f64::consts::FRAC_PI_8).tan()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_closed_range_can_wrap_once_across_the_original_seam() {
+        let polyline = Polyline {
+            vertices: vec![
+                PolylineVertex::straight([0.0, 0.0]),
+                PolylineVertex::straight([1.0, 0.0]),
+                PolylineVertex::straight([1.0, 1.0]),
+                PolylineVertex::straight([0.0, 1.0]),
+            ],
+            closed: true,
+        };
+        let range = polyline.ranged(0.75, 1.25).unwrap();
+        assert!(!range.polyline.closed);
+        assert_eq!(
+            range.polyline.vertices,
+            vec![
+                PolylineVertex::straight([0.0, 1.0]),
+                PolylineVertex::straight([0.0, 0.0]),
+                PolylineVertex::straight([1.0, 0.0]),
+            ]
+        );
+        assert_eq!(
+            range
+                .segments
+                .iter()
+                .map(|segment| segment.source_index)
+                .collect::<Vec<_>>(),
+            vec![3, 0]
+        );
+    }
+
+    #[test]
+    fn invalid_ranges_and_geometry_are_rejected() {
+        let mut polyline = Polyline {
+            vertices: vec![
+                PolylineVertex::straight([0.0, 0.0]),
+                PolylineVertex::straight([1.0, 0.0]),
+            ],
+            closed: false,
+        };
+        assert!(polyline.ranged(0.5, 0.5).is_none());
+        assert!(polyline.ranged(f64::NAN, 0.5).is_none());
+        assert!(polyline.ranged(0.5, 1.5).is_none());
+        polyline.vertices[0] = PolylineVertex::curved([0.0, 0.0], 1.0);
+        polyline.vertices[1].position = [0.0, 0.0];
+        assert!(polyline.ranged(0.0, 1.0).is_none());
     }
 }
