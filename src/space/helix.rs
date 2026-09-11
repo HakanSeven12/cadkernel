@@ -43,8 +43,9 @@ impl HelixCurve {
             && self.top_radius.is_finite()
             && self.height.is_finite()
             && self.turns.is_finite()
-            && self.base_radius > 0.0
+            && self.base_radius >= 0.0
             && self.top_radius >= 0.0
+            && (self.base_radius > 0.0 || self.top_radius > 0.0)
             && self.turns > 0.0
     }
 
