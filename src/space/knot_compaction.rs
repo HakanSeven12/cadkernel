@@ -45,7 +45,11 @@ fn remove_once(curve: &NurbsCurve3, knot: f64, tolerance: f64) -> Option<NurbsCu
         let alpha = (knot - knots[index]) / width;
         if alpha <= 0.0 { return None; }
         let current = homogeneous(index); let previous = controls[index - 1];
-        controls.push(std::array::from_fn(|axis| (current[axis] - (1.0 - alpha) * previous[axis]) / alpha));
+        let mut recovered = std::array::from_fn(|axis| (current[axis] - (1.0 - alpha) * previous[axis]) / alpha);
+        // Equal input weights define a polynomial curve. Preserve that exact
+        // representation instead of introducing rational roundoff at each solve.
+        recovered[3] = curve.weights()[0];
+        controls.push(recovered);
     }
     let recovered = controls[last]; let expected = homogeneous(last + 1);
     if recovered[3] <= 0.0 || expected[3] <= 0.0 { return None; }
@@ -74,13 +78,17 @@ mod tests {
                 [2.0, 0.0, 0.0],
             ],
             vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
-            vec![1.0; 5],
+            vec![0.1; 5],
         )
         .unwrap();
         let compact = curve.compact_knots(1e-12).unwrap();
 
         assert_eq!(compact.control_points().len(), 4);
         assert_eq!(compact.knots().iter().filter(|knot| **knot == 0.5).count(), 1);
+        assert!(compact
+            .weights()
+            .iter()
+            .all(|weight| *weight == curve.weights()[0]));
         for step in 0..=20 {
             let parameter = step as f64 / 20.0;
             assert!(Vec3::from(curve.point_at(parameter))
