@@ -41,6 +41,14 @@ pub fn break_spans(curve: &Curve, first: f64, second: f64, tolerance: Tolerance)
     }
     let epsilon = (tolerance.linear() / speed).min(1.0);
     if curve.is_closed() {
+        // A closed polyline can split at a single point into two open chains
+        // retaining its original seam; a closed conic cannot represent this.
+        if matches!(curve, Curve::Polyline(_)) && (a - b).abs() <= epsilon {
+            let mut spans = Vec::with_capacity(2);
+            if a > epsilon { spans.push([0.0, a]); }
+            if 1.0 - a > epsilon { spans.push([a, 1.0]); }
+            return Some(spans);
+        }
         let removed = (b - a).rem_euclid(1.0);
         if removed <= epsilon || 1.0 - removed <= epsilon {
             return None;
@@ -211,7 +219,7 @@ pub fn inside_pieces(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom2d::{Arc, Circle, Line, XLine};
+    use crate::geom2d::{Arc, Circle, Line, Polyline, PolylineVertex, XLine};
     use std::f64::consts::TAU;
 
     fn tol() -> Tolerance {
@@ -385,8 +393,25 @@ mod tests {
         });
         assert_eq!(break_spans(&curve, 0.25, 0.75, tol()), Some(vec![[0.75, 1.25]]));
         assert_eq!(break_spans(&curve, 0.75, 0.25, tol()), Some(vec![[0.25, 0.75]]));
+        assert!(break_spans(&curve, 0.25, 0.25, tol()).is_none());
         assert!(break_spans(&curve, f64::NAN, 0.5, tol()).is_none());
         assert!(break_spans(&crossing_line(0.0), 0.25, 0.75, tol()).is_none());
+    }
+
+    #[test]
+    fn one_point_splits_a_closed_polyline_at_its_original_seam_too() {
+        let curve = Curve::Polyline(Polyline {
+            vertices: vec![
+                PolylineVertex::straight([0.0, 0.0]),
+                PolylineVertex::straight([1.0, 0.0]),
+                PolylineVertex::straight([1.0, 1.0]),
+            ],
+            closed: true,
+        });
+        assert_eq!(
+            break_spans(&curve, 0.4, 0.4, tol()),
+            Some(vec![[0.0, 0.4], [0.4, 1.0]])
+        );
     }
 
     #[test]
