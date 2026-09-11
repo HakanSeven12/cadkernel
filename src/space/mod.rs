@@ -13,6 +13,7 @@
 
 pub mod alignment;
 pub mod curve;
+pub mod arc_union;
 pub mod helix;
 pub mod line_union;
 pub mod lengthen;
