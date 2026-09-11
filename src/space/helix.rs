@@ -43,6 +43,7 @@ impl HelixCurve {
     /// Axis and endpoint radii exchange roles; handedness and turn count stay fixed.
     pub fn reversed(&self) -> Option<Self> {
         if !self.is_valid() { return None; }
+        if self.turns == 0.0 { return Some(*self); }
         let (center, x, y, axis) = self.frame()?;
         let angle = self.total_angle()?;
         let winding = match self.direction { HelixDirection::Clockwise => -1.0, HelixDirection::CounterClockwise => 1.0 };
@@ -82,7 +83,8 @@ impl HelixCurve {
             && self.base_radius >= 0.0
             && self.top_radius >= 0.0
             && (self.base_radius > 0.0 || self.top_radius > 0.0)
-            && self.turns > 0.0
+            && self.turns >= 0.0
+            && (self.turns > 0.0 || self.height == 0.0)
     }
 
     fn total_angle(&self) -> Option<f64> {
@@ -129,6 +131,10 @@ impl HelixCurve {
             return None;
         }
         let frame = self.frame()?;
+        if self.turns == 0.0 {
+            let point = (frame.0 + frame.1 * self.base_radius).to_array();
+            return NurbsCurve3::new_strict(1, vec![point, point], vec![0.0, 0.0, 1.0, 1.0], vec![1.0, 1.0]);
+        }
         let total_angle = self.total_angle()?;
         let segments = self.segment_count()?;
         let angle_step = total_angle / segments as f64;
@@ -164,6 +170,7 @@ impl HelixCurve {
         if !self.is_valid() || self.frame().is_none() {
             return None;
         }
+        if self.turns == 0.0 { return Some(0.0); }
         let total_angle = self.total_angle()?;
         let radius_delta = self.top_radius - self.base_radius;
         let radial_rate = radius_delta / total_angle;
