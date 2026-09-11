@@ -14,6 +14,7 @@
 pub mod curve;
 pub mod helix;
 pub mod nurbs;
+mod knot_compaction;
 pub mod plane;
 pub mod polygon;
 pub mod spline;
