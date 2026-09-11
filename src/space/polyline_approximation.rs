@@ -1,6 +1,8 @@
 //! Bounded straight-segment approximation of positive-weight clamped splines.
 use super::{NurbsCurve3, Vec3};
 
+const MAX_POINTS: usize = 1_000_000;
+
 /// Approximation coordinates and the maximum control-hull chord deviation.
 pub struct SplinePolyline {
     pub points: Vec<[f64; 3]>,
@@ -17,7 +19,7 @@ impl NurbsCurve3 {
     /// Unsupported unclamped/discontinuous curves and exhausted resource limits
     /// return None instead of relaxing the requested accuracy.
     pub fn to_polyline_precision(&self, precision: u8) -> Option<SplinePolyline> {
-        if precision > 99 { return None; }
+        if precision > 99 || self.control_points().len() > MAX_POINTS { return None; }
         let degree = self.degree();
         let (start, end) = self.domain();
         if degree == 0 || !self.knots()[..=degree].iter().all(|k| *k == start)
@@ -41,6 +43,7 @@ impl NurbsCurve3 {
             let mut multiplicity = knots.iter().filter(|k| **k == knot).count();
             if multiplicity > degree { return None; }
             while multiplicity < degree {
+                if controls.len() >= MAX_POINTS { return None; }
                 let span = super::spline::span_of(degree, &knots, controls.len()-1, knot);
                 let mut next = Vec::with_capacity(controls.len()+1);
                 next.extend_from_slice(&controls[..=span-degree]);
@@ -83,8 +86,8 @@ fn subdivide(net: &[[f64;4]], tolerance: f64, depth: usize, out: &mut Vec<[f64;3
         if !distance.is_finite() { return None; }
         if distance > tolerance { flat = false; }
     }
-    if flat { if out.len() >= 1_000_000 { return None; } out.push(end_array); return Some(()); }
-    if depth >= 32 || out.len() >= 1_000_000 { return None; }
+    if flat { if out.len() >= MAX_POINTS { return None; } out.push(end_array); return Some(()); }
+    if depth >= 32 || out.len() >= MAX_POINTS { return None; }
     let mut work = net.to_vec(); let mut left = vec![work[0]]; let mut right = vec![*work.last()?];
     for remaining in (1..work.len()).rev() {
         for i in 0..remaining { work[i] = std::array::from_fn(|axis| work[i][axis]*0.5+work[i+1][axis]*0.5); }
