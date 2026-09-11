@@ -24,6 +24,40 @@ use super::curve::{Curve, Extent};
 use super::vec::Vec2;
 use super::Tolerance;
 
+/// Parameter spans remaining after removing a picked interval from a bounded curve.
+/// Open curves keep both outside spans, independent of pick order. A single
+/// interior parameter splits an open curve without removing any geometry.
+/// Closed curves keep the directed complement, which may end beyond parameter 1.
+pub fn break_spans(curve: &Curve, first: f64, second: f64, tolerance: Tolerance) -> Option<Vec<[f64; 2]>> {
+    if curve.extent() != Extent::Bounded || !first.is_finite() || !second.is_finite() {
+        return None;
+    }
+    let a = first.clamp(0.0, 1.0);
+    let b = second.clamp(0.0, 1.0);
+    let speed = Vec2::from(curve.tangent_at(a)).length()
+        .max(Vec2::from(curve.tangent_at(b)).length());
+    if !speed.is_finite() || speed <= 0.0 {
+        return None;
+    }
+    let epsilon = (tolerance.linear() / speed).min(1.0);
+    if curve.is_closed() {
+        let removed = (b - a).rem_euclid(1.0);
+        if removed <= epsilon || 1.0 - removed <= epsilon {
+            return None;
+        }
+        return Some(vec![[b, b + 1.0 - removed]]);
+    }
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut spans = Vec::with_capacity(2);
+    if lo > epsilon {
+        spans.push([0.0, lo]);
+    }
+    if 1.0 - hi > epsilon {
+        spans.push([hi, 1.0]);
+    }
+    Some(spans)
+}
+
 /// Curve spans left after removing the cut interval containing `picked`.
 pub fn trim_spans(
     curve: &Curve,
