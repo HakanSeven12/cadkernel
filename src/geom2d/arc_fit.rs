@@ -11,17 +11,24 @@ pub struct ArcFitVertex {
     pub inserted: bool,
 }
 
+fn unit(direction: Vec2) -> Option<Vec2> {
+    let length = direction.length();
+    (length.is_finite() && length > 1e-12).then(|| direction / length)
+}
+
 fn arc_piece(start: Vec2, tangent: Vec2, end: Vec2) -> Option<(f64, f64)> {
     let chord = end - start;
     let length = chord.length();
-    if length <= 1e-12 { return None; }
+    if !length.is_finite() || length <= 1e-12 { return None; }
     if tangent.cross(chord).abs() <= length * 1e-12 {
         return (tangent.dot(chord) > 0.0).then_some((0.0, length));
     }
     let arc = arc_from_start_tangent(start.to_array(), tangent.to_array(), end.to_array(), false)?;
     let sweep = arc.sweep();
     let sign = tangent.cross(chord).signum();
-    Some((sign * (sweep * 0.25).tan(), arc.radius * sweep))
+    let bulge = sign * (sweep * 0.25).tan();
+    let length = arc.radius * sweep;
+    (bulge.is_finite() && length.is_finite() && length > 0.0).then_some((bulge, length))
 }
 
 /// Fit two tangent arcs per span. Unspecified interior tangents bisect the
@@ -33,7 +40,7 @@ pub fn fit_arc_chain(points: &[[f64; 2]], closed: bool, directions: &[Option<[f6
     if n < 2 || directions.len() != n || points.iter().flatten().any(|v| !v.is_finite()) { return None; }
     let points: Vec<Vec2> = points.iter().copied().map(Vec2::from).collect();
     let spans = if closed { n } else { n - 1 };
-    let chords: Vec<Vec2> = (0..spans).map(|i| (points[(i + 1) % n] - points[i]).normalize()).collect::<Option<_>>()?;
+    let chords: Vec<Vec2> = (0..spans).map(|i| unit(points[(i + 1) % n] - points[i])).collect::<Option<_>>()?;
     let mut tangents = vec![Vec2::default(); n];
     for i in 0..n {
         if !closed && (i == 0 || i + 1 == n) { continue; }
@@ -47,7 +54,7 @@ pub fn fit_arc_chain(points: &[[f64; 2]], closed: bool, directions: &[Option<[f6
     for (tangent, override_direction) in tangents.iter_mut().zip(directions) {
         if let Some(direction) = override_direction {
             if direction.iter().any(|v| !v.is_finite()) { return None; }
-            *tangent = Vec2::from(*direction).normalize()?;
+            *tangent = unit(Vec2::from(*direction))?;
         }
     }
     let mut result = Vec::with_capacity(spans * 2 + 1);
@@ -93,7 +100,9 @@ pub fn fit_arc_chain(points: &[[f64; 2]], closed: bool, directions: &[Option<[f6
         if knee.to_array().iter().any(|v| !v.is_finite()) { return None; }
         let (first_bulge, first_length) = arc_piece(p0, t0, knee)?;
         let (reverse_bulge, second_length) = arc_piece(p1, -t1, knee)?;
-        let fraction = first_length / (first_length + second_length);
+        let total_length = first_length + second_length;
+        if !total_length.is_finite() || total_length <= 0.0 { return None; }
+        let fraction = first_length / total_length;
         result.push(ArcFitVertex { point: p0.to_array(), bulge: first_bulge, source: i, fraction: 0.0, inserted: false });
         result.push(ArcFitVertex { point: knee.to_array(), bulge: -reverse_bulge, source: i, fraction, inserted: true });
     }
