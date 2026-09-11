@@ -940,14 +940,14 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
             None => out.missing_faces.push(face_key),
         }
     }
-    out.drawing_edges = scheduled_edges(body, &schedules, tolerance.linear);
+    out.drawing_edges = scheduled_edges(body, &schedules);
     out.edges = out
         .drawing_edges
         .iter()
         .filter(|edge| {
-            schedules.get(&edge.edge).is_none_or(|schedule| {
-                !smooth_scheduled_edge(body, edge.edge, schedule, tolerance.linear)
-            })
+            schedules
+                .get(&edge.edge)
+                .is_none_or(|schedule| !smooth_scheduled_edge(body, edge.edge, schedule))
         })
         .cloned()
         .collect();
@@ -983,7 +983,7 @@ pub fn tessellate_wireframe(body: &Body, tolerance: TessellationTolerance) -> Bo
             }
         }
     }
-    out.edges = visible_scheduled_edges(body, &schedules, tolerance.linear);
+    out.edges = visible_scheduled_edges(body, &schedules);
     out
 }
 
@@ -994,10 +994,13 @@ fn body_edge_schedules(
     body.edge_keys()
         .filter_map(|edge| {
             let max_angle = edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal);
-            Some((
-                edge,
-                shared_edge_samples(body, edge, max_angle, tolerance.linear)?,
-            ))
+            let mut samples = shared_edge_samples(body, edge, max_angle, tolerance.linear)?;
+            for sample in &mut samples {
+                sample.position =
+                    shared_surface_position(body, edge, sample.position, tolerance.linear)
+                        .unwrap_or(sample.position);
+            }
+            Some((edge, samples))
         })
         .collect()
 }
@@ -1005,14 +1008,13 @@ fn body_edge_schedules(
 fn visible_scheduled_edges(
     body: &Body,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
-    tolerance: f64,
 ) -> Vec<EdgeMesh> {
-    scheduled_edges(body, schedules, tolerance)
+    scheduled_edges(body, schedules)
         .into_iter()
         .filter(|edge| {
             schedules
                 .get(&edge.edge)
-                .is_none_or(|schedule| !smooth_scheduled_edge(body, edge.edge, schedule, tolerance))
+                .is_none_or(|schedule| !smooth_scheduled_edge(body, edge.edge, schedule))
         })
         .collect()
 }
@@ -1020,7 +1022,6 @@ fn visible_scheduled_edges(
 fn scheduled_edges(
     body: &Body,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
-    tolerance: f64,
 ) -> Vec<EdgeMesh> {
     body.edge_keys()
         .filter(|edge| !topological_parameter_seam(body, *edge))
@@ -1029,13 +1030,7 @@ fn scheduled_edges(
             (schedule.len() >= 2).then(|| EdgeMesh {
                 edge,
                 parameters: schedule.iter().map(|sample| sample.parameter).collect(),
-                positions: schedule
-                    .iter()
-                    .map(|sample| {
-                        shared_surface_position(body, edge, sample.position, tolerance)
-                            .unwrap_or(sample.position)
-                    })
-                    .collect(),
+                positions: schedule.iter().map(|sample| sample.position).collect(),
             })
         })
         .collect()
@@ -1045,7 +1040,6 @@ fn smooth_scheduled_edge(
     body: &Body,
     edge_key: EdgeKey,
     schedule: &[super::place::EdgeSample],
-    tolerance: f64,
 ) -> bool {
     let Some(edge) = body.edges.get(edge_key) else {
         return false;
@@ -1054,9 +1048,8 @@ fn smooth_scheduled_edge(
         return false;
     };
     schedule.iter().all(|sample| {
-        let position = shared_surface_position(body, edge_key, sample.position, tolerance)
-            .unwrap_or(sample.position);
-        let normals = [first, second].map(|coedge| outward_normal_at_edge(body, *coedge, position));
+        let normals =
+            [first, second].map(|coedge| outward_normal_at_edge(body, *coedge, sample.position));
         let [Some(first), Some(second)] = normals else {
             return false;
         };
@@ -1084,15 +1077,15 @@ fn shared_surface_position(
     tolerance: f64,
 ) -> Option<[f64; 3]> {
     let edge = body.edges.get(edge_key)?;
-    let surfaces: Vec<&super::geometry::Surface> = edge
+    let surfaces: Option<Vec<&super::geometry::Surface>> = edge
         .coedges
         .iter()
-        .filter_map(|coedge| {
+        .map(|coedge| {
             let (surface, _) = coedge_geometry(body, *coedge)?;
             Some(surface)
         })
         .collect();
-    surface_consensus_position(&surfaces, position, tolerance)
+    surface_consensus_position(&surfaces?, position, tolerance)
 }
 
 fn surface_consensus_position(
@@ -1100,9 +1093,9 @@ fn surface_consensus_position(
     position: [f64; 3],
     tolerance: f64,
 ) -> Option<[f64; 3]> {
-    let projected: Vec<[f64; 3]> = surfaces
+    let projected: Option<Vec<[f64; 3]>> = surfaces
         .iter()
-        .filter_map(|surface| {
+        .map(|surface| {
             let (u, v) = surface.parameters_at(position)?;
             let point = surface.point_at(u, v);
             point
@@ -1111,7 +1104,8 @@ fn surface_consensus_position(
                 .then_some(point)
         })
         .collect();
-    if projected.len() < 2 {
+    let projected = projected?;
+    if projected.is_empty() {
         return None;
     }
     let scale = projected
@@ -4810,18 +4804,6 @@ fn canonical_point_cached(
     cache: Option<&mut ParameterMap<[f64; 3]>>,
 ) -> [f64; 3] {
     if let Some(pin) = pins.iter().find(|pin| pin.parameters == parameters) {
-        let on_surface = surface.point_at(parameters[0], parameters[1]);
-        let scale = pin
-            .position
-            .iter()
-            .chain(on_surface.iter())
-            .map(|coordinate| coordinate.abs())
-            .fold(1.0, f64::max);
-        if on_surface.iter().all(|coordinate| coordinate.is_finite())
-            && distance3(pin.position, on_surface) > f64::EPSILON * 1024.0 * scale
-        {
-            return on_surface;
-        }
         return pin.position;
     }
     let key = parameters.map(f64::to_bits);
@@ -4934,10 +4916,11 @@ mod tests {
             major_radius: 12.65,
             minor_radius: -2.0,
         });
-        let parameters = torus.parameters_at([10.95, 0.0, 0.0]).unwrap();
+        let position = surface_consensus_position(&[&torus], [10.95, 0.0, 0.0], TOL).unwrap();
+        let parameters = torus.parameters_at(position).unwrap();
         let pins = [BoundaryPoint {
             parameters: [parameters.0, parameters.1],
-            position: [10.95, 0.0, 0.0],
+            position,
         }];
         let snapped = canonical_point_cached(&torus, pins[0].parameters, &pins, None);
         assert!((snapped[0] - 10.65).abs() < TOL, "{snapped:?}");
@@ -4959,6 +4942,31 @@ mod tests {
             surface_consensus_position(&[&cylinder, &torus], [10.95, 0.0, 0.0], TOL).unwrap();
         assert!((displayed[0] - 10.65).abs() < TOL, "{displayed:?}");
         assert!(displayed[1].abs() < TOL && displayed[2].abs() < TOL);
+    }
+
+    #[test]
+    fn adjacent_faces_keep_one_canonical_boundary_position() {
+        let first = Surface::Plane(Plane::XY);
+        let second =
+            Surface::Plane(Plane::orthonormal([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]).unwrap());
+        let position =
+            surface_consensus_position(&[&first, &second], [1.0, 4e-7, 4e-7], 1e-6).unwrap();
+        let canonical = |surface: &Surface| {
+            let parameters = surface.parameters_at(position).unwrap();
+            canonical_point_cached(
+                surface,
+                [parameters.0, parameters.1],
+                &[BoundaryPoint {
+                    parameters: [parameters.0, parameters.1],
+                    position,
+                }],
+                None,
+            )
+        };
+
+        assert_eq!(canonical(&first), canonical(&second));
+        assert!(first.distance_to(position).abs() <= 1e-6);
+        assert!(second.distance_to(position).abs() <= 1e-6);
     }
 
     #[test]
@@ -4988,7 +4996,7 @@ mod tests {
                 position: solid.vertices.get(edge.end).unwrap().point,
             },
         ];
-        assert!(smooth_scheduled_edge(&solid, edge_key, &schedule, TOL));
+        assert!(smooth_scheduled_edge(&solid, edge_key, &schedule));
         let tessellation = tessellate(
             &solid,
             TessellationTolerance::new(default_angle(), TOL),

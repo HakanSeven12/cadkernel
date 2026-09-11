@@ -1024,9 +1024,7 @@ impl NurbsSurface3 {
             let uv = along_u.dot(along_v);
             let vv = along_v.dot(along_v);
             let determinant = uu * vv - uv * uv;
-            if !determinant.is_finite()
-                || determinant.abs() <= f64::EPSILON * uu.abs().max(vv.abs()).max(1.0)
-            {
+            if !determinant.is_finite() || determinant <= f64::EPSILON * 64.0 * uu * vv {
                 break;
             }
             let ru = along_u.dot(residual);
@@ -1673,6 +1671,31 @@ mod tests {
                 "expected={expected:?} actual={actual:?} recovered={recovered:?}"
             );
         }
+    }
+
+    #[test]
+    fn surface_parameter_recovery_is_scale_independent() {
+        let size = 1e-5;
+        let surface = NurbsSurface3::new(
+            1,
+            1,
+            vec![
+                vec![[0.0, 0.0, 0.0], [0.0, size, 0.0]],
+                vec![[size, 0.0, 0.0], [size, size, 0.0]],
+            ],
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let expected = (0.13, 0.27);
+        let point = surface.point_at_knot(expected.0, expected.1);
+        let actual = surface.parameters_at(point).unwrap();
+        let recovered = surface.point_at_knot(actual.0, actual.1);
+        assert!(
+            Vec3::from(recovered).distance(Vec3::from(point)) < size * 1e-9,
+            "expected={expected:?} actual={actual:?} recovered={recovered:?}"
+        );
     }
 
     #[test]

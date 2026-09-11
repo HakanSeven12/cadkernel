@@ -187,7 +187,7 @@ impl Surface {
             Self::Torus(torus) => {
                 let radial = Vec3::from(torus.frame.vector_at([u.cos(), u.sin()]));
                 let normal = Vec3::from(torus.frame.normal()?);
-                (radial * v.cos() + normal * v.sin())
+                ((radial * v.cos() + normal * v.sin()) * torus.minor_radius.signum())
                     .normalize()
                     .map(Vec3::to_array)
             }
@@ -389,8 +389,9 @@ impl Surface {
             }
             Self::Torus(torus) => {
                 let (along, across) = axial_distance(&torus.frame, point);
-                let outer = (across - torus.major_radius).hypot(along) - torus.minor_radius;
-                let inner = (across + torus.major_radius).hypot(along) - torus.minor_radius;
+                let minor_radius = torus.minor_radius.abs();
+                let outer = (across - torus.major_radius).hypot(along) - minor_radius;
+                let inner = (across + torus.major_radius).hypot(along) - minor_radius;
                 // For a self-intersecting torus neither signed half-plane
                 // circle contains the other parametrised sheet. The nearest
                 // sheet is the one with the smaller absolute residual.
@@ -742,6 +743,14 @@ mod tests {
                     Vec3::from(recovered).distance(Vec3::from(point)) < 1e-9,
                     "u={u} v={v} parameters={parameters:?} recovered={recovered:?}"
                 );
+                assert!(surface.contains(point, 1e-9), "u={u} v={v}");
+                let (along_u, along_v) = surface.tangents_at(parameters.0, parameters.1).unwrap();
+                let tangent_normal = Vec3::from(along_u)
+                    .cross(Vec3::from(along_v))
+                    .normalize()
+                    .unwrap();
+                let reported = Vec3::from(surface.normal_at(parameters.0, parameters.1).unwrap());
+                assert!(tangent_normal.dot(reported) > 1.0 - 1e-12);
             }
         }
     }
