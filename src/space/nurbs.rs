@@ -140,6 +140,44 @@ impl NurbsCurve3 {
         self.closed
     }
 
+    /// Elevate a clamped spatial curve exactly, retaining its knot domain.
+    /// Component pairs share the planar homogeneous Bezier rule; no planarity
+    /// assumption is made. The resulting control net need not be minimal.
+    /// Unclamped, discontinuous and unresolved knot spans are unsupported.
+    pub fn elevated(&self, by: usize) -> Option<Self> {
+        let raised = self.degree.checked_add(by)?;
+        if by == 0 || raised > 26 { return None; }
+        Self::new_strict(self.degree, self.control_points.clone(), self.knots.clone(), self.weights.clone())?;
+        let (start, end) = self.domain();
+        if end <= start || !self.knots[..=self.degree].iter().all(|knot| *knot == start)
+            || !self.knots[self.knots.len() - self.degree - 1..].iter().all(|knot| *knot == end) { return None; }
+        let mut groups: Vec<(f64, usize)> = Vec::new();
+        for &knot in &self.knots {
+            if let Some((previous, count)) = groups.last_mut() {
+                if *previous == knot { *count += 1; continue; }
+                if knot - *previous <= 1e-12 { return None; }
+            }
+            groups.push((knot, 1));
+        }
+        if groups.first()?.1 != self.degree + 1 || groups.last()?.1 != self.degree + 1 { return None; }
+        if groups.iter().any(|(knot, count)| *knot > start && *knot < end && *count > self.degree) { return None; }
+        // Common weight scaling avoids the planar rule's tiny-weight fallback.
+        let scale = self.weights.iter().copied().reduce(f64::min)?;
+        let weights: Vec<_> = self.weights.iter().map(|weight| weight / scale).collect();
+        let component = |axis: usize| {
+            crate::geom2d::NurbsCurve::new_strict(self.degree,
+                self.control_points.iter().map(|point| [point[0], point[axis]]).collect(),
+                self.knots.clone(), weights.clone())?.elevated(by)
+        };
+        let xy = component(1)?;
+        let xz = component(2)?;
+        if xy.knots() != xz.knots() || xy.weights() != xz.weights()
+            || xy.control_points().len() != xz.control_points().len() { return None; }
+        let controls = xy.control_points().iter().zip(xz.control_points()).map(|(xy, xz)| [xy[0], xy[1], xz[1]]).collect();
+        let weights = xy.weights().iter().map(|weight| weight * scale).collect();
+        Self::new_strict(raised, controls, xy.knots().to_vec(), weights).map(|curve| curve.with_periodicity(self.closed))
+    }
+
     /// The degree of the curve.
     pub fn degree(&self) -> usize {
         self.degree

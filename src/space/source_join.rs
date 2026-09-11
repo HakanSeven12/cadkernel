@@ -11,15 +11,20 @@ pub fn line_as_nurbs(points: [[f64; 3]; 2], degree: usize) -> Option<NurbsCurve3
     NurbsCurve3::new_strict(degree,controls,[vec![0.0;degree+1],vec![1.0;degree+1]].concat(),vec![1.0;degree+1])
 }
 
-/// Join touching clamped NURBS of equal degree without fitting or sampling.
+/// Join touching clamped NURBS without fitting or sampling.
+/// The lower-degree input is elevated exactly to the higher degree.
 /// The source direction is retained; the other curve can be reversed or prepended.
 /// Rational weights are rescaled at the seam, which has C0 continuity.
 /// Coincident endpoints preserve both curve shapes exactly. Within tolerance,
 /// only the candidate endpoint is snapped to the source endpoint; the source
-/// control points and weights remain unchanged when appending or prepending.
+/// geometry remains unchanged when appending or prepending; its control net
+/// is elevated only when the candidate has higher degree.
 pub fn join_nurbs_curves(source: &NurbsCurve3, other: &NurbsCurve3, tolerance: f64) -> Option<NurbsCurve3> {
-    if !tolerance.is_finite() || tolerance < 0.0 || source.degree()!=other.degree() || source.is_closed() || other.is_closed() { return None; }
-    let degree=source.degree();
+    if !tolerance.is_finite() || tolerance < 0.0 || source.is_closed() || other.is_closed() { return None; }
+    let degree=source.degree().max(other.degree());
+    let source = if source.degree() < degree { source.elevated(degree - source.degree())? } else { source.clone() };
+    let other = if other.degree() < degree { other.elevated(degree - other.degree())? } else { other.clone() };
+    let (source, other) = (&source, &other);
     for curve in [source,other] {
         let (a,b)=curve.domain(); let knots=curve.knots();
         if !a.is_finite() || !b.is_finite() || a>=b || !knots[..=degree].iter().all(|v|*v==a)
