@@ -17,14 +17,16 @@ impl NurbsCurve3 {
     /// Positive rational Bezier convex hulls bound every accepted segment's
     /// distance from the curve. Endpoints and knot boundaries are retained.
     /// Unsupported unclamped/discontinuous curves and exhausted resource limits
-    /// return None instead of relaxing the requested accuracy.
+    /// return None instead of relaxing the requested accuracy. Degree is limited
+    /// to 64, control/output nets to one million points, recursion to 32 levels
+    /// and cumulative extraction/subdivision work to sixteen million units.
     pub fn to_polyline_precision(&self, precision: u8) -> Option<SplinePolyline> {
         if precision > 99 || self.control_points().len() > MAX_POINTS { return None; }
         let degree = self.degree();
         if self.knots().len() > 2 * MAX_POINTS || degree >= self.control_points().len() { return None; }
         let mut budget = 16_000_000usize;
         let (start, end) = self.domain();
-        if degree == 0 || !self.knots()[..=degree].iter().all(|k| *k == start)
+        if degree == 0 || degree > 64 || !self.knots()[..=degree].iter().all(|k| *k == start)
             || !self.knots()[self.knots().len()-degree-1..].iter().all(|k| *k == end) { return None; }
         let mut low = self.control_points()[0]; let mut high = low;
         for point in self.control_points() {
@@ -39,10 +41,14 @@ impl NurbsCurve3 {
         }).collect();
         if controls.iter().any(|p| p[3] <= 0.0 || p.iter().any(|v| !v.is_finite())) { return None; }
         let mut knots = self.knots().to_vec();
-        let mut interior: Vec<_> = knots.iter().copied().filter(|k| *k > start && *k < end).collect();
-        interior.dedup();
-        for knot in interior {
-            let mut multiplicity = knots.iter().filter(|k| **k == knot).count();
+        let mut interior: Vec<(f64, usize)> = Vec::new();
+        for knot in knots.iter().copied().filter(|k| *k > start && *k < end) {
+            if let Some((previous, multiplicity)) = interior.last_mut() {
+                if *previous == knot { *multiplicity += 1; continue; }
+            }
+            interior.push((knot, 1));
+        }
+        for (knot, mut multiplicity) in interior {
             if multiplicity > degree { return None; }
             while multiplicity < degree {
                 if controls.len() >= MAX_POINTS { return None; }
