@@ -9,6 +9,8 @@
 //! and sweep from it has several sign and half-turn cases that are easy to get
 //! subtly wrong in each place that needs them. [`BulgeArc`] does it once.
 
+use super::{frame::Frame, vec::Vec2, Tolerance};
+
 /// The circular arc a bulge encodes, in the form most callers actually want.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BulgeArc {
@@ -144,6 +146,21 @@ pub struct Polyline {
     pub closed: bool,
 }
 
+/// The orthogonal frame and dimensions of a rectangular polyline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RectangleFrame {
+    /// First vertex of the polyline.
+    pub origin: [f64; 2],
+    /// Unit direction from the first vertex to the second.
+    pub width_axis: [f64; 2],
+    /// Unit direction from the second vertex to the third.
+    pub height_axis: [f64; 2],
+    /// Distance from the first vertex to the second.
+    pub width: f64,
+    /// Perpendicular distance from the second vertex to the third.
+    pub height: f64,
+}
+
 impl Polyline {
     /// An empty open polyline.
     pub fn new() -> Self {
@@ -169,6 +186,55 @@ impl Polyline {
             self.vertices[next].position,
             self.vertices[index].bulge,
         )
+    }
+
+    /// Returns the rectangle described by four ordered straight vertices.
+    pub fn rectangle_frame(&self, tolerance: Tolerance) -> Option<RectangleFrame> {
+        if !self.closed
+            || self.vertices.len() != 4
+            || self.vertices.iter().any(|vertex| {
+                vertex.bulge != 0.0 || !vertex.position.iter().all(|value| value.is_finite())
+            })
+        {
+            return None;
+        }
+
+        let world = [0, 1, 2, 3].map(|index| {
+            let [x, y] = self.vertices[index].position;
+            [x, y, 0.0]
+        });
+        let frame = Frame::around(world.iter());
+        let coordinates = world.map(|point| Vec2::from(frame.lift_2d([point[0], point[1]])));
+        let width_vector = coordinates[1] - coordinates[0];
+        let second_edge = coordinates[2] - coordinates[1];
+        let width = width_vector.length();
+        if width <= tolerance.linear() {
+            return None;
+        }
+
+        let width_axis = width_vector / width;
+        let perpendicular = width_axis.perpendicular();
+        let signed_height = second_edge.dot(perpendicular);
+        let height = signed_height.abs();
+        if height <= tolerance.linear() {
+            return None;
+        }
+        let height_axis = perpendicular * signed_height.signum();
+        let expected_second = coordinates[1] + height_axis * height;
+        let expected_third = coordinates[0] + height_axis * height;
+        if coordinates[2].distance(expected_second) > tolerance.linear()
+            || coordinates[3].distance(expected_third) > tolerance.linear()
+        {
+            return None;
+        }
+
+        Some(RectangleFrame {
+            origin: self.vertices[0].position,
+            width_axis: width_axis.to_array(),
+            height_axis: height_axis.to_array(),
+            width,
+            height,
+        })
     }
 }
 
@@ -337,6 +403,37 @@ mod tests {
         };
         assert!(poly.segment_arc(1).is_none());
         assert!(poly.segment_arc(5).is_none());
+    }
+
+    #[test]
+    fn rectangle_frame_recognizes_rotation_and_rejects_non_rectangles() {
+        let origin = Vec2::new(500_000.0, 4_500_000.0);
+        let width_axis = Vec2::new(0.6, 0.8);
+        let height_axis = Vec2::new(-0.8, 0.6);
+        let points = [
+            origin,
+            origin + width_axis * 10.0,
+            origin + width_axis * 10.0 + height_axis * 4.0,
+            origin + height_axis * 4.0,
+        ];
+        let mut polyline = Polyline {
+            vertices: points
+                .map(|point| PolylineVertex::straight(point.to_array()))
+                .to_vec(),
+            closed: true,
+        };
+
+        let rectangle = polyline.rectangle_frame(Tolerance::default()).unwrap();
+        assert!((rectangle.width - 10.0).abs() < 1.0e-9);
+        assert!((rectangle.height - 4.0).abs() < 1.0e-9);
+        assert!(Vec2::from(rectangle.width_axis).distance(width_axis) < 1.0e-9);
+        assert!(Vec2::from(rectangle.height_axis).distance(height_axis) < 1.0e-9);
+
+        polyline.vertices[3].position[0] += 0.01;
+        assert!(polyline.rectangle_frame(Tolerance::default()).is_none());
+        polyline.vertices[3].position = points[3].to_array();
+        polyline.vertices[0].bulge = 1.0e-12;
+        assert!(polyline.rectangle_frame(Tolerance::default()).is_none());
     }
 
     #[test]

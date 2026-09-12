@@ -59,7 +59,9 @@ pub use intersect::{
 };
 #[cfg(feature = "offset")]
 pub use offset::offset_polyline;
-pub use polyline::{BulgeArc, Polyline, PolylineRange, PolylineRangeSegment, PolylineVertex};
+pub use polyline::{
+    BulgeArc, Polyline, PolylineRange, PolylineRangeSegment, PolylineVertex, RectangleFrame,
+};
 pub use snap::{
     characteristic_points, nearest_to, perpendicular_from, tangent_from, SnapKind, SnapPoint,
 };
