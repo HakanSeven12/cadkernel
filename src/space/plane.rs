@@ -27,6 +27,35 @@ use super::vec::Vec3;
 
 const COPLANARITY_TOLERANCE: f64 = 1e-9;
 
+/// Intersection of an infinite line and a plane given by a point and normal.
+/// `angular_tolerance` bounds the absolute dot product of the unit directions;
+/// parallel, degenerate and nonfinite inputs return `None`.
+pub fn intersect_line_plane(
+    line_origin: [f64; 3],
+    line_direction: [f64; 3],
+    plane_origin: [f64; 3],
+    plane_normal: [f64; 3],
+    angular_tolerance: f64,
+) -> Option<[f64; 3]> {
+    if !line_origin.iter().chain(&line_direction).chain(&plane_origin).chain(&plane_normal)
+        .all(|value| value.is_finite())
+        || !angular_tolerance.is_finite() || angular_tolerance < 0.0
+    {
+        return None;
+    }
+    let direction = Vec3::from(line_direction).normalize()?;
+    let normal = Vec3::from(plane_normal).normalize()?;
+    let denominator = direction.dot(normal);
+    if denominator.abs() <= angular_tolerance {
+        return None;
+    }
+    // Evaluate near the plane origin, not at a potentially distant line origin.
+    let offset = Vec3::from(line_origin) - Vec3::from(plane_origin);
+    let nearest = offset - direction * offset.dot(direction);
+    let hit = Vec3::from(plane_origin) + (nearest - direction * (nearest.dot(normal) / denominator));
+    hit.is_finite().then_some(hit.to_array())
+}
+
 /// Scale-aware distance used by coplanarity checks.
 pub fn coplanarity_tolerance(points: &[[f64; 3]]) -> f64 {
     if !points.iter().flatten().all(|value| value.is_finite()) {
@@ -299,6 +328,21 @@ impl Default for Plane {
 mod tests {
     use super::*;
     use std::f64::consts::FRAC_1_SQRT_2;
+
+    #[test]
+    fn line_plane_intersection_preserves_elevation_and_rejects_invalid_inputs() {
+        let plane = [639_792.184_2, 4_517_057.531_7, 12.5];
+        let line = [plane[0] + 3.0, plane[1] - 7.0, 181_080.0];
+        assert_eq!(intersect_line_plane(line, [0.0, 0.0, -4.0], plane, [0.0, 0.0, 2.0], 1e-6),
+            Some([line[0], line[1], plane[2]]));
+        assert_eq!(intersect_line_plane([0.0, 0.0, 10.0], [1.0, 0.0, -1.0], [0.0; 3], [0.0, 1.0, 1.0], 1e-6),
+            Some([10.0, 0.0, 0.0]));
+        for direction in [[1.0, 0.0, 0.0], [1.0, 0.0, 1e-7], [0.0; 3], [f64::NAN, 0.0, 1.0]] {
+            assert_eq!(intersect_line_plane(line, direction, plane, [0.0, 0.0, 1.0], 1e-6), None);
+        }
+        assert_eq!(intersect_line_plane(line, [0.0, 0.0, 1.0], plane, [0.0; 3], 1e-6), None);
+        assert_eq!(intersect_line_plane(line, [0.0, 0.0, 1.0], plane, [0.0, 0.0, 1.0], f64::NAN), None);
+    }
 
     /// A plane whose frame is deliberately neither unit nor right-angled.
     fn skewed() -> Plane {
