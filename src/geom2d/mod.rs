@@ -22,6 +22,7 @@ pub(crate) mod constrained;
 pub mod cross;
 pub mod curve;
 pub mod deviation;
+pub mod dimension;
 pub mod fillet;
 pub mod frame;
 pub mod gradient;
@@ -44,6 +45,7 @@ pub use band::{
 pub use clip::{break_spans, inside_pieces, inside_spans, trim_spans};
 pub use centerline::{centerline_between, CenterLineGeometry};
 pub use containment::{closest_point, contains, distance_to, nearest_of, Closest};
+pub use dimension::linear_dimension_leader;
 pub use construct::{
     arc_from_endpoints_angle, arc_from_endpoints_radius, arc_from_sagitta,
     arc_from_start_tangent, arc_sweep_from_chord, arc_through_points, bounded_arc,
