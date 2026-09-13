@@ -19,6 +19,7 @@ pub mod containment;
 pub mod construct;
 #[cfg(feature = "brep")]
 pub(crate) mod constrained;
+pub mod constraint_inference;
 pub mod cross;
 pub mod curve;
 pub mod deviation;
@@ -45,6 +46,9 @@ pub use band::{
 pub use clip::{break_spans, inside_pieces, inside_spans, trim_spans};
 pub use centerline::{centerline_between, CenterLineGeometry};
 pub use containment::{closest_point, contains, distance_to, nearest_of, Closest};
+pub use constraint_inference::{
+    infer_constraints, Endpoint as ConstraintEndpoint, InferredConstraint, SketchPrimitive,
+};
 pub use dimension::linear_dimension_leader;
 pub use construct::{
     arc_from_endpoints_angle, arc_from_endpoints_radius, arc_from_sagitta,
