@@ -9,8 +9,8 @@ use crate::solvers::SolveStatus;
 use crate::subsystem::SubSystem;
 use crate::util::ParamStore;
 
-const TOLG: f64 = 1e-80;
-const TOLX: f64 = 1e-80;
+const TOLG: f64 = 1e-12;
+const TOLX: f64 = 1e-12;
 const TOLF: f64 = 1e-10;
 const MAX_ITER: usize = 100;
 
