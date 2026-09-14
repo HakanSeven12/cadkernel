@@ -206,7 +206,7 @@ impl Constraint for AngleViaTwoPoints {
 /// As [`AngleViaPoint`], but `crv1`'s normal is taken at a fixed curve
 /// parameter `cparam` (via [`Curve::calculate_normal_at_param`]) instead of
 /// at a stored point — for constraining a curve's tangent at a specific
-/// parametric location that isn't itself a sketch point.
+/// parametric location that isn't itself a constrained point.
 pub struct AngleViaPointAndParam {
     crv1: Rc<dyn Curve>,
     crv2: Rc<dyn Curve>,

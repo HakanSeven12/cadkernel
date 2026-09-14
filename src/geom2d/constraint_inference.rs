@@ -1,4 +1,4 @@
-//! Geometric relations that are already present in a set of sketch curves.
+//! Geometric relations that are already present in a set of drawing curves.
 
 use super::{Arc, Circle, Line, Tolerance, Vec2};
 

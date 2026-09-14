@@ -201,7 +201,7 @@ impl DeriVector2 {
 /// constraint classes.
 pub trait Curve {
     /// Normal at a point `p` that need not lie exactly on the curve (e.g. a
-    /// not-yet-solved sketch point being pulled onto it). Default impl
+    /// not-yet-solved parametric point being pulled onto it). Default impl
     /// delegates to [`calculate_normal_from_value`](Self::calculate_normal_from_value)
     /// after sampling `p` from the store — what differs per curve type is
     /// only the formula once you *have* the point's value, not how the

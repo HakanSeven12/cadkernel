@@ -1,40 +1,12 @@
 //! Degrees-of-freedom and redundant-constraint diagnosis.
 //!
-//! Ported in spirit, not line-by-line, from `System::diagnose` and
-//! `identifyConflictingRedundantConstraints` (`GCS.cpp`). The C++ version is
-//! substantially more machinery than the rest of this port: it runs two QR
-//! decompositions in parallel threads, switches between dense and sparse QR
-//! by system size, tracks per-constraint "tags" (so a caller can mark
-//! certain constraints high-priority or exempt from the conflict report),
-//! and distinguishes *which* rows of a rank-deficient Jacobian are
-//! genuinely redundant (safe to drop) via Eigen's `FullPivHouseholderQR`
-//! column tracking.
-//!
-//! This gets to the same two numbers a caller actually needs — the
-//! remaining degrees of freedom, and a set of constraints that could be
-//! removed without changing what the rest of the system can satisfy — via
-//! plain rank-revealing SVD (already used the same way in `qp_eq.rs`) and a
-//! straightforward incremental-rank scan, at the cost of two simplifications
-//! worth knowing about before relying on this for anything but a UI hint:
-//!
-//! - **No tag system.** Every constraint in the subsystem is considered;
-//!   there's no way yet to exempt a particular constraint from the report.
-//! - **Redundant vs. conflicting is a separate, opt-in step.** [`diagnose`]
-//!   itself only identifies constraint rows that are *linearly dependent* on
-//!   the others (the Jacobian doesn't have full row rank) — safe to drop
-//!   without changing the solvable configuration space, but not yet telling
-//!   apart a harmless duplicate from a genuinely *conflicting* constraint
-//!   (dependent AND infeasible together, e.g. two different fixed distances
-//!   between the same two points). [`classify_redundant`] answers that,
-//!   for exactly the rows `diagnose` flagged, by attempting a solve on the
-//!   reduced system and checking whether the removed row's own error can
-//!   still reach zero there — kept separate from `diagnose` because it costs
-//!   one extra solve per redundant row, which `diagnose`'s own "cheap enough
-//!   for every edit" contract doesn't afford.
+//! Rank is built incrementally from the Jacobian rows. Dependent rows are
+//! reported as redundant; callers may classify those rows separately when
+//! they need to distinguish harmless duplication from a conflict.
 
 use std::rc::Rc;
 
-use nalgebra::DMatrix;
+use nalgebra::DVector;
 
 use crate::constraints::Constraint;
 use crate::subsystem::SubSystem;
@@ -69,26 +41,32 @@ pub fn diagnose(sub: &SubSystem, store: &ParamStore) -> Diagnosis {
     let psize = sub.p_size();
     let csize = sub.c_size();
 
-    let full_rank = matrix_rank(&jacobi);
-    let dof = psize.saturating_sub(full_rank);
-
-    let mut kept_rows: Vec<usize> = Vec::with_capacity(csize);
+    let tolerance = jacobi.norm() * f64::EPSILON * (jacobi.nrows().max(jacobi.ncols()) as f64);
+    let mut basis: Vec<DVector<f64>> = Vec::with_capacity(csize.min(psize));
     let mut redundant: Vec<usize> = Vec::new();
-    let mut current_rank = 0usize;
 
     for i in 0..csize {
-        let mut trial = kept_rows.clone();
-        trial.push(i);
-        let trial_rank = matrix_rank(&row_submatrix(&jacobi, &trial));
-        if trial_rank > current_rank {
-            kept_rows.push(i);
-            current_rank = trial_rank;
-        } else {
+        let mut residual = jacobi.row(i).transpose().into_owned();
+        // Re-orthogonalize once. The second pass keeps the incremental rank
+        // stable for nearly dependent rows without rebuilding a decomposition
+        // for every prefix of the matrix.
+        for _ in 0..2 {
+            for direction in &basis {
+                residual -= direction * direction.dot(&residual);
+            }
+        }
+        let norm = residual.norm();
+        if norm <= tolerance {
             redundant.push(i);
+        } else {
+            basis.push(residual / norm);
         }
     }
 
-    Diagnosis { dof, redundant }
+    Diagnosis {
+        dof: psize.saturating_sub(basis.len()),
+        redundant,
+    }
 }
 
 /// Whether a redundant (linearly-dependent) constraint is safe to drop or
@@ -111,7 +89,7 @@ pub enum RedundancyKind {
 /// Below this, a redundant constraint's own error at the reduced system's
 /// solved position counts as "satisfied" (genuinely redundant) rather than
 /// "violated" (conflicting). Matches the tolerance `solvers` use to call a
-/// solve `Success` at sketch scale.
+/// solve `Success` at drawing scale.
 const CONFLICT_TOLERANCE: f64 = 1e-6;
 
 /// For each `redundant` row `diagnose` flagged on `sub` (linearly dependent
@@ -129,8 +107,7 @@ const CONFLICT_TOLERANCE: f64 = 1e-6;
 /// into it: this does one extra solve per redundant row, which [`diagnose`]'s
 /// own "cheap enough for every edit" contract doesn't afford — but the
 /// common case (no redundant rows at all) never pays for it, since a caller
-/// only reaches for this once `diagnose` has already reported something to
-/// classify (e.g. the plan's SketchXpert-style resolver UI).
+/// only reaches for this once `diagnose` has already reported something.
 pub fn classify_redundant(
     sub: &SubSystem,
     store: &ParamStore,
@@ -160,20 +137,6 @@ pub fn classify_redundant(
         .collect()
 }
 
-fn row_submatrix(m: &DMatrix<f64>, rows: &[usize]) -> DMatrix<f64> {
-    let owned_rows: Vec<_> = rows.iter().map(|&r| m.row(r).clone_owned()).collect();
-    DMatrix::from_rows(&owned_rows)
-}
-
-fn matrix_rank(m: &DMatrix<f64>) -> usize {
-    if m.nrows() == 0 || m.ncols() == 0 {
-        return 0;
-    }
-    let singular_values = m.clone().singular_values();
-    let tol = singular_values.max() * f64::EPSILON * (m.nrows().max(m.ncols()) as f64);
-    singular_values.iter().filter(|&&s| s > tol).count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,7 +154,7 @@ mod tests {
             p1, p2, distance,
         ));
         // Only one constraint on two free params (p2.x, p2.y): one DOF left
-        // (free to slide around the circle), matching a real sketch's math,
+        // (free to slide around the circle), matching the geometric model,
         // not "fully constrained" -- this test is really about the *shape*
         // of the result, exercised precisely by the redundancy tests below.
         let sub = SubSystem::new(vec![c], &[p2.x, p2.y]);

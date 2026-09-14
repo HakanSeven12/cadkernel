@@ -59,7 +59,7 @@ impl ParamStore {
     /// The solver itself must not call this on a driven parameter — that
     /// check belongs to the constraint/subsystem layer, which knows which
     /// parameters it is allowed to move. This method stays unconditional so
-    /// setting up or re-driving a sketch (the one place driven values do
+    /// setting up or re-driving a parametric model (the one place driven values do
     /// change) does not need a separate code path.
     pub fn set(&mut self, id: ParamId, value: f64) {
         self.values[id.0 as usize] = value;

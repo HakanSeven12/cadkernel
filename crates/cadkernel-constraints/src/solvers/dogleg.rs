@@ -1,22 +1,7 @@
-//! Powell's Dogleg trust-region method — planegcs's default solver.
+//! Powell's Dogleg trust-region solver.
 //!
-//! Ported from `System::solve_DL` (`GCS.cpp`). Tolerances and iteration cap
-//! match planegcs's own defaults (`System::System()`'s member-initializer
-//! list): `tolg = 1e-80`, `tolx = 1e-80`, `tolf = 1e-10`, `max_iter = 100`
-//! (the "redundant-solving" variants with different tolerances, and the
-//! `sketchSizeMultiplier`-scaled iteration cap, aren't exposed — both are
-//! System-level solver *configuration* the later `diagnosis.rs`/`system.rs`
-//! work can thread through if it turns out to matter).
-//!
-//! One deliberate substitution: the Gauss-Newton step `h_gn` solves
-//! `Jx * h_gn = -fx`. The C++ defaults to Eigen's `FullPivLU`, chosen
-//! because it handles `Jx` being rectangular and possibly rank-deficient.
-//! nalgebra has no equivalent decomposition; this uses its SVD-based
-//! least-squares solve instead, which handles the same rectangular/
-//! rank-deficient cases (via a small-singular-value cutoff) and serves the
-//! same purpose — a robust direction when the Jacobian isn't a nice square
-//! invertible matrix — without replicating the C++'s three-way
-//! `dogLegGaussStep` switch between LU variants.
+//! The Gauss-Newton step uses SVD-based least squares so rectangular and
+//! rank-deficient Jacobians still produce a robust search direction.
 
 use nalgebra::DVector;
 

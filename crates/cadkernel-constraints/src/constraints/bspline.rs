@@ -8,7 +8,7 @@
 //! constraint's `error()`/`grad()` are called many times per solve with `u`
 //! barely changing between calls. This port always recomputes the window
 //! fresh via [`BSpline::find_span`] instead: `find_span` is an O(pole
-//! count) linear scan, cheap at ordinary sketch scale, and skipping the
+//! count) linear scan, cheap at ordinary drawing scale, and skipping the
 //! cache sidesteps needing interior mutability (a `Cell<usize>`) on a type
 //! that otherwise, like every other `Constraint` impl here, only needs
 //! shared access to evaluate.

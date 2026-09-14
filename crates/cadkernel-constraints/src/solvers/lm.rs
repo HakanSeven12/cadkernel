@@ -1,19 +1,7 @@
-//! Levenberg-Marquardt — damped Gauss-Newton least squares.
+//! Levenberg-Marquardt damped least-squares solver.
 //!
-//! Ported from `System::solve_LM` (`GCS.cpp`). Defaults match planegcs's
-//! own (`System::System()`): `eps = 1e-10`, `eps1 = 1e-80`, `tau = 1e-3`,
-//! `max_iter = 100` (as with `dogleg.rs`, the "redundant-solving" tolerance
-//! variants and the `sketchSizeMultiplier`-scaled iteration cap aren't
-//! exposed here). Store snapshot/revert-on-failure replaces the C++'s
-//! scratch-copy-plus-separate-`applySolution()` pattern exactly as in
-//! `dogleg.rs` — see that module's doc comment and `subsystem.rs`'s for why.
-//!
-//! One faithful-but-odd detail kept as-is: the inner damping-adjustment loop
-//! counts rejected steps in `k` and stops after `k` reaches 50, but the
-//! C++'s `if (k > 50) { stop = 7; ... }` check after that loop can never be
-//! true (`k` never exceeds 50, only reaches it) — so that branch is
-//! effectively dead code upstream, and stays dead code here rather than
-//! being "corrected" into the probably-intended `k >= 50`.
+//! Failed attempts are isolated in the parameter store and reverted before
+//! returning so callers never receive a partial solution.
 
 use crate::solvers::SolveStatus;
 use crate::subsystem::SubSystem;

@@ -103,7 +103,7 @@ mod tests {
     use crate::geo::Point;
 
     #[test]
-    fn a_two_point_distance_sketch_builds_partitions_and_round_trips() {
+    fn a_two_point_distance_system_builds_partitions_and_round_trips() {
         // Two independent constraints on disjoint geometry: a P2PDistance
         // between two points, and an unrelated Difference — should land in
         // two separate subsystems.

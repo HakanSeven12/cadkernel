@@ -114,7 +114,7 @@ impl SubSystem {
     /// instead, relying on [`Constraint::grad`]'s own membership check to
     /// contribute `0.0` for unrelated pairs — same result, no adjacency
     /// bookkeeping to maintain yet. Revisit if profiling ever shows this
-    /// O(csize * params.len()) scan mattering at real sketch sizes.
+    /// O(csize * params.len()) scan mattering at real model sizes.
     pub fn calc_grad_for(&self, store: &ParamStore, params: &[ParamId]) -> DVector<f64> {
         let mut grad = DVector::zeros(params.len());
         for (j, &param) in params.iter().enumerate() {
