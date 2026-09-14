@@ -308,6 +308,59 @@ impl Constraint for P2PDistance {
     }
 }
 
+/// Signed point-to-point distance projected onto a fixed direction.
+pub struct ProjectedDistance {
+    pub p1: Point,
+    pub p2: Point,
+    pub distance: ParamId,
+    direction: [f64; 2],
+}
+
+impl ProjectedDistance {
+    pub fn new(
+        p1: Point,
+        p2: Point,
+        distance: ParamId,
+        direction: [f64; 2],
+    ) -> Option<Self> {
+        let length = direction[0].hypot(direction[1]);
+        (length > f64::EPSILON).then_some(Self {
+            p1,
+            p2,
+            distance,
+            direction: [direction[0] / length, direction[1] / length],
+        })
+    }
+}
+
+impl Constraint for ProjectedDistance {
+    fn params(&self) -> Vec<ParamId> {
+        vec![self.p1.x, self.p1.y, self.p2.x, self.p2.y, self.distance]
+    }
+
+    fn error_value(&self, store: &ParamStore) -> f64 {
+        (store.get(self.p2.x) - store.get(self.p1.x)) * self.direction[0]
+            + (store.get(self.p2.y) - store.get(self.p1.y)) * self.direction[1]
+            - store.get(self.distance)
+    }
+
+    fn grad_value(&self, _store: &ParamStore, param: ParamId) -> f64 {
+        if param == self.p1.x {
+            -self.direction[0]
+        } else if param == self.p1.y {
+            -self.direction[1]
+        } else if param == self.p2.x {
+            self.direction[0]
+        } else if param == self.p2.y {
+            self.direction[1]
+        } else if param == self.distance {
+            -1.0
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Signed distance from point `p` to line `l`, matching `distance` in sign
 /// per `ccw` (counterclockwise winding puts the point on the positive side).
 pub struct P2LDistance {
@@ -980,6 +1033,17 @@ mod tests {
         let p2 = point(&mut store, 3.0, 4.0);
         let d = store.add(5.0, false);
         let c = P2PDistance::new(p1, p2, d);
+        assert!(c.error_value(&store).abs() < 1e-12);
+        assert_grad_matches_finite_difference(&c, &mut store);
+    }
+
+    #[test]
+    fn projected_distance_uses_the_normalized_fixed_direction() {
+        let mut store = ParamStore::new();
+        let p1 = point(&mut store, 1.0, 2.0);
+        let p2 = point(&mut store, 7.0, 10.0);
+        let d = store.add(10.0, false);
+        let c = ProjectedDistance::new(p1, p2, d, [3.0, 4.0]).unwrap();
         assert!(c.error_value(&store).abs() < 1e-12);
         assert_grad_matches_finite_difference(&c, &mut store);
     }
