@@ -317,12 +317,7 @@ pub struct ProjectedDistance {
 }
 
 impl ProjectedDistance {
-    pub fn new(
-        p1: Point,
-        p2: Point,
-        distance: ParamId,
-        direction: [f64; 2],
-    ) -> Option<Self> {
+    pub fn new(p1: Point, p2: Point, distance: ParamId, direction: [f64; 2]) -> Option<Self> {
         let length = direction[0].hypot(direction[1]);
         (length > f64::EPSILON).then_some(Self {
             p1,
@@ -358,6 +353,129 @@ impl Constraint for ProjectedDistance {
         } else {
             0.0
         }
+    }
+}
+
+/// Signed point-to-point distance projected onto a direction that follows a line.
+pub struct ProjectedDistanceAlongLine {
+    pub p1: Point,
+    pub p2: Point,
+    pub distance: ParamId,
+    pub direction_line: Line,
+    pub perpendicular: bool,
+}
+
+impl ProjectedDistanceAlongLine {
+    pub fn new(
+        p1: Point,
+        p2: Point,
+        distance: ParamId,
+        direction_line: Line,
+        perpendicular: bool,
+    ) -> Self {
+        Self {
+            p1,
+            p2,
+            distance,
+            direction_line,
+            perpendicular,
+        }
+    }
+
+    fn values(&self, store: &ParamStore) -> Option<([f64; 2], [f64; 2], f64)> {
+        let delta = [
+            store.get(self.p2.x) - store.get(self.p1.x),
+            store.get(self.p2.y) - store.get(self.p1.y),
+        ];
+        let line = [
+            store.get(self.direction_line.p2.x) - store.get(self.direction_line.p1.x),
+            store.get(self.direction_line.p2.y) - store.get(self.direction_line.p1.y),
+        ];
+        let length = line[0].hypot(line[1]);
+        if length <= f64::EPSILON {
+            return None;
+        }
+        let unit = [line[0] / length, line[1] / length];
+        let direction = if self.perpendicular {
+            [-unit[1], unit[0]]
+        } else {
+            unit
+        };
+        Some((delta, direction, length))
+    }
+}
+
+impl Constraint for ProjectedDistanceAlongLine {
+    fn params(&self) -> Vec<ParamId> {
+        vec![
+            self.p1.x,
+            self.p1.y,
+            self.p2.x,
+            self.p2.y,
+            self.distance,
+            self.direction_line.p1.x,
+            self.direction_line.p1.y,
+            self.direction_line.p2.x,
+            self.direction_line.p2.y,
+        ]
+    }
+
+    fn error_value(&self, store: &ParamStore) -> f64 {
+        let Some((delta, direction, _)) = self.values(store) else {
+            return 0.0;
+        };
+        delta[0] * direction[0] + delta[1] * direction[1] - store.get(self.distance)
+    }
+
+    fn grad_value(&self, store: &ParamStore, param: ParamId) -> f64 {
+        let Some((delta, direction, length)) = self.values(store) else {
+            return 0.0;
+        };
+        let mut deriv = 0.0;
+        if param == self.p1.x {
+            deriv -= direction[0];
+        }
+        if param == self.p1.y {
+            deriv -= direction[1];
+        }
+        if param == self.p2.x {
+            deriv += direction[0];
+        }
+        if param == self.p2.y {
+            deriv += direction[1];
+        }
+        if param == self.distance {
+            deriv -= 1.0;
+        }
+
+        let unit = if self.perpendicular {
+            [direction[1], -direction[0]]
+        } else {
+            direction
+        };
+        let direction_gradient = if self.perpendicular {
+            [delta[1], -delta[0]]
+        } else {
+            delta
+        };
+        let along = direction_gradient[0] * unit[0] + direction_gradient[1] * unit[1];
+        let line_gradient = [
+            (direction_gradient[0] - along * unit[0]) / length,
+            (direction_gradient[1] - along * unit[1]) / length,
+        ];
+        if param == self.direction_line.p1.x {
+            deriv -= line_gradient[0];
+        }
+        if param == self.direction_line.p1.y {
+            deriv -= line_gradient[1];
+        }
+        if param == self.direction_line.p2.x {
+            deriv += line_gradient[0];
+        }
+        if param == self.direction_line.p2.y {
+            deriv += line_gradient[1];
+        }
+        deriv
     }
 }
 
@@ -1044,6 +1162,30 @@ mod tests {
         let p2 = point(&mut store, 7.0, 10.0);
         let d = store.add(10.0, false);
         let c = ProjectedDistance::new(p1, p2, d, [3.0, 4.0]).unwrap();
+        assert!(c.error_value(&store).abs() < 1e-12);
+        assert_grad_matches_finite_difference(&c, &mut store);
+    }
+
+    #[test]
+    fn projected_distance_can_follow_a_line() {
+        let mut store = ParamStore::new();
+        let p1 = point(&mut store, 1.0, 2.0);
+        let p2 = point(&mut store, 7.0, 10.0);
+        let d = store.add(10.0, false);
+        let direction_line = line(&mut store, -2.0, -3.0, 1.0, 1.0);
+        let c = ProjectedDistanceAlongLine::new(p1, p2, d, direction_line, false);
+        assert!(c.error_value(&store).abs() < 1e-12);
+        assert_grad_matches_finite_difference(&c, &mut store);
+    }
+
+    #[test]
+    fn projected_distance_can_follow_a_line_normal() {
+        let mut store = ParamStore::new();
+        let p1 = point(&mut store, 1.0, 2.0);
+        let p2 = point(&mut store, -7.0, 8.0);
+        let d = store.add(10.0, false);
+        let direction_line = line(&mut store, -2.0, -3.0, 1.0, 1.0);
+        let c = ProjectedDistanceAlongLine::new(p1, p2, d, direction_line, true);
         assert!(c.error_value(&store).abs() < 1e-12);
         assert_grad_matches_finite_difference(&c, &mut store);
     }
