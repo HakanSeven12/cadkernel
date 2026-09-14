@@ -3,7 +3,7 @@
 use super::{Arc, Circle, Line, Tolerance, Vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SketchPrimitive {
+pub enum ParametricPrimitive {
     Line(Line),
     Circle(Circle),
     Arc(Arc),
@@ -51,10 +51,10 @@ pub enum InferredConstraint {
     },
 }
 
-fn endpoints(primitive: SketchPrimitive) -> Option<[[f64; 2]; 2]> {
+fn endpoints(primitive: ParametricPrimitive) -> Option<[[f64; 2]; 2]> {
     match primitive {
-        SketchPrimitive::Line(line) => Some([line.start, line.end]),
-        SketchPrimitive::Arc(arc) => Some([
+        ParametricPrimitive::Line(line) => Some([line.start, line.end]),
+        ParametricPrimitive::Arc(arc) => Some([
             [
                 arc.centre[0] + arc.radius * arc.start_angle.cos(),
                 arc.centre[1] + arc.radius * arc.start_angle.sin(),
@@ -64,18 +64,18 @@ fn endpoints(primitive: SketchPrimitive) -> Option<[[f64; 2]; 2]> {
                 arc.centre[1] + arc.radius * arc.end_angle.sin(),
             ],
         ]),
-        SketchPrimitive::Circle(_) => None,
+        ParametricPrimitive::Circle(_) => None,
     }
 }
 
-fn circle(primitive: SketchPrimitive) -> Option<Circle> {
+fn circle(primitive: ParametricPrimitive) -> Option<Circle> {
     match primitive {
-        SketchPrimitive::Circle(circle) => Some(circle),
-        SketchPrimitive::Arc(arc) => Some(Circle {
+        ParametricPrimitive::Circle(circle) => Some(circle),
+        ParametricPrimitive::Arc(arc) => Some(Circle {
             centre: arc.centre,
             radius: arc.radius,
         }),
-        SketchPrimitive::Line(_) => None,
+        ParametricPrimitive::Line(_) => None,
     }
 }
 
@@ -96,7 +96,7 @@ fn line_distance(line: Line, point: [f64; 2]) -> Option<f64> {
 /// priority order. This never changes geometry; the caller decides which
 /// returned relations to persist.
 pub fn infer_constraints(
-    primitives: &[SketchPrimitive],
+    primitives: &[ParametricPrimitive],
     distance_tolerance: Tolerance,
     angle_tolerance_radians: f64,
 ) -> Vec<InferredConstraint> {
@@ -115,7 +115,7 @@ pub fn infer_constraints(
     let mut tangent = Vec::new();
 
     for (index, primitive) in primitives.iter().copied().enumerate() {
-        if let SketchPrimitive::Line(line) = primitive {
+        if let ParametricPrimitive::Line(line) = primitive {
             if let Some(direction) = unit_line(line) {
                 if direction.y.abs() <= sin_angle {
                     horizontal.push(InferredConstraint::Horizontal { entity: index });
@@ -154,7 +154,7 @@ pub fn infer_constraints(
                 }
             }
 
-            if let (SketchPrimitive::Line(a), SketchPrimitive::Line(b)) =
+            if let (ParametricPrimitive::Line(a), ParametricPrimitive::Line(b)) =
                 (primitives[first], primitives[second])
             {
                 if let (Some(ua), Some(ub)) = (unit_line(a), unit_line(b)) {
@@ -182,8 +182,8 @@ pub fn infer_constraints(
                         tangent.push(InferredConstraint::Tangent { first, second });
                     }
                 }
-                (Some(circle), None) if matches!(primitives[second], SketchPrimitive::Line(_)) => {
-                    let SketchPrimitive::Line(line) = primitives[second] else {
+                (Some(circle), None) if matches!(primitives[second], ParametricPrimitive::Line(_)) => {
+                    let ParametricPrimitive::Line(line) = primitives[second] else {
                         unreachable!()
                     };
                     if line_distance(line, circle.centre)
@@ -192,8 +192,8 @@ pub fn infer_constraints(
                         tangent.push(InferredConstraint::Tangent { first, second });
                     }
                 }
-                (None, Some(circle)) if matches!(primitives[first], SketchPrimitive::Line(_)) => {
-                    let SketchPrimitive::Line(line) = primitives[first] else {
+                (None, Some(circle)) if matches!(primitives[first], ParametricPrimitive::Line(_)) => {
+                    let ParametricPrimitive::Line(line) = primitives[first] else {
                         unreachable!()
                     };
                     if line_distance(line, circle.centre)
@@ -226,11 +226,11 @@ mod tests {
     #[test]
     fn relations_are_in_priority_order() {
         let curves = [
-            SketchPrimitive::Line(Line {
+            ParametricPrimitive::Line(Line {
                 start: [0.0, 0.0],
                 end: [2.0, 0.0],
             }),
-            SketchPrimitive::Line(Line {
+            ParametricPrimitive::Line(Line {
                 start: [2.0, 0.0],
                 end: [4.0, 0.0],
             }),
@@ -246,11 +246,11 @@ mod tests {
     #[test]
     fn infers_circle_line_tangency() {
         let curves = [
-            SketchPrimitive::Circle(Circle {
+            ParametricPrimitive::Circle(Circle {
                 centre: [0.0, 0.0],
                 radius: 2.0,
             }),
-            SketchPrimitive::Line(Line {
+            ParametricPrimitive::Line(Line {
                 start: [-3.0, 2.0],
                 end: [3.0, 2.0],
             }),
