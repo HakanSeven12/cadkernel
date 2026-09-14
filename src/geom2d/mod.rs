@@ -69,7 +69,10 @@ pub use offset::offset_polyline;
 pub use polyline::{
     BulgeArc, Polyline, PolylineRange, PolylineRangeSegment, PolylineVertex, RectangleFrame,
 };
-pub use polyline_edit::{move_polyline_segment_parallel, resize_polyline_arc};
+pub use polyline_edit::{
+    move_polyline_segment_parallel, polyline_arc_radius_from_point,
+    polyline_segment_parallel_offset, resize_polyline_arc,
+};
 pub use snap::{
     characteristic_points, nearest_to, perpendicular_from, tangent_from, SnapKind, SnapPoint,
 };

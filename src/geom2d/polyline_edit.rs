@@ -332,6 +332,48 @@ fn arc_fillet_frame(polyline: &Polyline, segment: usize) -> Option<(Vec2, Vec2, 
     ))
 }
 
+/// Radius selected by a cursor point for an arc segment.
+pub fn polyline_arc_radius_from_point(
+    polyline: &Polyline,
+    segment: usize,
+    point: [f64; 2],
+) -> Option<f64> {
+    let arc = polyline.segment_arc(segment)?;
+    let point = Vec2::from(point);
+    let radius = if let Some((apex, _, _)) = arc_fillet_frame(polyline, segment) {
+        let midpoint = Vec2::from(arc.sample(0.5));
+        let ray = midpoint - apex;
+        arc.radius * (point - apex).dot(ray) / ray.dot(ray)
+    } else {
+        point.distance(Vec2::from(arc.center))
+    };
+    (radius > Tolerance::default().linear()).then_some(radius)
+}
+
+/// Signed parallel offset selected by a cursor point for a straight segment.
+pub fn polyline_segment_parallel_offset(
+    polyline: &Polyline,
+    segment: usize,
+    point: [f64; 2],
+) -> Option<f64> {
+    let count = if polyline.closed {
+        polyline.vertices.len()
+    } else {
+        polyline.vertices.len().saturating_sub(1)
+    };
+    if segment >= count || polyline.vertices[segment].bulge.abs() >= BULGE_EPSILON {
+        return None;
+    }
+    let start = Vec2::from(polyline.vertices[segment].position);
+    let end = Vec2::from(polyline.vertices[(segment + 1) % polyline.vertices.len()].position);
+    let direction = end - start;
+    let length = direction.length();
+    if length <= Tolerance::default().linear() {
+        return None;
+    }
+    Some((Vec2::from(point) - start).dot(direction.perpendicular() / length))
+}
+
 /// Change an arc segment's radius while preserving its connected geometry.
 pub fn resize_polyline_arc(polyline: &mut Polyline, segment: usize, radius: f64) -> bool {
     if radius <= Tolerance::default().linear() || !radius.is_finite() {
