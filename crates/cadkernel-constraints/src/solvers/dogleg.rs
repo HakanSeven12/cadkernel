@@ -56,11 +56,23 @@ pub fn solve_dl(sub: &SubSystem, store: &mut ParamStore) -> SolveStatus {
         let alpha = g.norm_squared() / (&jx * &g).norm_squared();
         let h_sd = &g * alpha;
 
-        let h_gn = jx
-            .clone()
-            .svd(true, true)
-            .solve(&(-fx.clone()), 1e-12)
-            .unwrap_or_else(|_| DVector::zeros(xsize));
+        // A lightly regularized normal equation gives the same
+        // Gauss-Newton direction at drawing precision and is dramatically
+        // cheaper than decomposing a large rectangular Jacobian on every
+        // trust-region iteration. Keep SVD as the robust fallback for a
+        // factorization that still cannot be formed.
+        let jt = jx.transpose();
+        let mut normal = &jt * &jx;
+        let diagonal_scale = normal.diagonal().amax().max(1.0);
+        for index in 0..normal.nrows() {
+            normal[(index, index)] += diagonal_scale * 1e-12;
+        }
+        let h_gn = normal.cholesky().map(|factor| factor.solve(&g)).unwrap_or_else(|| {
+            jx.clone()
+                .svd(true, true)
+                .solve(&(-fx.clone()), 1e-12)
+                .unwrap_or_else(|_| DVector::zeros(xsize))
+        });
 
         let rel_error = (&jx * &h_gn + &fx).norm() / fx.norm();
         if rel_error > 1e15 {
