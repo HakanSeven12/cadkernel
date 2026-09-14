@@ -170,4 +170,18 @@ mod tests {
             [2.0, 3.0, -6.0]
         );
     }
+
+    #[test]
+    fn an_unpositioned_text_marker_uses_the_dimension_midpoint() {
+        let point = default_dimension_jog_position(
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [f64::NAN; 3],
+        )
+        .unwrap();
+        assert_eq!(point, [5.0, 2.0, 0.0]);
+    }
 }
