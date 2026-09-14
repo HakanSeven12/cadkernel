@@ -65,9 +65,9 @@ impl Constraint for TangentCircumf {
             return r1 - r2;
         }
         if self.internal {
-            d_sq - (r1 - r2) * (r1 - r2)
+            d_sq.sqrt() - (r1 - r2).abs()
         } else {
-            d_sq - (r1 + r2) * (r1 + r2)
+            d_sq.sqrt() - (r1 + r2)
         }
     }
 
@@ -86,32 +86,35 @@ impl Constraint for TangentCircumf {
             return 0.0;
         }
 
+        let distance = d_sq.sqrt();
+
         let mut deriv = 0.0;
         if param == self.c1_center.x {
-            deriv += 2.0 * dx;
+            deriv += dx / distance;
         }
         if param == self.c1_center.y {
-            deriv += 2.0 * dy;
+            deriv += dy / distance;
         }
         if param == self.c2_center.x {
-            deriv += -2.0 * dx;
+            deriv -= dx / distance;
         }
         if param == self.c2_center.y {
-            deriv += -2.0 * dy;
+            deriv -= dy / distance;
         }
         if self.internal {
+            let radius_sign = (r1 - r2).signum();
             if param == self.r1 {
-                deriv += 2.0 * (r2 - r1);
+                deriv -= radius_sign;
             }
             if param == self.r2 {
-                deriv += 2.0 * (r1 - r2);
+                deriv += radius_sign;
             }
         } else {
             if param == self.r1 {
-                deriv += -2.0 * (r1 + r2);
+                deriv -= 1.0;
             }
             if param == self.r2 {
-                deriv += -2.0 * (r1 + r2);
+                deriv -= 1.0;
             }
         }
         deriv
@@ -454,6 +457,9 @@ mod tests {
         assert_grad_matches_finite_difference, assert_single_param_grad_matches_fd,
     };
     use crate::geo::Line;
+    use crate::solvers::{dogleg::solve_dl, SolveStatus};
+    use crate::subsystem::SubSystem;
+    use std::rc::Rc;
 
     fn point(store: &mut ParamStore, x: f64, y: f64) -> Point {
         Point::new(store.add(x, false), store.add(y, false))
@@ -485,6 +491,34 @@ mod tests {
         let c2 = circle(&mut store, 9.0, 2.0, 4.0);
         let c = TangentCircumf::new(c1.center, c2.center, c1.rad, c2.rad, false);
         assert_grad_matches_finite_difference(&c, &mut store);
+    }
+
+    #[test]
+    fn tangent_circumf_converges_from_widely_separated_circles() {
+        let mut store = ParamStore::new();
+        let c1 = circle(&mut store, 0.0, 0.0, 3.0);
+        let c2 = circle(&mut store, 20.0, 0.0, 2.0);
+        let constraint: Rc<dyn Constraint> = Rc::new(TangentCircumf::new(
+            c1.center, c2.center, c1.rad, c2.rad, false,
+        ));
+        let subsystem = SubSystem::new(vec![constraint.clone()], &constraint.params());
+
+        assert_eq!(solve_dl(&subsystem, &mut store), SolveStatus::Success);
+        assert!(constraint.error(&store).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tangent_circumf_converges_to_internal_contact() {
+        let mut store = ParamStore::new();
+        let c1 = circle(&mut store, 0.0, 0.0, 5.0);
+        let c2 = circle(&mut store, 1.0, 0.0, 2.0);
+        let constraint: Rc<dyn Constraint> = Rc::new(TangentCircumf::new(
+            c1.center, c2.center, c1.rad, c2.rad, true,
+        ));
+        let subsystem = SubSystem::new(vec![constraint.clone()], &constraint.params());
+
+        assert_eq!(solve_dl(&subsystem, &mut store), SolveStatus::Success);
+        assert!(constraint.error(&store).abs() < 1e-9);
     }
 
     #[test]
