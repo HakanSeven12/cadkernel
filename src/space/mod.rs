@@ -15,6 +15,7 @@ pub mod alignment;
 pub mod arclength;
 pub mod arc_union;
 pub mod curve;
+pub mod dimension;
 pub mod endpoint_join;
 pub mod helix;
 pub mod line_union;
@@ -34,6 +35,11 @@ pub mod planar;
 
 pub use alignment::align_point_pairs;
 pub use arclength::ArcLengthCurve3;
+pub use dimension::{
+    default_dimension_jog_position, dimension_jog_points, dimension_spacing_frame,
+    move_to_dimension_spacing, nearest_segment_point, segment_break_gap_xy,
+    DimensionSpacingFrame,
+};
 pub use helix::{HelixCurve, HelixDirection};
 pub use line_union::{line_union, simplify_linear_chain, LineUnion, LineUnionKind};
 pub use nurbs::{NurbsCurve3, NurbsSurface3};
