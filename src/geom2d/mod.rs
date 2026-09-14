@@ -32,6 +32,7 @@ pub mod nurbs;
 #[cfg(feature = "offset")]
 pub mod offset;
 pub mod polyline;
+pub mod polyline_edit;
 pub mod snap;
 pub mod tessellate;
 pub mod triangulate;
@@ -68,6 +69,7 @@ pub use offset::offset_polyline;
 pub use polyline::{
     BulgeArc, Polyline, PolylineRange, PolylineRangeSegment, PolylineVertex, RectangleFrame,
 };
+pub use polyline_edit::{move_polyline_segment_parallel, resize_polyline_arc};
 pub use snap::{
     characteristic_points, nearest_to, perpendicular_from, tangent_from, SnapKind, SnapPoint,
 };
