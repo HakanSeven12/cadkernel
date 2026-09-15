@@ -18,7 +18,7 @@
 
 use std::rc::Rc;
 
-use crate::geo::{Curve, DeriVector2, Point};
+use crate::geo::{Arc, Curve, DeriVector2, Point};
 use crate::util::{ParamId, ParamStore};
 
 use super::Constraint;
@@ -81,6 +81,89 @@ impl Constraint for CurveValue {
     fn params(&self) -> Vec<ParamId> {
         let mut params = vec![self.p.x, self.p.y, self.u];
         params.extend(self.crv.own_params());
+        params
+    }
+
+    fn error_value(&self, store: &ParamStore) -> f64 {
+        let err_vec = self.err_vec(store, None);
+        if self.pcoord == self.p.x {
+            err_vec.x
+        } else {
+            err_vec.y
+        }
+    }
+
+    fn grad_value(&self, store: &ParamStore, param: ParamId) -> f64 {
+        let err_vec = self.err_vec(store, Some(param));
+        if self.pcoord == self.p.x {
+            err_vec.dx
+        } else {
+            err_vec.dy
+        }
+    }
+}
+
+/// Ties one point coordinate to a circular arc while keeping the sampled
+/// parameter inside the arc's start/end interval.
+///
+/// A plain [`CurveValue`] evaluates an [`Arc`] as its supporting circle, so
+/// its free parameter can converge to a point outside the visible arc. This
+/// variant reflects the free parameter into `[0, 1]` before interpolating
+/// between the arc angles. Both ends remain reachable, their one-sided slope
+/// stays nonzero, and every solved point therefore stays on the bounded arc.
+pub struct BoundedArcValue {
+    p: Point,
+    /// Must be `p.x` or `p.y` — which coordinate this constrains.
+    pcoord: ParamId,
+    arc: Arc,
+    /// Free latent parameter, reflected into the normalized arc interval.
+    u: ParamId,
+}
+
+impl BoundedArcValue {
+    /// `pcoord` must be `p.x` or `p.y`.
+    pub fn new(p: Point, pcoord: ParamId, arc: Arc, u: ParamId) -> Self {
+        debug_assert!(pcoord == p.x || pcoord == p.y, "pcoord must be p.x or p.y");
+        Self { p, pcoord, arc, u }
+    }
+
+    fn err_vec(&self, store: &ParamStore, derivparam: Option<ParamId>) -> DeriVector2 {
+        let latent = store.get(self.u);
+        let phase = latent.rem_euclid(2.0);
+        let (normalized, slope) = if phase <= 1.0 {
+            (phase, 1.0)
+        } else {
+            (2.0 - phase, -1.0)
+        };
+        let dnormalized = if derivparam == Some(self.u) {
+            slope
+        } else {
+            0.0
+        };
+        let start = store.get(self.arc.start_angle);
+        let end = store.get(self.arc.end_angle);
+        let dstart = if derivparam == Some(self.arc.start_angle) {
+            1.0
+        } else {
+            0.0
+        };
+        let dend = if derivparam == Some(self.arc.end_angle) {
+            1.0
+        } else {
+            0.0
+        };
+        let angle = start + (end - start) * normalized;
+        let dangle = dstart + (dend - dstart) * normalized + (end - start) * dnormalized;
+        let p_to = self.arc.value(store, angle, dangle, derivparam);
+        let p_from = DeriVector2::from_point(store, self.p, derivparam);
+        p_from.subtr(&p_to)
+    }
+}
+
+impl Constraint for BoundedArcValue {
+    fn params(&self) -> Vec<ParamId> {
+        let mut params = vec![self.p.x, self.p.y, self.u];
+        params.extend(self.arc.own_params());
         params
     }
 
@@ -428,6 +511,8 @@ mod tests {
     use super::*;
     use crate::constraints::test_support::assert_grad_matches_finite_difference;
     use crate::geo::{Circle, Line};
+    use crate::solvers::{dogleg::solve_dl, SolveStatus};
+    use crate::subsystem::SubSystem;
 
     fn make_point(store: &mut ParamStore, x: f64, y: f64) -> Point {
         Point::new(store.add(x, false), store.add(y, false))
@@ -460,6 +545,71 @@ mod tests {
 
         let c = CurveValue::new(p, p.x, circle, u);
         assert_grad_matches_finite_difference(&c, &mut store);
+    }
+
+    fn make_quarter_arc(store: &mut ParamStore, driven: bool) -> Arc {
+        let center = make_point(store, 0.0, 0.0);
+        let rad = store.add(5.0, driven);
+        let start = make_point(store, 5.0, 0.0);
+        let end = make_point(store, 0.0, 5.0);
+        Arc {
+            circle: Circle { center, rad },
+            start,
+            end,
+            start_angle: store.add(0.0, driven),
+            end_angle: store.add(std::f64::consts::FRAC_PI_2, driven),
+        }
+    }
+
+    #[test]
+    fn bounded_arc_value_grad_matches_finite_difference() {
+        let mut store = ParamStore::new();
+        let arc = make_quarter_arc(&mut store, false);
+        let u = store.add(0.3, false);
+        let p = make_point(&mut store, 10.0, 10.0);
+
+        let c = BoundedArcValue::new(p, p.x, arc, u);
+        assert_grad_matches_finite_difference(&c, &mut store);
+    }
+
+    #[test]
+    fn bounded_arc_value_reflects_parameters_into_the_sweep() {
+        let mut store = ParamStore::new();
+        let arc = make_quarter_arc(&mut store, true);
+        let u = store.add(1.25, false);
+        let angle = std::f64::consts::FRAC_PI_2 * 0.75;
+        let p = make_point(&mut store, 5.0 * angle.cos(), 5.0 * angle.sin());
+
+        let x = BoundedArcValue::new(p, p.x, arc, u);
+        let y = BoundedArcValue::new(p, p.y, arc, u);
+        assert!(x.error_value(&store).abs() < 1e-9);
+        assert!(y.error_value(&store).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bounded_arc_value_solves_away_from_both_endpoint_seeds() {
+        for seed in [0.0, 1.0] {
+            let mut store = ParamStore::new();
+            let arc = make_quarter_arc(&mut store, true);
+            let target_angle = std::f64::consts::FRAC_PI_4;
+            let p = Point::new(
+                store.add(5.0 * target_angle.cos(), true),
+                store.add(5.0 * target_angle.sin(), true),
+            );
+            let u = store.add(seed, false);
+            let constraints: Vec<Rc<dyn Constraint>> = vec![
+                Rc::new(BoundedArcValue::new(p, p.x, arc, u)),
+                Rc::new(BoundedArcValue::new(p, p.y, arc, u)),
+            ];
+            let sub = SubSystem::new(constraints, &[u]);
+
+            assert_eq!(
+                solve_dl(&sub, &mut store),
+                SolveStatus::Success,
+                "seed={seed}"
+            );
+            assert!(sub.error(&store) < 1e-12);
+        }
     }
 
     fn make_lines_at_angle(
