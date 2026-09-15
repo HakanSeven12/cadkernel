@@ -191,9 +191,7 @@ fn segments_intersect_within(a: Line, b: Line, distance: f64) -> bool {
 }
 
 fn line_circle_contact(line: Line, circle: Circle) -> Option<([f64; 2], f64)> {
-    let Some(t) = parameter_on_line(line, circle.centre) else {
-        return None;
-    };
+    let t = parameter_on_line(line, circle.centre)?;
     let start = Vec2::from(line.start);
     let direction = Vec2::from(line.end) - start;
     Some(((start + direction * t).to_array(), t))
@@ -418,6 +416,9 @@ pub fn infer_constraints_with_settings(
         }
     }
 
+    // Disabled axis constraints cannot make an enabled pair relation
+    // redundant: they will not be returned to the caller.
+    candidates.retain(|candidate| settings.priority.contains(&candidate.kind()));
     let axis_candidates = candidates.clone();
     candidates.retain(|candidate| {
         let Some((first, second)) = pair(*candidate) else {
@@ -524,5 +525,33 @@ mod tests {
         assert!(loose
             .iter()
             .any(|item| matches!(item, InferredConstraint::Tangent { .. })));
+    }
+
+    #[test]
+    fn disabled_axes_do_not_suppress_enabled_pair_relations() {
+        let curves = [
+            ParametricPrimitive::Line(Line {
+                start: [0.0, 0.0],
+                end: [2.0, 0.0],
+            }),
+            ParametricPrimitive::Line(Line {
+                start: [3.0, 0.0],
+                end: [5.0, 0.0],
+            }),
+        ];
+        let found = infer_constraints_with_settings(
+            &curves,
+            &InferenceSettings {
+                priority: vec![InferenceKind::Collinear],
+                ..InferenceSettings::default()
+            },
+        );
+        assert_eq!(
+            found,
+            [InferredConstraint::Collinear {
+                first: 0,
+                second: 1,
+            }]
+        );
     }
 }
