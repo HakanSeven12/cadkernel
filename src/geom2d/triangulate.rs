@@ -7,10 +7,10 @@
 //! # Ear clipping, and why holes are bridged rather than special-cased
 //!
 //! The method is the simple one: find a corner whose triangle contains no
-//! other vertex, cut it off, repeat. It is quadratic in the worst case and
-//! linear in practice for the polygons a drawing produces, and — unlike the
-//! faster sweep methods — it needs no ordering structure that a nearly
-//! degenerate polygon can corrupt.
+//! other vertex, cut it off, repeat. Candidate corners are selected by shape
+//! score before testing containment, so the first valid candidate is the
+//! preferred ear. Difficult rings can still require testing every candidate;
+//! the worst case remains cubic in the number of vertices.
 //!
 //! Holes are joined to the outer ring by a bridge: a pair of coincident edges
 //! run out to the hole, round it, and back. The result is one ring with a
@@ -628,6 +628,7 @@ fn bridge_target(points: &mut Vec<Vec2>, ring: &mut Vec<usize>, from: Vec2) -> O
 /// Cuts corners off until nothing is left.
 fn clip_ears(points: &[Vec2], mut ring: Vec<usize>) -> Vec<[usize; 3]> {
     let mut out = Vec::with_capacity(ring.len().saturating_sub(2));
+    let mut candidates = Vec::new();
     // Every ear removes one vertex, so the loop cannot run longer than the
     // ring — but a polygon with no ear at all (self-intersecting) would spin,
     // so the failures are counted rather than assumed away.
@@ -654,9 +655,37 @@ fn clip_ears(points: &[Vec2], mut ring: Vec<usize>) -> Vec<[usize; 3]> {
             (bounds[0][1] - bounds[0][0]).max(f64::MIN_POSITIVE),
             (bounds[1][1] - bounds[1][0]).max(f64::MIN_POSITIVE),
         ];
-        let cut = (0..count).filter(|at| is_ear(points, &ring, *at)).min_by(|a, b| {
-            ear_score(points, &ring, *a, scale).total_cmp(&ear_score(points, &ring, *b, scale))
-        });
+        let cut = if count <= 4 {
+            // Triangles and quads do not need a candidate allocation.
+            (0..count)
+                .filter(|at| is_ear(points, &ring, *at))
+                .min_by(|a, b| {
+                    ear_score(points, &ring, *a, scale)
+                        .total_cmp(&ear_score(points, &ring, *b, scale))
+                })
+        } else {
+            candidates.clear();
+            candidates.extend(
+                (0..count)
+                    .filter(|&at| convex_corner(ear_corners(points, &ring, at)))
+                    .map(|at| (at, ear_score(points, &ring, at, scale))),
+            );
+            let mut cut = None;
+            while let Some(candidate_index) = (0..candidates.len()).min_by(|&a, &b| {
+                // swap_remove changes storage order; ties still use ring order.
+                candidates[a]
+                    .1
+                    .total_cmp(&candidates[b].1)
+                    .then_with(|| candidates[a].0.cmp(&candidates[b].0))
+            }) {
+                let (at, _) = candidates.swap_remove(candidate_index);
+                if is_ear(points, &ring, at) {
+                    cut = Some(at);
+                    break;
+                }
+            }
+            cut
+        };
         match cut {
             Some(at) => {
                 let count = ring.len();
@@ -678,12 +707,7 @@ fn clip_ears(points: &[Vec2], mut ring: Vec<usize>) -> Vec<[usize; 3]> {
 }
 
 fn ear_score(points: &[Vec2], ring: &[usize], at: usize, scale: [f64; 2]) -> f64 {
-    let count = ring.len();
-    let corners = [
-        points[ring[(at + count - 1) % count]],
-        points[ring[at]],
-        points[ring[(at + 1) % count]],
-    ];
+    let corners = ear_corners(points, ring, at);
     (0..3)
         .map(|index| {
             let next = (index + 1) % 3;
@@ -694,18 +718,26 @@ fn ear_score(points: &[Vec2], ring: &[usize], at: usize, scale: [f64; 2]) -> f64
         .fold(0.0, f64::max)
 }
 
-/// Whether the corner at `at` can be cut off.
-fn is_ear(points: &[Vec2], ring: &[usize], at: usize) -> bool {
+fn ear_corners(points: &[Vec2], ring: &[usize], at: usize) -> [Vec2; 3] {
     let count = ring.len();
-    let (a, b, c) = (
+    [
         points[ring[(at + count - 1) % count]],
         points[ring[at]],
         points[ring[(at + 1) % count]],
-    );
+    ]
+}
+
+fn convex_corner([a, b, c]: [Vec2; 3]) -> bool {
+    (b - a).cross(c - b) > 0.0
+}
+
+/// Whether the corner at `at` can be cut off.
+fn is_ear(points: &[Vec2], ring: &[usize], at: usize) -> bool {
+    let count = ring.len();
+    let [a, b, c] = ear_corners(points, ring, at);
     // A reflex corner is not an ear, and neither is a collapsed one: cutting
     // either produces a triangle outside the polygon or none at all.
-    let turn = (b - a).cross(c - b);
-    if turn <= 0.0 {
+    if !convex_corner([a, b, c]) {
         return false;
     }
     // And nothing else may be inside the triangle, or the cut would swallow
@@ -758,6 +790,52 @@ mod tests {
         let (points, triangles) = polygon(&square(10.0), &[]);
         assert_eq!(triangles.len(), 2);
         assert!((area(&points, &triangles) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn equal_scores_keep_the_first_valid_ear() {
+        let points: Vec<Vec2> = square(10.0).into_iter().map(Vec2::from).collect();
+        assert_eq!(
+            clip_ears(&points, vec![0, 1, 2, 3]),
+            vec![[3, 0, 1], [1, 2, 3]]
+        );
+        // Check the complete output, including the final triangle/quad scan.
+        let corners = square(10.0);
+        let points: Vec<Vec2> = (0..4)
+            .flat_map(|side| {
+                let a = corners[side];
+                let b = corners[(side + 1) % 4];
+                (0..5).map(move |i| {
+                    Vec2::from([
+                        a[0] + (b[0] - a[0]) * i as f64 / 5.0,
+                        a[1] + (b[1] - a[1]) * i as f64 / 5.0,
+                    ])
+                })
+            })
+            .collect();
+        assert_eq!(
+            clip_ears(&points, (0..20).collect()),
+            [
+                [19, 0, 1],
+                [4, 5, 6],
+                [9, 10, 11],
+                [14, 15, 16],
+                [19, 1, 2],
+                [3, 4, 6],
+                [8, 9, 11],
+                [13, 14, 16],
+                [3, 6, 7],
+                [8, 11, 12],
+                [13, 16, 17],
+                [18, 19, 2],
+                [18, 2, 3],
+                [3, 7, 8],
+                [8, 12, 13],
+                [13, 17, 18],
+                [18, 3, 8],
+                [8, 13, 18],
+            ]
+        );
     }
 
     #[test]
