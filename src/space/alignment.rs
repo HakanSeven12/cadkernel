@@ -64,31 +64,20 @@ pub fn align_point_pairs(
     target: &[[f64; 3]],
     scale_two_pairs: bool,
 ) -> Option<[[f64; 4]; 4]> {
-    if source.len() != target.len()
-        || !(1..=3).contains(&source.len())
-        || source
-            .iter()
-            .chain(target)
-            .flatten()
-            .any(|v| !v.is_finite())
-    {
+    if source.len() != target.len() || !(1..=3).contains(&source.len())
+        || source.iter().chain(target).flatten().any(|v| !v.is_finite()) {
         return None;
     }
     let source_origin = Vec3::from(source[0]);
     let target_origin = Vec3::from(target[0]);
-    let axes = [
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-        Vec3::new(0.0, 0.0, 1.0),
-    ];
+    let axes = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)];
     let mut columns = axes;
     if source.len() >= 2 {
         let a = Vec3::from(source[1]) - source_origin;
         let b = Vec3::from(target[1]) - target_origin;
         let a_length = a.length();
         let b_length = b.length();
-        if !a_length.is_finite() || !b_length.is_finite() || a_length <= 1e-12 || b_length <= 1e-12
-        {
+        if !a_length.is_finite() || !b_length.is_finite() || a_length <= 1e-12 || b_length <= 1e-12 {
             return None;
         }
         let x = a / a_length;
@@ -112,11 +101,8 @@ pub fn align_point_pairs(
             let sine = cross.length();
             if sine > 1e-12 {
                 let axis = cross / sine;
-                columns = axes.map(|basis| {
-                    basis * cosine
-                        + axis.cross(basis) * sine
-                        + axis * (axis.dot(basis) * (1.0 - cosine))
-                });
+                columns = axes.map(|basis| basis * cosine + axis.cross(basis) * sine
+                    + axis * (axis.dot(basis) * (1.0 - cosine)));
             } else if cosine < 0.0 {
                 // At a half-turn the normal is underdetermined. Keep the
                 // world vertical axis when possible, otherwise the Y axis.
@@ -126,28 +112,20 @@ pub fn align_point_pairs(
             }
             if scale_two_pairs {
                 let scale = b_length / a_length;
-                if !scale.is_finite() {
-                    return None;
-                }
+                if !scale.is_finite() { return None; }
                 columns = columns.map(|column| column * scale);
             }
         }
     }
-    let translation = target_origin
-        - columns[0] * source_origin.x
-        - columns[1] * source_origin.y
-        - columns[2] * source_origin.z;
+    let translation = target_origin - columns[0] * source_origin.x
+        - columns[1] * source_origin.y - columns[2] * source_origin.z;
     let matrix = [
         [columns[0].x, columns[1].x, columns[2].x, translation.x],
         [columns[0].y, columns[1].y, columns[2].y, translation.y],
         [columns[0].z, columns[1].z, columns[2].z, translation.z],
         [0.0, 0.0, 0.0, 1.0],
     ];
-    matrix
-        .iter()
-        .flatten()
-        .all(|v| v.is_finite())
-        .then_some(matrix)
+    matrix.iter().flatten().all(|v| v.is_finite()).then_some(matrix)
 }
 
 #[cfg(test)]
@@ -160,12 +138,8 @@ mod tests {
         let target = [[7.0, 8.0, 9.0], [7.0, 10.0, 9.0], [4.0, 8.0, 9.0]];
         let matrix = align_point_pairs(&source, &target, true).unwrap();
         for (from, to) in source.into_iter().zip(target) {
-            let actual = std::array::from_fn(|row| {
-                matrix[row][0] * from[0]
-                    + matrix[row][1] * from[1]
-                    + matrix[row][2] * from[2]
-                    + matrix[row][3]
-            });
+            let actual = std::array::from_fn(|row| matrix[row][0] * from[0]
+                + matrix[row][1] * from[1] + matrix[row][2] * from[2] + matrix[row][3]);
             assert!(Vec3::from(actual).distance(Vec3::from(to)) < 1e-12);
         }
     }

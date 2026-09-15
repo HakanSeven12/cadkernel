@@ -12,32 +12,33 @@
 //! planar B-rep face.
 
 pub mod alignment;
-pub mod arc_union;
 pub mod arclength;
+pub mod arc_union;
 pub mod curve;
 pub mod dimension;
 pub mod endpoint_join;
 pub mod helix;
-mod knot_compaction;
-pub mod lengthen;
 pub mod line_union;
+pub mod lengthen;
 pub mod nurbs;
+mod knot_compaction;
+mod polyline_approximation;
 pub mod plane;
 pub mod polygon;
-mod polyline_approximation;
+pub mod spline;
 pub mod smooth;
 pub mod source_join;
-pub mod spline;
 pub mod vec;
 
 #[cfg(feature = "geom2d")]
 pub mod planar;
 
-pub use alignment::{align_aabbs_2d, align_point_pairs, BoundsAlignment};
+pub use alignment::{BoundsAlignment, align_aabbs_2d, align_point_pairs};
 pub use arclength::ArcLengthCurve3;
 pub use dimension::{
     default_dimension_jog_position, dimension_jog_points, dimension_spacing_frame,
-    move_to_dimension_spacing, nearest_segment_point, segment_break_gap_xy, DimensionSpacingFrame,
+    move_to_dimension_spacing, nearest_segment_point, segment_break_gap_xy,
+    DimensionSpacingFrame,
 };
 pub use helix::{HelixCurve, HelixDirection};
 pub use line_union::{line_union, simplify_linear_chain, LineUnion, LineUnionKind};
