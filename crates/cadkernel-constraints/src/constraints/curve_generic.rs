@@ -127,6 +127,33 @@ impl BoundedArcValue {
         Self { p, pcoord, arc, u }
     }
 
+    /// Seeds the latent parameter from a point's nearest angular position on
+    /// the signed arc interval. A point outside the interval starts just
+    /// inside the nearest end so the solver retains a usable derivative.
+    pub fn initial_parameter(store: &ParamStore, p: Point, arc: Arc) -> f64 {
+        let point_angle = (store.get(p.y) - store.get(arc.circle.center.y))
+            .atan2(store.get(p.x) - store.get(arc.circle.center.x));
+        let start = store.get(arc.start_angle);
+        let end = store.get(arc.end_angle);
+        let sweep = end - start;
+        if sweep.abs() <= 1e-12 {
+            return 0.0;
+        }
+        let midpoint = (start + end) * 0.5;
+        let unwrapped = point_angle
+            + ((midpoint - point_angle) / std::f64::consts::TAU).round() * std::f64::consts::TAU;
+        let normalized = (unwrapped - start) / sweep;
+        const ENDPOINT_SEED: f64 = 1e-6;
+        let normalized = if normalized < 0.0 {
+            ENDPOINT_SEED
+        } else if normalized > 1.0 {
+            1.0 - ENDPOINT_SEED
+        } else {
+            normalized
+        };
+        normalized.sqrt().asin()
+    }
+
     fn err_vec(&self, store: &ParamStore, derivparam: Option<ParamId>) -> DeriVector2 {
         let latent = store.get(self.u);
         let normalized = latent.sin().powi(2);
@@ -599,6 +626,30 @@ mod tests {
             assert!(x.error_value(&store).abs() < 1e-9);
             assert!(y.error_value(&store).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn bounded_arc_value_seeds_inside_signed_sweeps() {
+        let mut store = ParamStore::new();
+        let mut arc = make_quarter_arc(&mut store, true);
+        let inside = make_point(
+            &mut store,
+            5.0 * std::f64::consts::FRAC_PI_4.cos(),
+            5.0 * std::f64::consts::FRAC_PI_4.sin(),
+        );
+        let parameter = BoundedArcValue::initial_parameter(&store, inside, arc);
+        assert!((parameter - std::f64::consts::FRAC_PI_4).abs() < 1e-9);
+
+        store.set(arc.start_angle, std::f64::consts::FRAC_PI_2);
+        store.set(arc.end_angle, 0.0);
+        let parameter = BoundedArcValue::initial_parameter(&store, inside, arc);
+        assert!((parameter - std::f64::consts::FRAC_PI_4).abs() < 1e-9);
+
+        let outside = make_point(&mut store, -5.0, 0.0);
+        arc.start_angle = store.add(0.0, true);
+        arc.end_angle = store.add(std::f64::consts::FRAC_PI_2, true);
+        let parameter = BoundedArcValue::initial_parameter(&store, outside, arc);
+        assert!(parameter > 0.0 && parameter < std::f64::consts::FRAC_PI_2);
     }
 
     #[test]
