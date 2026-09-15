@@ -108,15 +108,15 @@ impl Constraint for CurveValue {
 ///
 /// A plain [`CurveValue`] evaluates an [`Arc`] as its supporting circle, so
 /// its free parameter can converge to a point outside the visible arc. This
-/// variant reflects the free parameter into `[0, 1]` before interpolating
-/// between the arc angles. Both ends remain reachable, their one-sided slope
-/// stays nonzero, and every solved point therefore stays on the bounded arc.
+/// variant maps the free parameter through `sin²(u)`, producing a normalized
+/// value in `[0, 1]` before interpolating between the arc angles. Both ends
+/// remain reachable and every solved point therefore stays on the bounded arc.
 pub struct BoundedArcValue {
     p: Point,
     /// Must be `p.x` or `p.y` — which coordinate this constrains.
     pcoord: ParamId,
     arc: Arc,
-    /// Free latent parameter, reflected into the normalized arc interval.
+    /// Free latent parameter. `sin²(u)` is the normalized arc parameter.
     u: ParamId,
 }
 
@@ -129,14 +129,9 @@ impl BoundedArcValue {
 
     fn err_vec(&self, store: &ParamStore, derivparam: Option<ParamId>) -> DeriVector2 {
         let latent = store.get(self.u);
-        let phase = latent.rem_euclid(2.0);
-        let (normalized, slope) = if phase <= 1.0 {
-            (phase, 1.0)
-        } else {
-            (2.0 - phase, -1.0)
-        };
+        let normalized = latent.sin().powi(2);
         let dnormalized = if derivparam == Some(self.u) {
-            slope
+            (2.0 * latent).sin()
         } else {
             0.0
         };
@@ -573,11 +568,11 @@ mod tests {
     }
 
     #[test]
-    fn bounded_arc_value_reflects_parameters_into_the_sweep() {
+    fn bounded_arc_value_maps_parameters_into_the_sweep() {
         let mut store = ParamStore::new();
         let arc = make_quarter_arc(&mut store, true);
         let u = store.add(1.25, false);
-        let angle = std::f64::consts::FRAC_PI_2 * 0.75;
+        let angle = std::f64::consts::FRAC_PI_2 * 1.25_f64.sin().powi(2);
         let p = make_point(&mut store, 5.0 * angle.cos(), 5.0 * angle.sin());
 
         let x = BoundedArcValue::new(p, p.x, arc, u);
@@ -587,8 +582,28 @@ mod tests {
     }
 
     #[test]
-    fn bounded_arc_value_solves_away_from_both_endpoint_seeds() {
-        for seed in [0.0, 1.0] {
+    fn bounded_arc_value_reaches_both_endpoints() {
+        for (seed, angle) in [
+            (0.0, 0.0),
+            (std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2),
+        ] {
+            let mut store = ParamStore::new();
+            let arc = make_quarter_arc(&mut store, true);
+            let p = Point::new(
+                store.add(5.0 * angle.cos(), true),
+                store.add(5.0 * angle.sin(), true),
+            );
+            let u = store.add(seed, false);
+            let x = BoundedArcValue::new(p, p.x, arc, u);
+            let y = BoundedArcValue::new(p, p.y, arc, u);
+            assert!(x.error_value(&store).abs() < 1e-9);
+            assert!(y.error_value(&store).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn bounded_arc_value_solves_from_near_both_endpoints() {
+        for seed in [1e-3, std::f64::consts::FRAC_PI_2 - 1e-3] {
             let mut store = ParamStore::new();
             let arc = make_quarter_arc(&mut store, true);
             let target_angle = std::f64::consts::FRAC_PI_4;
