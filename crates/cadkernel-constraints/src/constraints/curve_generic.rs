@@ -18,7 +18,7 @@
 
 use std::rc::Rc;
 
-use crate::geo::{Curve, DeriVector2, Point};
+use crate::geo::{Arc, Curve, DeriVector2, Point};
 use crate::util::{ParamId, ParamStore};
 
 use super::Constraint;
@@ -81,6 +81,86 @@ impl Constraint for CurveValue {
     fn params(&self) -> Vec<ParamId> {
         let mut params = vec![self.p.x, self.p.y, self.u];
         params.extend(self.crv.own_params());
+        params
+    }
+
+    fn error_value(&self, store: &ParamStore) -> f64 {
+        let err_vec = self.err_vec(store, None);
+        if self.pcoord == self.p.x {
+            err_vec.x
+        } else {
+            err_vec.y
+        }
+    }
+
+    fn grad_value(&self, store: &ParamStore, param: ParamId) -> f64 {
+        let err_vec = self.err_vec(store, Some(param));
+        if self.pcoord == self.p.x {
+            err_vec.dx
+        } else {
+            err_vec.dy
+        }
+    }
+}
+
+/// Ties one point coordinate to a circular arc while keeping the sampled
+/// parameter inside the arc's start/end interval.
+///
+/// A plain [`CurveValue`] evaluates an [`Arc`] as its supporting circle, so
+/// its free parameter can converge to a point outside the visible arc.  This
+/// variant maps the free parameter through `sin²(u)`, producing a normalized
+/// value in `[0, 1]` before interpolating between the arc angles.  Both ends
+/// remain reachable and every solved point therefore stays on the bounded arc.
+pub struct BoundedArcValue {
+    p: Point,
+    /// Must be `p.x` or `p.y` — which coordinate this constrains.
+    pcoord: ParamId,
+    arc: Arc,
+    /// Free latent parameter. `sin²(u)` is the normalized arc parameter.
+    u: ParamId,
+}
+
+impl BoundedArcValue {
+    /// `pcoord` must be `p.x` or `p.y`.
+    pub fn new(p: Point, pcoord: ParamId, arc: Arc, u: ParamId) -> Self {
+        debug_assert!(pcoord == p.x || pcoord == p.y, "pcoord must be p.x or p.y");
+        Self { p, pcoord, arc, u }
+    }
+
+    fn err_vec(&self, store: &ParamStore, derivparam: Option<ParamId>) -> DeriVector2 {
+        let latent = store.get(self.u);
+        let normalized = latent.sin().powi(2);
+        let dnormalized = if derivparam == Some(self.u) {
+            (2.0 * latent).sin()
+        } else {
+            0.0
+        };
+        let start = store.get(self.arc.start_angle);
+        let end = store.get(self.arc.end_angle);
+        let dstart = if derivparam == Some(self.arc.start_angle) {
+            1.0
+        } else {
+            0.0
+        };
+        let dend = if derivparam == Some(self.arc.end_angle) {
+            1.0
+        } else {
+            0.0
+        };
+        let angle = start + (end - start) * normalized;
+        let dangle = dstart
+            + (dend - dstart) * normalized
+            + (end - start) * dnormalized;
+        let p_to = self.arc.value(store, angle, dangle, derivparam);
+        let p_from = DeriVector2::from_point(store, self.p, derivparam);
+        p_from.subtr(&p_to)
+    }
+}
+
+impl Constraint for BoundedArcValue {
+    fn params(&self) -> Vec<ParamId> {
+        let mut params = vec![self.p.x, self.p.y, self.u];
+        params.extend(self.arc.own_params());
         params
     }
 
