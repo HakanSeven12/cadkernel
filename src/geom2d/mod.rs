@@ -48,7 +48,8 @@ pub use clip::{break_spans, inside_pieces, inside_spans, trim_spans};
 pub use centerline::{centerline_between, CenterLineGeometry};
 pub use containment::{closest_point, contains, distance_to, nearest_of, Closest};
 pub use constraint_inference::{
-    infer_constraints, Endpoint as ConstraintEndpoint, InferredConstraint, ParametricPrimitive,
+    infer_constraints, infer_constraints_with_settings, Endpoint as ConstraintEndpoint,
+    InferenceKind, InferenceSettings, InferredConstraint, ParametricPrimitive,
 };
 pub use dimension::linear_dimension_leader;
 pub use construct::{
