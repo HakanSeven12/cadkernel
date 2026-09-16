@@ -142,15 +142,25 @@ fn cast(
     });
     let mut hits: Vec<Vec2> = Vec::new();
     for curve in boundary {
-        for crossing in intersect(&ray, curve, tolerance) {
-            // A crossing at an end of the piece is shared with its neighbour,
-            // so it would be counted twice. Rather than guess which, give up
-            // on this direction.
-            let at_end = crossing.t_b <= 1e-6 || crossing.t_b >= 1.0 - 1e-6;
-            if at_end && !curve.is_closed() {
-                return None;
+        // Keep polyline corners visible to the endpoint-degeneracy check.
+        let segments = curve.segments();
+        let pieces = if matches!(curve, Curve::Polyline(_)) {
+            segments.as_slice()
+        } else {
+            std::slice::from_ref(curve)
+        };
+        for piece in pieces {
+            for crossing in intersect(&ray, piece, tolerance) {
+                let at_end = crossing.t_b <= 1e-6 || crossing.t_b >= 1.0 - 1e-6;
+                let tangent = Vec2::from(piece.tangent_at(crossing.t_b));
+                // A corner or tangent touch needs a different casting direction.
+                if (at_end && !piece.is_closed())
+                    || tangent.cross(Vec2::from(direction)).abs() <= 1e-10 * tangent.length()
+                {
+                    return None;
+                }
+                hits.push(Vec2::from(crossing.point));
             }
-            hits.push(Vec2::from(crossing.point));
         }
     }
 
@@ -319,6 +329,7 @@ mod tests {
         assert!(contains(std::slice::from_ref(&circle), [3.0, 4.0], tol()));
         assert!(contains(std::slice::from_ref(&circle), [4.5, 4.0], tol()));
         assert!(!contains(std::slice::from_ref(&circle), [6.0, 4.0], tol()));
+        assert!(!contains(std::slice::from_ref(&circle), [-1.0, 6.0], tol()), "a tangent ray does not enter the circle");
     }
 
     #[test]
@@ -347,6 +358,7 @@ mod tests {
         assert!(contains(std::slice::from_ref(&l_shape), [2.0, 8.0], tol()), "in the arm");
         assert!(contains(std::slice::from_ref(&l_shape), [8.0, 2.0], tol()), "in the foot");
         assert!(!contains(std::slice::from_ref(&l_shape), [8.0, 8.0], tol()), "in the notch");
+        assert!(!contains(std::slice::from_ref(&l_shape), [-1.0, 4.0], tol()), "outside, level with the notch");
     }
 
     #[test]
