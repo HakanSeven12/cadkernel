@@ -616,13 +616,51 @@ impl NurbsCurve3 {
         0.5 * (low + high)
     }
 
+    /// Solve tangency from an external point near a knot-parameter seed.
+    /// Returns only validated solutions; a spatial curve need not have one.
+    pub fn tangent_from_near(&self, from: [f64; 3], seed: f64) -> Option<[f64; 3]> {
+        let from = Vec3::from(from);
+        let (start, end) = self.domain();
+        let span = end - start;
+        if !from.is_finite() || !seed.is_finite() || !span.is_finite() || span <= 1e-15 {
+            return None;
+        }
+        let residual = |u| {
+            (Vec3::from(self.point_at_knot(u)) - from).cross(Vec3::from(self.derivative_at_knot(u)))
+        };
+        let mut u = seed.clamp(start, end);
+        for _ in 0..48 {
+            let value = residual(u);
+            let lo = (u - span * 1e-6).max(start);
+            let hi = (u + span * 1e-6).min(end);
+            let derivative = (residual(hi) - residual(lo)) / (hi - lo);
+            if !value.is_finite() || !derivative.is_finite() {
+                return None;
+            }
+            if derivative.length_squared() <= 1e-30 {
+                break;
+            }
+            let next = (u - value.dot(derivative) / derivative.length_squared()).clamp(start, end);
+            if (next - u).abs() < span * 1e-14 {
+                u = next;
+                break;
+            }
+            u = next;
+        }
+        let point = Vec3::from(self.point_at_knot(u));
+        let derivative = Vec3::from(self.derivative_at_knot(u));
+        let scale = (point - from).length() * derivative.length();
+        if !point.is_finite()
+            || !scale.is_finite()
+            || scale <= 1e-20
+            || residual(u).length() > 1e-8 * scale
+        {
+            return None;
+        }
+        Some(point.to_array())
+    }
+
     /// The tangent at a knot parameter, by a central difference.
-    ///
-    /// Differenced rather than differentiated: the derivative of a rational
-    /// curve is a quotient rule over two B-splines, and for what this is
-    /// wanted for — which way the curve is heading, and how hard it turns —
-    /// a difference at a ten-thousandth of the domain is indistinguishable
-    /// and cannot be subtly wrong.
     pub fn tangent_at_knot(&self, u: f64) -> [f64; 3] {
         let Some((here, step)) = self.sampling_at(u) else {
             return [0.0; 3];
@@ -1469,6 +1507,30 @@ mod tests {
             analytic.distance(numeric) < 1e-6,
             "{analytic:?} vs {numeric:?}"
         );
+    }
+
+    #[test]
+    fn tangent_from_near_validates_endpoints_interior_and_missing_solutions() {
+        let curve = NurbsCurve3::new_strict(
+            2,
+            vec![[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![1.0; 3],
+        )
+        .unwrap();
+        for (from, expected) in [
+            ([0.0, -1.0, 0.0], [1.0, 1.0, 0.0]),
+            ([0.0, -0.25, 0.0], [0.5, 0.25, 0.0]),
+        ] {
+            let point = curve.tangent_from_near(from, 0.8).unwrap();
+            assert!(Vec3::from(point).distance(Vec3::from(expected)) < 1e-8);
+        }
+        assert!(curve.tangent_from_near([0.0, 1.0, 0.0], 0.8).is_none());
+        assert!(curve.tangent_from_near([0.0, -1.0, 1.0], 0.8).is_none());
+        assert!(curve.tangent_from_near([f64::NAN, 0.0, 0.0], 0.8).is_none());
+        assert!(curve
+            .tangent_from_near([0.0, -1.0, 0.0], f64::NAN)
+            .is_none());
     }
 
     #[test]
