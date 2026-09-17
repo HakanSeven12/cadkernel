@@ -113,6 +113,17 @@ impl Vec3 {
         self.distance(start + along * parameter)
     }
 
+    /// Perpendicular distance from this point to an infinite line.
+    /// Degenerate and non-finite inputs do not define a line.
+    pub fn distance_to_line(self, start: Self, end: Self) -> Option<f64> {
+        if !self.is_finite() || !start.is_finite() || !end.is_finite() {
+            return None;
+        }
+        let direction = (end - start).normalize()?;
+        let offset = self - start;
+        Some((offset - direction * offset.dot(direction)).length())
+    }
+
     /// A unit vector in the same direction.
     ///
     /// `None` when there is no direction to speak of. Returning a zero vector
@@ -257,6 +268,17 @@ mod tests {
         assert_eq!((b - a).length(), 5.0);
         assert_eq!(a.distance(b), 5.0);
         assert_eq!(a.distance_squared(b), 25.0);
+    }
+
+    #[test]
+    fn distance_to_line_uses_the_infinite_support_and_rejects_a_point() {
+        let start = Vec3::new(1.0, 2.0, 3.0);
+        let end = Vec3::new(3.0, 2.0, 3.0);
+        assert_eq!(
+            Vec3::new(100.0, 6.0, 3.0).distance_to_line(start, end),
+            Some(4.0)
+        );
+        assert_eq!(start.distance_to_line(start, start), None);
     }
 
     #[test]
