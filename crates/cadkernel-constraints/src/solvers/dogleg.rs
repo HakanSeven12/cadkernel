@@ -13,6 +13,10 @@ const TOLG: f64 = 1e-12;
 const TOLX: f64 = 1e-12;
 const TOLF: f64 = 1e-10;
 const MAX_ITER: usize = 100;
+/// Bound on the fallback SVD's QR sweeps, per singular value. nalgebra's
+/// plain `svd()` iterates without limit and never terminates on some
+/// inputs; a converging decomposition needs only a handful per value.
+const SVD_MAX_ITER_PER_VALUE: usize = 100;
 
 pub fn solve_dl(sub: &SubSystem, store: &mut ParamStore) -> SolveStatus {
     let xsize = sub.p_size();
@@ -48,7 +52,14 @@ pub fn solve_dl(sub: &SubSystem, store: &mut ParamStore) -> SolveStatus {
         } else if iter >= MAX_ITER {
             stop = 4;
             break;
-        } else if err > diverging_lim || err.is_nan() {
+        } else if err > diverging_lim
+            || err.is_nan()
+            || !fx.iter().all(|v| v.is_finite())
+            || !jx.iter().all(|v| v.is_finite())
+        {
+            // A non-finite residual or Jacobian (e.g. a gradient dividing
+            // by a zero length) cannot produce a meaningful step, and
+            // factoring it can fail to terminate.
             stop = 6;
             break;
         }
@@ -67,12 +78,18 @@ pub fn solve_dl(sub: &SubSystem, store: &mut ParamStore) -> SolveStatus {
         for index in 0..normal.nrows() {
             normal[(index, index)] += diagonal_scale * 1e-12;
         }
-        let h_gn = normal.cholesky().map(|factor| factor.solve(&g)).unwrap_or_else(|| {
-            jx.clone()
-                .svd(true, true)
-                .solve(&(-fx.clone()), 1e-12)
-                .unwrap_or_else(|_| DVector::zeros(xsize))
-        });
+        let h_gn = match normal.cholesky() {
+            Some(factor) => factor.solve(&g),
+            None => {
+                let max_niter = SVD_MAX_ITER_PER_VALUE * jx.nrows().min(jx.ncols()).max(1);
+                match jx.clone().try_svd(true, true, f64::EPSILON, max_niter) {
+                    Some(svd) => svd
+                        .solve(&(-fx.clone()), 1e-12)
+                        .unwrap_or_else(|_| DVector::zeros(xsize)),
+                    None => break, // stop stays 0 -> Failed
+                }
+            }
+        };
 
         let rel_error = (&jx * &h_gn + &fx).norm() / fx.norm();
         if rel_error > 1e15 {
@@ -200,6 +217,29 @@ mod tests {
         let dx = store.get(anchor.x) - store.get(p.x);
         let dy = store.get(anchor.y) - store.get(p.y);
         assert!(((dx * dx + dy * dy).sqrt() - 10.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn a_zero_length_line_in_an_equal_length_pair_fails_instead_of_hanging() {
+        // Equal length expressed as two P2PDistance constraints sharing one
+        // free length. The first line's endpoints coincide, so its gradient
+        // divides by zero and the Jacobian is NaN. That used to reach
+        // nalgebra's unbounded SVD, which panics or never returns on NaN.
+        let mut store = ParamStore::new();
+        let a1 = Point::new(store.add(1.0, false), store.add(1.0, false));
+        let a2 = Point::new(store.add(1.0, false), store.add(1.0, false));
+        let b1 = Point::new(store.add(0.0, false), store.add(0.0, false));
+        let b2 = Point::new(store.add(3.0, false), store.add(4.0, false));
+        let length = store.add(2.0, false);
+
+        let c1: Rc<dyn crate::constraints::Constraint> = Rc::new(P2PDistance::new(a1, a2, length));
+        let c2: Rc<dyn crate::constraints::Constraint> = Rc::new(P2PDistance::new(b1, b2, length));
+        let params = [a1.x, a1.y, a2.x, a2.y, b1.x, b1.y, b2.x, b2.y, length];
+        let sub = SubSystem::new(vec![c1, c2], &params);
+
+        assert!(sub.error(&store) > 0.0, "should start unsatisfied");
+        assert_eq!(solve_dl(&sub, &mut store), SolveStatus::Failed);
+        assert_eq!(store.get(length), 2.0, "a failed solve reverts the store");
     }
 
     #[test]
