@@ -77,6 +77,27 @@ pub fn coplanarity_tolerance(points: &[[f64; 3]]) -> f64 {
     COPLANARITY_TOLERANCE * extent + f64::EPSILON * coordinate_scale * 64.0
 }
 
+/// Reorients an axis into the plane perpendicular to `normal` while keeping
+/// its original length and as much of its original direction as possible.
+pub fn reorient_axis_to_plane(axis: [f64; 3], normal: [f64; 3]) -> Option<[f64; 3]> {
+    let axis = Vec3::from(axis);
+    let length = axis.length();
+    let normal = Vec3::from(normal).normalize()?;
+    if !axis.is_finite() || !length.is_finite() || length <= 1.0e-300 {
+        return None;
+    }
+    let projected = axis - normal * axis.dot(normal);
+    let direction = projected.normalize().or_else(|| {
+        let helper = if normal.x.abs() < 0.8 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
+        normal.cross(helper).normalize()
+    })?;
+    Some((direction * length).to_array())
+}
+
 /// Whether points and directions share a plane.
 pub fn are_coplanar(points: &[[f64; 3]], directions: &[[f64; 3]]) -> bool {
     if !points
@@ -342,6 +363,19 @@ mod tests {
         }
         assert_eq!(intersect_line_plane(line, [0.0, 0.0, 1.0], plane, [0.0; 3], 1e-6), None);
         assert_eq!(intersect_line_plane(line, [0.0, 0.0, 1.0], plane, [0.0, 0.0, 1.0], f64::NAN), None);
+    }
+
+    #[test]
+    fn reoriented_axis_keeps_length_and_lies_in_the_new_plane() {
+        for (axis, normal) in [
+            ([3.0, 0.0, 0.0], [1.0, 1.0, 0.0]),
+            ([0.0, 0.0, 2.0], [0.0, 0.0, 1.0]),
+        ] {
+            let result = Vec3::from(reorient_axis_to_plane(axis, normal).unwrap());
+            let normal = Vec3::from(normal).normalize().unwrap();
+            assert!((result.length() - Vec3::from(axis).length()).abs() < 1.0e-12);
+            assert!(result.dot(normal).abs() < 1.0e-12);
+        }
     }
 
     /// A plane whose frame is deliberately neither unit nor right-angled.

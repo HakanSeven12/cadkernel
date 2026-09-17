@@ -44,7 +44,7 @@ pub use dimension::{
 pub use helix::{HelixCurve, HelixDirection};
 pub use line_union::{line_union, simplify_linear_chain, LineUnion, LineUnionKind};
 pub use nurbs::{NurbsCurve3, NurbsSurface3};
-pub use plane::{are_coplanar, coplanarity_tolerance, Plane};
+pub use plane::{are_coplanar, coplanarity_tolerance, reorient_axis_to_plane, Plane};
 pub use polyline_approximation::SplinePolyline;
 pub use rigid_constraint::solve_rigid_point_coincidence;
 pub use smooth::{smooth_nurbs_endpoint, CurveJet, SplineEnd};
