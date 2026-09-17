@@ -25,6 +25,7 @@ mod knot_compaction;
 mod polyline_approximation;
 pub mod plane;
 pub mod polygon;
+pub mod rigid_constraint;
 pub mod spline;
 pub mod smooth;
 pub mod source_join;
@@ -45,6 +46,7 @@ pub use line_union::{line_union, simplify_linear_chain, LineUnion, LineUnionKind
 pub use nurbs::{NurbsCurve3, NurbsSurface3};
 pub use plane::{are_coplanar, coplanarity_tolerance, Plane};
 pub use polyline_approximation::SplinePolyline;
+pub use rigid_constraint::solve_rigid_point_coincidence;
 pub use smooth::{smooth_nurbs_endpoint, CurveJet, SplineEnd};
 pub use spline::{clamped_uniform_knots, de_boor, Parameterization};
 pub use vec::Vec3;
