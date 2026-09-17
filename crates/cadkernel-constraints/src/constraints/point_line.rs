@@ -828,18 +828,33 @@ impl Constraint for Parallel {
     }
 }
 
-/// Lines `l1`/`l2` are at right angles (their direction vectors' dot product
-/// is zero). Same scale treatment as [`Parallel`].
+/// Lines `l1`/`l2` are at right angles. The signed cross-product form keeps a
+/// useful gradient even when the input lines start exactly parallel.
 pub struct Perpendicular {
     pub l1: Line,
     pub l2: Line,
     scale: f64,
+    orientation: f64,
 }
 
 impl Perpendicular {
     pub fn new(store: &ParamStore, l1: Line, l2: Line) -> Self {
         let scale = Parallel::compute_scale(store, &l1, &l2);
-        Self { l1, l2, scale }
+        let dx1 = store.get(l1.p1.x) - store.get(l1.p2.x);
+        let dy1 = store.get(l1.p1.y) - store.get(l1.p2.y);
+        let dx2 = store.get(l2.p1.x) - store.get(l2.p2.x);
+        let dy2 = store.get(l2.p1.y) - store.get(l2.p2.y);
+        let orientation = if dx1 * dy2 - dy1 * dx2 < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        Self {
+            l1,
+            l2,
+            scale,
+            orientation,
+        }
     }
 }
 
@@ -866,7 +881,9 @@ impl Constraint for Perpendicular {
         let dy1 = store.get(self.l1.p1.y) - store.get(self.l1.p2.y);
         let dx2 = store.get(self.l2.p1.x) - store.get(self.l2.p2.x);
         let dy2 = store.get(self.l2.p1.y) - store.get(self.l2.p2.y);
-        dx1 * dx2 + dy1 * dy2
+        let len1 = dx1.hypot(dy1);
+        let len2 = dx2.hypot(dy2);
+        dx1 * dy2 - dy1 * dx2 - self.orientation * len1 * len2
     }
 
     fn grad_value(&self, store: &ParamStore, param: ParamId) -> f64 {
@@ -876,30 +893,36 @@ impl Constraint for Perpendicular {
         let dy1 = store.get(l1p1y) - store.get(l1p2y);
         let dx2 = store.get(l2p1x) - store.get(l2p2x);
         let dy2 = store.get(l2p1y) - store.get(l2p2y);
+        let len1 = dx1.hypot(dy1).max(f64::EPSILON);
+        let len2 = dx2.hypot(dy2).max(f64::EPSILON);
+        let d_dx1 = dy2 - self.orientation * dx1 * len2 / len1;
+        let d_dy1 = -dx2 - self.orientation * dy1 * len2 / len1;
+        let d_dx2 = -dy1 - self.orientation * dx2 * len1 / len2;
+        let d_dy2 = dx1 - self.orientation * dy2 * len1 / len2;
         let mut deriv = 0.0;
         if param == l1p1x {
-            deriv += dx2;
+            deriv += d_dx1;
         }
         if param == l1p2x {
-            deriv += -dx2;
+            deriv -= d_dx1;
         }
         if param == l1p1y {
-            deriv += dy2;
+            deriv += d_dy1;
         }
         if param == l1p2y {
-            deriv += -dy2;
+            deriv -= d_dy1;
         }
         if param == l2p1x {
-            deriv += dx1;
+            deriv += d_dx2;
         }
         if param == l2p2x {
-            deriv += -dx1;
+            deriv -= d_dx2;
         }
         if param == l2p1y {
-            deriv += dy1;
+            deriv += d_dy2;
         }
         if param == l2p2y {
-            deriv += -dy1;
+            deriv -= d_dy2;
         }
         deriv
     }
@@ -1238,6 +1261,17 @@ mod tests {
         let l2 = line(&mut store, 0.0, 0.0, 0.0, 10.0);
         let c = Perpendicular::new(&store, l1, l2);
         assert!(c.error_value(&store).abs() < 1e-9);
+        assert_grad_matches_finite_difference(&c, &mut store);
+    }
+
+    #[test]
+    fn perpendicular_keeps_a_free_gradient_for_parallel_lines() {
+        let mut store = ParamStore::new();
+        let l1 = line(&mut store, 0.0, 0.0, 10.0, 0.0);
+        let l2 = line(&mut store, 20.0, 0.0, 30.0, 0.0);
+        let c = Perpendicular::new(&store, l1, l2);
+
+        assert!(c.grad_value(&store, l2.p2.y).abs() > 1.0);
         assert_grad_matches_finite_difference(&c, &mut store);
     }
 
