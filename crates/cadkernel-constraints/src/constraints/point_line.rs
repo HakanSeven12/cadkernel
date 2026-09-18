@@ -937,6 +937,98 @@ pub struct MidpointOnLine {
     pub l2: Line,
 }
 
+/// The directions of `first` and `second` are mirror images across `axis`.
+///
+/// Lines are undirected here: a reflected direction parallel or antiparallel
+/// to the other line satisfies the relation. The residual is the cross
+/// product of the second direction with the first direction reflected across
+/// the axis. A construction-time scale keeps the polynomial residual
+/// dimensionless without changing its zero set.
+pub struct SymmetricLineDirections {
+    pub first: Line,
+    pub second: Line,
+    pub axis: Line,
+    scale: f64,
+}
+
+impl SymmetricLineDirections {
+    pub fn new(store: &ParamStore, first: Line, second: Line, axis: Line) -> Self {
+        let direction = |line: Line| {
+            let dx = store.get(line.p2.x) - store.get(line.p1.x);
+            let dy = store.get(line.p2.y) - store.get(line.p1.y);
+            (dx, dy, dx.hypot(dy))
+        };
+        let (_, _, first_length) = direction(first);
+        let (_, _, second_length) = direction(second);
+        let (_, _, axis_length) = direction(axis);
+        let denominator = first_length * second_length * axis_length * axis_length;
+        let scale = if denominator > f64::EPSILON {
+            1.0 / denominator
+        } else {
+            1.0
+        };
+        Self {
+            first,
+            second,
+            axis,
+            scale,
+        }
+    }
+
+    fn direction(
+        store: &ParamStore,
+        line: Line,
+        derivparam: Option<ParamId>,
+    ) -> crate::geo::DeriVector2 {
+        let start = crate::geo::DeriVector2::from_point(store, line.p1, derivparam);
+        let end = crate::geo::DeriVector2::from_point(store, line.p2, derivparam);
+        end.subtr(&start)
+    }
+
+    fn error_grad(&self, store: &ParamStore, derivparam: Option<ParamId>) -> (f64, f64) {
+        let first = Self::direction(store, self.first, derivparam);
+        let second = Self::direction(store, self.second, derivparam);
+        let axis = Self::direction(store, self.axis, derivparam);
+        let (projection, projection_derivative) = first.scalar_prod(&axis);
+        let (axis_squared, axis_squared_derivative) = axis.scalar_prod(&axis);
+        let reflected = axis
+            .mult_d(2.0 * projection, 2.0 * projection_derivative)
+            .subtr(&first.mult_d(axis_squared, axis_squared_derivative));
+        reflected.cross_prod_z(&second)
+    }
+}
+
+impl Constraint for SymmetricLineDirections {
+    fn params(&self) -> Vec<ParamId> {
+        vec![
+            self.first.p1.x,
+            self.first.p1.y,
+            self.first.p2.x,
+            self.first.p2.y,
+            self.second.p1.x,
+            self.second.p1.y,
+            self.second.p2.x,
+            self.second.p2.y,
+            self.axis.p1.x,
+            self.axis.p1.y,
+            self.axis.p2.x,
+            self.axis.p2.y,
+        ]
+    }
+
+    fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    fn error_value(&self, store: &ParamStore) -> f64 {
+        self.error_grad(store, None).0
+    }
+
+    fn grad_value(&self, store: &ParamStore, param: ParamId) -> f64 {
+        self.error_grad(store, Some(param)).1
+    }
+}
+
 impl MidpointOnLine {
     pub fn new(l1: Line, l2: Line) -> Self {
         Self { l1, l2 }
